@@ -15,6 +15,7 @@ from typing import Dict, Optional, Tuple
 from dataclasses import dataclass, field
 
 from utils.logger import get_logger
+from utils.telegram_notifier import get_telegram_notifier
 
 logger = get_logger("risk_manager")
 
@@ -116,7 +117,8 @@ class RiskManager:
         self,
         enable_kill_switch: bool = False,
         daily_max_loss_percent: float = 3.0,
-        starting_capital: float = 0.0
+        starting_capital: float = 0.0,
+        telegram_notifier=None
     ):
         """
         리스크 매니저 초기화
@@ -125,6 +127,7 @@ class RiskManager:
             enable_kill_switch: 킬 스위치 활성화 여부
             daily_max_loss_percent: 일일 최대 손실 허용 비율 (%)
             starting_capital: 시작 자본금 (원)
+            telegram_notifier: 텔레그램 알림기 (미입력 시 자동 생성)
         """
         self._enable_kill_switch = enable_kill_switch
         self._daily_max_loss_percent = daily_max_loss_percent
@@ -136,6 +139,9 @@ class RiskManager:
         
         # 일일 손실 한도 도달 플래그
         self._daily_limit_reached = False
+        
+        # 텔레그램 알림기
+        self._telegram = telegram_notifier or get_telegram_notifier()
         
         logger.info(
             f"[RISK] 리스크 매니저 초기화 완료 | "
@@ -149,6 +155,8 @@ class RiskManager:
                 "[RISK] ⚠️ KILL SWITCH ACTIVATED - "
                 "모든 신규 주문이 차단됩니다."
             )
+            # 📱 텔레그램 킬 스위치 알림
+            self._telegram.notify_kill_switch("초기화 시 킬 스위치가 활성화되어 있습니다.")
     
     # ════════════════════════════════════════════════════════════════
     # 설정 조회/변경
@@ -169,13 +177,20 @@ class RiskManager:
         """일일 손실 한도 도달 여부"""
         return self._daily_limit_reached
     
-    def enable_kill_switch(self) -> None:
-        """킬 스위치 활성화"""
+    def enable_kill_switch(self, reason: str = "수동 활성화") -> None:
+        """
+        킬 스위치 활성화
+        
+        Args:
+            reason: 활성화 사유
+        """
         self._enable_kill_switch = True
         logger.warning(
             "[RISK] ⚠️ KILL SWITCH ACTIVATED - "
             "모든 신규 주문이 차단됩니다."
         )
+        # 📱 텔레그램 킬 스위치 알림
+        self._telegram.notify_kill_switch(reason)
     
     def disable_kill_switch(self) -> None:
         """킬 스위치 비활성화"""
@@ -239,12 +254,20 @@ class RiskManager:
         
         # 손실 한도 체크
         if current_loss_pct <= -self._daily_max_loss_percent:
-            self._daily_limit_reached = True
-            logger.warning(
-                f"[RISK] ⚠️ Daily loss limit reached! "
-                f"손실: {current_loss_pct:.2f}% | "
-                f"한도: -{self._daily_max_loss_percent}%"
-            )
+            # 처음 한도 도달 시에만 알림 전송
+            if not self._daily_limit_reached:
+                self._daily_limit_reached = True
+                logger.warning(
+                    f"[RISK] ⚠️ Daily loss limit reached! "
+                    f"손실: {current_loss_pct:.2f}% | "
+                    f"한도: -{self._daily_max_loss_percent}%"
+                )
+                # 📱 텔레그램 일일 손실 한도 알림
+                self._telegram.notify_daily_loss_limit(
+                    daily_loss=self._daily_pnl.realized_pnl,
+                    loss_pct=current_loss_pct,
+                    max_loss_pct=self._daily_max_loss_percent
+                )
     
     def _reset_daily_tracking(self) -> None:
         """
@@ -308,6 +331,7 @@ class RiskManager:
                 "[RISK] Kill Switch 활성화 - "
                 "모든 주문이 차단됩니다. 프로그램을 종료합니다."
             )
+            # 📱 텔레그램 킬 스위치 알림 (중복 방지를 위해 check 시에는 보내지 않음)
             return RiskCheckResult(
                 passed=False,
                 reason="[RISK] Kill Switch activated. All trading halted.",
@@ -476,4 +500,15 @@ def safe_exit_with_message(message: str) -> None:
     print("\n" + "=" * 60)
     print(f"[RISK] 안전 종료: {message}")
     print("=" * 60 + "\n")
+    
+    # 📱 텔레그램 알림
+    try:
+        telegram = get_telegram_notifier()
+        if "Kill Switch" in message:
+            telegram.notify_kill_switch(message)
+        else:
+            telegram.notify_error("프로그램 종료", message)
+    except Exception:
+        pass  # 알림 실패해도 종료는 진행
+    
     sys.exit(0)

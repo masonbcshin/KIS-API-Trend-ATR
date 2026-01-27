@@ -135,6 +135,19 @@ LOG_LEVEL = "INFO"
 LOG_DIR = Path(__file__).parent.parent / "logs"
 
 # ════════════════════════════════════════════════════════════════
+# 텔레그램 알림 설정
+# ════════════════════════════════════════════════════════════════
+
+# 텔레그램 봇 토큰 (@BotFather에서 발급)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+
+# 텔레그램 채팅 ID (1:1 또는 그룹)
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# 텔레그램 알림 활성화 여부
+TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "true").lower() in ("true", "1", "yes")
+
+# ════════════════════════════════════════════════════════════════
 # 설정 검증 함수
 # ════════════════════════════════════════════════════════════════
 
@@ -178,6 +191,8 @@ def get_settings_summary() -> str:
     Returns:
         str: 설정 요약 문자열
     """
+    telegram_status = "✅ 활성화" if (TELEGRAM_ENABLED and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID) else "❌ 비활성화"
+    
     return f"""
 ═══════════════════════════════════════════════════
 KIS Trend-ATR Trading System - 설정 요약
@@ -196,5 +211,8 @@ KIS Trend-ATR Trading System - 설정 요약
 
 [주문 설정]
 - 주문 수량: {ORDER_QUANTITY}주
+
+[텔레그램 알림]
+- 상태: {telegram_status}
 ═══════════════════════════════════════════════════
 """
