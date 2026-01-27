@@ -21,6 +21,9 @@ from config import settings
 from strategy.trend_atr import TrendATRStrategy, SignalType, TrendType
 from utils.logger import get_logger
 
+import warnings
+warnings.filterwarnings('ignore', category=RuntimeWarning)
+
 logger = get_logger("backtester")
 
 
@@ -269,13 +272,40 @@ class Backtester:
             # 포지션 미보유 시: 진입 조건 확인
             # ════════════════════════════════════════════════════════
             else:
+                # ADX (추세 강도) 가져오기
+                adx = row.get('adx', None)
+                if adx is not None and pd.isna(adx):
+                    adx = None
+                
                 # 진입 조건:
                 # 1. 상승 추세 (종가 > MA)
                 # 2. 직전 캔들 고가 돌파
+                # 3. ADX > 임계값 (추세 강도 충분)
+                # 4. ATR 급등 아님
                 is_uptrend = current_close > ma
                 is_breakout = not pd.isna(prev_high) and current_high > prev_high
                 
-                if is_uptrend and is_breakout:
+                # ADX 필터: 추세 강도 확인 (횡보장 필터)
+                has_trend_strength = True
+                if adx is not None:
+                    has_trend_strength = adx >= settings.ADX_THRESHOLD
+                
+                # ATR 급등 필터
+                is_atr_normal = True
+                min_periods = self.strategy.atr_period * 2
+                if i >= min_periods:
+                    recent_atr = df_with_indicators['atr'].iloc[i-min_periods:i]
+                    avg_atr = recent_atr.mean()
+                    if not pd.isna(avg_atr) and avg_atr > 0:
+                        atr_ratio = atr / avg_atr
+                        if atr_ratio > settings.ATR_SPIKE_THRESHOLD:
+                            is_atr_normal = False
+                            logger.debug(
+                                f"[진입 거부] {current_date} | ATR 급등 "
+                                f"(비율: {atr_ratio:.1f}x > {settings.ATR_SPIKE_THRESHOLD}x)"
+                            )
+                
+                if is_uptrend and is_breakout and has_trend_strength and is_atr_normal:
                     # 진입가: 직전 캔들 고가 (돌파 시점)
                     entry_price = prev_high
                     
@@ -283,8 +313,11 @@ class Backtester:
                     quantity = self._calculate_position_size(entry_price, capital)
                     
                     if quantity > 0:
-                        # 손절/익절가 계산
-                        stop_loss = entry_price - (atr * self.strategy.atr_multiplier_sl)
+                        # 손절/익절가 계산 (최대 손실 제한 포함)
+                        atr_stop_loss = entry_price - (atr * self.strategy.atr_multiplier_sl)
+                        max_loss_stop = entry_price * (1 - settings.MAX_LOSS_PCT / 100)
+                        stop_loss = max(atr_stop_loss, max_loss_stop)
+                        
                         take_profit = entry_price + (atr * self.strategy.atr_multiplier_tp)
                         
                         # 수수료
@@ -305,10 +338,11 @@ class Backtester:
                             "entry_commission": entry_commission
                         }
                         
+                        adx_str = f", ADX: {adx:.1f}" if adx else ""
                         logger.debug(
                             f"[진입] {current_date} | "
                             f"가격: {entry_price:,.0f}원 | 수량: {quantity}주 | "
-                            f"손절: {stop_loss:,.0f}원 | 익절: {take_profit:,.0f}원"
+                            f"손절: {stop_loss:,.0f}원 | 익절: {take_profit:,.0f}원{adx_str}"
                         )
             
             # 자산 곡선 업데이트

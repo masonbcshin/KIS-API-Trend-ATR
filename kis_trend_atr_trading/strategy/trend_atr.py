@@ -182,6 +182,73 @@ class TrendATRStrategy:
         """
         return df['close'].rolling(window=self.ma_period).mean()
     
+    def calculate_adx(self, df: pd.DataFrame, period: int = None) -> pd.Series:
+        """
+        ADX(Average Directional Index)를 계산합니다.
+        
+        ADX는 추세의 강도를 측정하는 지표입니다:
+            - ADX > 25: 추세 존재 (강한 추세)
+            - ADX < 25: 횡보장 (추세 약함)
+        
+        Args:
+            df: OHLCV 데이터프레임 (high, low, close 컬럼 필요)
+            period: ADX 계산 기간 (기본: settings.ADX_PERIOD)
+        
+        Returns:
+            pd.Series: ADX 값 시리즈
+        """
+        period = period or settings.ADX_PERIOD
+        
+        high = df['high']
+        low = df['low']
+        close = df['close']
+        
+        # +DM (Positive Directional Movement)
+        plus_dm = high.diff()
+        minus_dm = -low.diff()
+        
+        # +DM은 고가 상승분이 저가 하락분보다 클 때만 유효
+        plus_dm = np.where(
+            (plus_dm > minus_dm) & (plus_dm > 0),
+            plus_dm,
+            0
+        )
+        
+        # -DM은 저가 하락분이 고가 상승분보다 클 때만 유효
+        minus_dm = np.where(
+            (minus_dm > plus_dm) & (minus_dm > 0),
+            minus_dm,
+            0
+        )
+        
+        plus_dm = pd.Series(plus_dm, index=df.index)
+        minus_dm = pd.Series(minus_dm, index=df.index)
+        
+        # True Range
+        tr1 = high - low
+        tr2 = abs(high - close.shift(1))
+        tr3 = abs(low - close.shift(1))
+        true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        
+        # Smoothed TR, +DM, -DM (Wilder's smoothing)
+        atr_smooth = true_range.ewm(alpha=1/period, adjust=False).mean()
+        plus_dm_smooth = plus_dm.ewm(alpha=1/period, adjust=False).mean()
+        minus_dm_smooth = minus_dm.ewm(alpha=1/period, adjust=False).mean()
+        
+        # +DI, -DI
+        plus_di = 100 * plus_dm_smooth / atr_smooth
+        minus_di = 100 * minus_dm_smooth / atr_smooth
+        
+        # DX (Directional Index)
+        di_sum = plus_di + minus_di
+        di_diff = abs(plus_di - minus_di)
+        dx = 100 * di_diff / di_sum.replace(0, np.nan)
+        
+        # ADX (smoothed DX)
+        adx = dx.ewm(alpha=1/period, adjust=False).mean()
+        
+        return adx
+    
     def add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         데이터프레임에 기술적 지표를 추가합니다.
@@ -200,6 +267,9 @@ class TrendATRStrategy:
         # 추세 판단용 이동평균
         df['ma'] = self.calculate_ma(df)
         
+        # ADX (추세 강도) 계산
+        df['adx'] = self.calculate_adx(df)
+        
         # 추세 판단
         df['trend'] = np.where(
             df['close'] > df['ma'],
@@ -211,6 +281,52 @@ class TrendATRStrategy:
         df['prev_high'] = df['high'].shift(1)
         
         return df
+    
+    # ════════════════════════════════════════════════════════════════
+    # ATR 검증
+    # ════════════════════════════════════════════════════════════════
+    
+    def is_atr_valid(self, df: pd.DataFrame) -> Tuple[bool, str]:
+        """
+        ATR이 정상 범위인지 검증합니다.
+        
+        ATR 급등 시 손절/익절 폭이 비정상적으로 넓어지므로,
+        평균 대비 일정 배수를 초과하면 진입을 거부합니다.
+        
+        Args:
+            df: 지표가 계산된 데이터프레임
+        
+        Returns:
+            Tuple[bool, str]: (유효 여부, 사유)
+        """
+        # 비교용 데이터가 부족하면 통과
+        min_periods = self.atr_period * 2
+        if len(df) < min_periods:
+            return True, ""
+        
+        current_atr = df.iloc[-1]['atr']
+        
+        # 현재 ATR이 NaN이면 이미 다른 곳에서 필터링됨
+        if pd.isna(current_atr):
+            return True, ""
+        
+        # 최근 ATR 평균 계산 (현재 값 제외)
+        recent_atr = df['atr'].iloc[-min_periods:-1]
+        avg_atr = recent_atr.mean()
+        
+        if pd.isna(avg_atr) or avg_atr <= 0:
+            return True, ""
+        
+        # ATR 급등 검사
+        atr_ratio = current_atr / avg_atr
+        if atr_ratio > settings.ATR_SPIKE_THRESHOLD:
+            return False, (
+                f"ATR 급등 감지 (현재: {current_atr:,.0f}, "
+                f"평균: {avg_atr:,.0f}, 비율: {atr_ratio:.1f}x > "
+                f"임계값: {settings.ATR_SPIKE_THRESHOLD}x)"
+            )
+        
+        return True, ""
     
     # ════════════════════════════════════════════════════════════════
     # 추세 판단
@@ -252,6 +368,7 @@ class TrendATRStrategy:
         손절가를 계산합니다.
         
         손절가 = 진입가 - (ATR * 손절 배수)
+        단, 최대 손실 비율을 초과하지 않도록 제한합니다.
         
         Args:
             entry_price: 진입가
@@ -260,7 +377,22 @@ class TrendATRStrategy:
         Returns:
             float: 손절가
         """
-        stop_loss = entry_price - (atr * self.atr_multiplier_sl)
+        # ATR 기반 손절가
+        atr_stop_loss = entry_price - (atr * self.atr_multiplier_sl)
+        
+        # 최대 손실 비율 기반 손절가
+        max_loss_stop = entry_price * (1 - settings.MAX_LOSS_PCT / 100)
+        
+        # 둘 중 더 높은 값(손실이 작은 값) 선택
+        stop_loss = max(atr_stop_loss, max_loss_stop)
+        
+        # 손절가가 제한된 경우 로깅
+        if stop_loss > atr_stop_loss:
+            logger.debug(
+                f"손절가 제한 적용: ATR 기반 {atr_stop_loss:,.0f}원 → "
+                f"최대손실 제한 {stop_loss:,.0f}원 (MAX_LOSS: {settings.MAX_LOSS_PCT}%)"
+            )
+        
         return max(0, stop_loss)  # 음수 방지
     
     def calculate_take_profit(self, entry_price: float, atr: float) -> float:
@@ -294,6 +426,8 @@ class TrendATRStrategy:
             1. 포지션 미보유
             2. 상승 추세 (종가 > MA50)
             3. 현재가 > 직전 캔들 고가 (돌파)
+            4. ATR 정상 범위 (급등 아님)
+            5. ADX > 임계값 (추세 강도 충분)
         
         Args:
             df: 지표가 계산된 데이터프레임
@@ -315,6 +449,20 @@ class TrendATRStrategy:
         if pd.isna(latest['atr']) or latest['atr'] <= 0:
             return False, "ATR 미계산"
         
+        # ATR 급등 검사
+        atr_valid, atr_reason = self.is_atr_valid(df)
+        if not atr_valid:
+            return False, atr_reason
+        
+        # ADX(추세 강도) 검사 - 횡보장 필터
+        adx = latest.get('adx', None)
+        if adx is not None and not pd.isna(adx):
+            if adx < settings.ADX_THRESHOLD:
+                return False, (
+                    f"추세 강도 부족 (ADX: {adx:.1f} < "
+                    f"임계값: {settings.ADX_THRESHOLD})"
+                )
+        
         # 추세 확인
         trend = self.get_trend(df)
         if trend != TrendType.UPTREND:
@@ -328,7 +476,7 @@ class TrendATRStrategy:
         if current_price <= prev_high:
             return False, f"돌파 미발생 (현재가: {current_price:,.0f} <= 직전고가: {prev_high:,.0f})"
         
-        return True, f"상승 추세 + 직전 고가({prev_high:,.0f}) 돌파"
+        return True, f"상승 추세(ADX:{adx:.1f}) + 직전 고가({prev_high:,.0f}) 돌파"
     
     def check_exit_condition(
         self,
