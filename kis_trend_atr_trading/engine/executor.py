@@ -16,6 +16,12 @@ from config import settings
 from api.kis_api import KISApi, KISApiError
 from strategy.trend_atr import TrendATRStrategy, Signal, SignalType
 from utils.logger import get_logger, TradeLogger
+from engine.risk_manager import (
+    RiskManager,
+    RiskCheckResult,
+    create_risk_manager_from_settings,
+    safe_exit_with_message
+)
 
 logger = get_logger("executor")
 trade_logger = TradeLogger("executor")
@@ -46,7 +52,8 @@ class TradingExecutor:
         api: KISApi = None,
         strategy: TrendATRStrategy = None,
         stock_code: str = None,
-        order_quantity: int = None
+        order_quantity: int = None,
+        risk_manager: RiskManager = None
     ):
         """
         거래 실행 엔진 초기화
@@ -56,11 +63,15 @@ class TradingExecutor:
             strategy: 전략 인스턴스 (미입력 시 자동 생성)
             stock_code: 거래 종목 코드 (기본: 설정 파일 값)
             order_quantity: 주문 수량 (기본: 설정 파일 값)
+            risk_manager: 리스크 매니저 (미입력 시 자동 생성)
         """
         self.api = api or KISApi(is_paper_trading=True)
         self.strategy = strategy or TrendATRStrategy()
         self.stock_code = stock_code or settings.DEFAULT_STOCK_CODE
         self.order_quantity = order_quantity or settings.ORDER_QUANTITY
+        
+        # 리스크 매니저 초기화 (필수!)
+        self.risk_manager = risk_manager or create_risk_manager_from_settings()
         
         # 실행 상태
         self.is_running = False
@@ -76,6 +87,9 @@ class TradingExecutor:
             f"거래 실행 엔진 초기화: 종목={self.stock_code}, "
             f"수량={self.order_quantity}주"
         )
+        
+        # 리스크 매니저 상태 출력
+        self.risk_manager.print_status()
     
     # ════════════════════════════════════════════════════════════════
     # 데이터 조회
@@ -170,6 +184,14 @@ class TradingExecutor:
         Returns:
             Dict: 주문 결과
         """
+        # ★ 리스크 체크 (신규 진입 주문)
+        risk_check = self.risk_manager.check_order_allowed(is_closing_position=False)
+        if not risk_check.passed:
+            logger.warning(risk_check.reason)
+            if risk_check.should_exit:
+                safe_exit_with_message(risk_check.reason)
+            return {"success": False, "message": risk_check.reason}
+        
         if not self._can_execute_order(signal):
             return {"success": False, "message": "주문 조건 미충족"}
         
@@ -234,6 +256,14 @@ class TradingExecutor:
         Returns:
             Dict: 주문 결과
         """
+        # ★ 리스크 체크 (청산 주문 - 손실 한도 도달해도 청산은 허용)
+        risk_check = self.risk_manager.check_order_allowed(is_closing_position=True)
+        if not risk_check.passed:
+            logger.warning(risk_check.reason)
+            if risk_check.should_exit:
+                safe_exit_with_message(risk_check.reason)
+            return {"success": False, "message": risk_check.reason}
+        
         if not self._can_execute_order(signal):
             return {"success": False, "message": "주문 조건 미충족"}
         
@@ -259,6 +289,10 @@ class TradingExecutor:
                     exit_price=signal.price,
                     reason=signal.reason
                 )
+                
+                # ★ 리스크 매니저에 손익 기록
+                if close_result:
+                    self.risk_manager.record_trade_pnl(close_result["pnl"])
                 
                 # 주문 추적 업데이트
                 self._last_order_time = datetime.now()
@@ -294,6 +328,7 @@ class TradingExecutor:
         전략을 1회 실행합니다.
         
         실행 순서:
+            0. 리스크 체크 (Kill Switch)
             1. 시장 데이터 조회
             2. 현재가 조회
             3. 전략 시그널 생성
@@ -304,6 +339,13 @@ class TradingExecutor:
         """
         logger.info("=" * 50)
         logger.info("전략 실행 시작")
+        
+        # ★ 실행 전 킬 스위치 체크
+        kill_check = self.risk_manager.check_kill_switch()
+        if not kill_check.passed:
+            logger.error(kill_check.reason)
+            if kill_check.should_exit:
+                safe_exit_with_message(kill_check.reason)
         
         result = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -406,6 +448,14 @@ class TradingExecutor:
             interval_seconds: 실행 간격 (초, 최소 60초)
             max_iterations: 최대 반복 횟수 (None = 무한)
         """
+        # ★ 시작 전 킬 스위치 체크
+        kill_check = self.risk_manager.check_kill_switch()
+        if not kill_check.passed:
+            logger.error(kill_check.reason)
+            if kill_check.should_exit:
+                safe_exit_with_message(kill_check.reason)
+            return
+        
         # 초단타 방지: 최소 60초 간격
         if interval_seconds < 60:
             logger.warning("실행 간격이 60초 미만입니다. 60초로 조정합니다.")
