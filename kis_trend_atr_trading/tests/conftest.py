@@ -18,6 +18,57 @@ sys.path.insert(0, str(project_root))
 
 
 # ════════════════════════════════════════════════════════════════
+# 테스트 환경 설정 (time.sleep 비활성화)
+# ════════════════════════════════════════════════════════════════
+
+@pytest.fixture(autouse=True)
+def mock_time_sleep():
+    """time.sleep을 mock하여 테스트 속도 향상"""
+    with patch('time.sleep', return_value=None):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def mock_executor_sleep():
+    """executor 모듈의 time.sleep을 mock"""
+    with patch('engine.executor.time.sleep', return_value=None):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def fast_test_settings():
+    """테스트용 빠른 설정"""
+    from config import settings
+    
+    # 원래 값 저장
+    original_timeout = settings.ORDER_EXECUTION_TIMEOUT
+    original_interval = settings.ORDER_CHECK_INTERVAL
+    original_daily_max_trades = settings.DAILY_MAX_TRADES
+    
+    # 테스트용 빠른 값 설정
+    settings.ORDER_EXECUTION_TIMEOUT = 1
+    settings.ORDER_CHECK_INTERVAL = 0.1
+    settings.DAILY_MAX_TRADES = 100  # 테스트에서 거래 횟수 제한 완화
+    
+    yield
+    
+    # 원래 값 복원
+    settings.ORDER_EXECUTION_TIMEOUT = original_timeout
+    settings.ORDER_CHECK_INTERVAL = original_interval
+    settings.DAILY_MAX_TRADES = original_daily_max_trades
+
+
+@pytest.fixture(autouse=True)
+def clear_daily_trades():
+    """테스트 전후 일일 거래 기록 초기화"""
+    from utils.position_store import get_daily_trade_store
+    store = get_daily_trade_store()
+    store.clear_today()
+    yield
+    store.clear_today()
+
+
+# ════════════════════════════════════════════════════════════════
 # 샘플 데이터 Fixtures
 # ════════════════════════════════════════════════════════════════
 
@@ -214,39 +265,40 @@ def sample_atr_spike_df():
 @pytest.fixture
 def mock_kis_api():
     """Mock KIS API 클라이언트를 생성합니다."""
-    with patch('api.kis_api.KISApi') as MockApi:
-        mock_api = MockApi.return_value
-        
-        # 기본 응답 설정
-        mock_api.get_access_token.return_value = "mock_access_token"
-        
-        mock_api.get_current_price.return_value = {
-            "stock_code": "005930",
-            "current_price": 65000.0,
-            "change_rate": 1.5,
-            "volume": 5000000,
-            "high_price": 66000.0,
-            "low_price": 64000.0,
-            "open_price": 64500.0
-        }
-        
-        mock_api.place_buy_order.return_value = {
-            "success": True,
-            "order_no": "0001234567",
-            "message": "주문 접수 완료"
-        }
-        
-        mock_api.place_sell_order.return_value = {
-            "success": True,
-            "order_no": "0001234568",
-            "message": "주문 접수 완료"
-        }
-        
-        mock_api.get_order_status.return_value = {
+    mock_api = Mock()
+    
+    # 기본 응답 설정
+    mock_api.get_access_token.return_value = "mock_access_token"
+    
+    mock_api.get_current_price.return_value = {
+        "stock_code": "005930",
+        "current_price": 65000.0,
+        "change_rate": 1.5,
+        "volume": 5000000,
+        "high_price": 66000.0,
+        "low_price": 64000.0,
+        "open_price": 64500.0
+    }
+    
+    mock_api.place_buy_order.return_value = {
+        "success": True,
+        "order_no": "0001234567",
+        "message": "주문 접수 완료"
+    }
+    
+    mock_api.place_sell_order.return_value = {
+        "success": True,
+        "order_no": "0001234568",
+        "message": "주문 접수 완료"
+    }
+    
+    # get_order_status - 체결 확인용
+    def mock_get_order_status(order_no=None):
+        return {
             "success": True,
             "orders": [
                 {
-                    "order_no": "0001234567",
+                    "order_no": order_no or "0001234567",
                     "stock_code": "005930",
                     "order_type": "매수",
                     "order_qty": 10,
@@ -258,16 +310,19 @@ def mock_kis_api():
             ],
             "total_count": 1
         }
-        
-        mock_api.get_account_balance.return_value = {
-            "success": True,
-            "holdings": [],
-            "total_eval": 10000000,
-            "cash_balance": 10000000,
-            "total_pnl": 0
-        }
-        
-        yield mock_api
+    mock_api.get_order_status.side_effect = mock_get_order_status
+    
+    mock_api.get_account_balance.return_value = {
+        "success": True,
+        "holdings": [],
+        "total_eval": 10000000,
+        "cash_balance": 10000000,
+        "total_pnl": 0
+    }
+    
+    mock_api.get_daily_ohlcv.return_value = pd.DataFrame()
+    
+    return mock_api
 
 
 @pytest.fixture
@@ -376,7 +431,8 @@ def mock_executor(mock_kis_api, strategy):
         api=mock_kis_api,
         strategy=strategy,
         stock_code="005930",
-        order_quantity=10
+        order_quantity=10,
+        auto_sync=False  # 테스트에서는 자동 동기화 비활성화
     )
     
     return executor
