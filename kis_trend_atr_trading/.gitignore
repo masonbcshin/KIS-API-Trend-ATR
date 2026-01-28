@@ -37,8 +37,15 @@ env/
 *~
 
 # 로그 파일
-logs/
+logs/*
+!logs/.gitkeep
 *.log
+
+# 거래 데이터 (민감한 정보)
+data/*.csv
+data/*.db
+!data/trades_sample.csv
+!data/.gitkeep
 
 # OS
 .DS_Store
