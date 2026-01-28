@@ -33,33 +33,17 @@ class TestDuplicateOrderPrevention:
     def test_duplicate_buy_signal_blocked(self, sample_uptrend_df, strategy):
         """동일한 BUY 시그널 연속 실행 차단 테스트"""
         mock_api = Mock(spec=KISApi)
-        def mock_order_status(order_no=None):
-            return {
-                "success": True,
-                "orders": [{"order_no": order_no or "0001234567", "exec_qty": 100, "exec_price": 65000}]
-            }
-        mock_api.get_order_status.side_effect = mock_order_status
         mock_api.place_buy_order.return_value = {
             "success": True,
             "order_no": "0001234567",
             "message": "주문 성공"
         }
         
-        mock_api.get_order_status.return_value = {
-            "success": True,
-            "orders": [{
-                "order_no": "0001234567",
-                "exec_qty": 10,
-                "exec_price": 65000
-            }]
-        }
-        
         executor = TradingExecutor(
             api=mock_api,
             strategy=strategy,
             stock_code="005930",
-            order_quantity=10,
-            auto_sync=False
+            order_quantity=10
         )
         
         # 첫 번째 BUY 시그널
@@ -98,12 +82,6 @@ class TestDuplicateOrderPrevention:
     def test_duplicate_sell_signal_blocked(self, strategy_with_position):
         """동일한 SELL 시그널 연속 실행 차단 테스트"""
         mock_api = Mock(spec=KISApi)
-        def mock_order_status(order_no=None):
-            return {
-                "success": True,
-                "orders": [{"order_no": order_no or "0001234567", "exec_qty": 100, "exec_price": 65000}]
-            }
-        mock_api.get_order_status.side_effect = mock_order_status
         mock_api.place_sell_order.return_value = {
             "success": True,
             "order_no": "0001234568",
@@ -114,8 +92,7 @@ class TestDuplicateOrderPrevention:
             api=mock_api,
             strategy=strategy_with_position,
             stock_code="005930",
-            order_quantity=10,
-            auto_sync=False
+            order_quantity=10
         )
         
         # 첫 번째 SELL 시그널
@@ -162,25 +139,10 @@ class TestDuplicateOrderPrevention:
     def test_different_signal_type_allowed(self, strategy):
         """다른 종류의 시그널은 연속 실행 가능 테스트"""
         mock_api = Mock(spec=KISApi)
-        def mock_order_status(order_no=None):
-            return {
-                "success": True,
-                "orders": [{"order_no": order_no or "0001234567", "exec_qty": 100, "exec_price": 65000}]
-            }
-        mock_api.get_order_status.side_effect = mock_order_status
         mock_api.place_buy_order.return_value = {
             "success": True,
             "order_no": "0001234567",
             "message": "주문 성공"
-        }
-        
-        mock_api.get_order_status.return_value = {
-            "success": True,
-            "orders": [{
-                "order_no": "0001234567",
-                "exec_qty": 10,
-                "exec_price": 65000
-            }]
         }
         mock_api.place_sell_order.return_value = {
             "success": True,
@@ -192,8 +154,7 @@ class TestDuplicateOrderPrevention:
             api=mock_api,
             strategy=strategy,
             stock_code="005930",
-            order_quantity=10,
-            auto_sync=False
+            order_quantity=10
         )
         
         # BUY 시그널
@@ -237,33 +198,17 @@ class TestOrderExecution:
     def test_buy_order_success(self, strategy):
         """매수 주문 성공 테스트"""
         mock_api = Mock(spec=KISApi)
-        def mock_order_status(order_no=None):
-            return {
-                "success": True,
-                "orders": [{"order_no": order_no or "0001234567", "exec_qty": 100, "exec_price": 65000}]
-            }
-        mock_api.get_order_status.side_effect = mock_order_status
         mock_api.place_buy_order.return_value = {
             "success": True,
             "order_no": "0001234567",
             "message": "주문 성공"
         }
         
-        mock_api.get_order_status.return_value = {
-            "success": True,
-            "orders": [{
-                "order_no": "0001234567",
-                "exec_qty": 10,
-                "exec_price": 65000
-            }]
-        }
-        
         executor = TradingExecutor(
             api=mock_api,
             strategy=strategy,
             stock_code="005930",
-            order_quantity=10,
-            auto_sync=False
+            order_quantity=10
         )
         
         signal = Signal(
@@ -285,33 +230,17 @@ class TestOrderExecution:
     def test_buy_order_failure(self, strategy):
         """매수 주문 실패 테스트"""
         mock_api = Mock(spec=KISApi)
-        def mock_order_status(order_no=None):
-            return {
-                "success": True,
-                "orders": [{"order_no": order_no or "0001234567", "exec_qty": 100, "exec_price": 65000}]
-            }
-        mock_api.get_order_status.side_effect = mock_order_status
         mock_api.place_buy_order.return_value = {
             "success": False,
             "order_no": "",
             "message": "잔고 부족"
         }
         
-        mock_api.get_order_status.return_value = {
-            "success": True,
-            "orders": [{
-                "order_no": "0001234567",
-                "exec_qty": 10,
-                "exec_price": 65000
-            }]
-        }
-        
         executor = TradingExecutor(
             api=mock_api,
             strategy=strategy,
             stock_code="005930",
-            order_quantity=10,
-            auto_sync=False
+            order_quantity=10
         )
         
         signal = Signal(
@@ -332,12 +261,6 @@ class TestOrderExecution:
     def test_sell_order_success(self, strategy_with_position):
         """매도 주문 성공 테스트"""
         mock_api = Mock(spec=KISApi)
-        def mock_order_status(order_no=None):
-            return {
-                "success": True,
-                "orders": [{"order_no": order_no or "0001234567", "exec_qty": 100, "exec_price": 65000}]
-            }
-        mock_api.get_order_status.side_effect = mock_order_status
         mock_api.place_sell_order.return_value = {
             "success": True,
             "order_no": "0001234568",
@@ -348,8 +271,7 @@ class TestOrderExecution:
             api=mock_api,
             strategy=strategy_with_position,
             stock_code="005930",
-            order_quantity=10,
-            auto_sync=False
+            order_quantity=10
         )
         
         signal = Signal(
@@ -370,19 +292,12 @@ class TestOrderExecution:
     def test_sell_order_without_position(self, strategy):
         """포지션 없이 매도 시도 테스트"""
         mock_api = Mock(spec=KISApi)
-        def mock_order_status(order_no=None):
-            return {
-                "success": True,
-                "orders": [{"order_no": order_no or "0001234567", "exec_qty": 100, "exec_price": 65000}]
-            }
-        mock_api.get_order_status.side_effect = mock_order_status
         
         executor = TradingExecutor(
             api=mock_api,
             strategy=strategy,
             stock_code="005930",
-            order_quantity=10,
-            auto_sync=False
+            order_quantity=10
         )
         
         signal = Signal(
@@ -403,19 +318,12 @@ class TestOrderExecution:
     def test_buy_order_blocked_with_existing_position(self, strategy_with_position):
         """이미 포지션 보유 중 매수 차단 테스트"""
         mock_api = Mock(spec=KISApi)
-        def mock_order_status(order_no=None):
-            return {
-                "success": True,
-                "orders": [{"order_no": order_no or "0001234567", "exec_qty": 100, "exec_price": 65000}]
-            }
-        mock_api.get_order_status.side_effect = mock_order_status
         
         executor = TradingExecutor(
             api=mock_api,
             strategy=strategy_with_position,
             stock_code="005930",
-            order_quantity=10,
-            auto_sync=False
+            order_quantity=10
         )
         
         signal = Signal(
@@ -440,19 +348,12 @@ class TestCanExecuteOrder:
     def test_hold_signal_cannot_execute(self, strategy):
         """HOLD 시그널은 실행 불가 테스트"""
         mock_api = Mock(spec=KISApi)
-        def mock_order_status(order_no=None):
-            return {
-                "success": True,
-                "orders": [{"order_no": order_no or "0001234567", "exec_qty": 100, "exec_price": 65000}]
-            }
-        mock_api.get_order_status.side_effect = mock_order_status
         
         executor = TradingExecutor(
             api=mock_api,
             strategy=strategy,
             stock_code="005930",
-            order_quantity=10,
-            auto_sync=False
+            order_quantity=10
         )
         
         signal = Signal(
@@ -468,33 +369,17 @@ class TestCanExecuteOrder:
     def test_signal_after_interval_allowed(self, strategy):
         """일정 시간 후 동일 시그널 허용 테스트"""
         mock_api = Mock(spec=KISApi)
-        def mock_order_status(order_no=None):
-            return {
-                "success": True,
-                "orders": [{"order_no": order_no or "0001234567", "exec_qty": 100, "exec_price": 65000}]
-            }
-        mock_api.get_order_status.side_effect = mock_order_status
         mock_api.place_buy_order.return_value = {
             "success": True,
             "order_no": "0001234567",
             "message": "주문 성공"
         }
         
-        mock_api.get_order_status.return_value = {
-            "success": True,
-            "orders": [{
-                "order_no": "0001234567",
-                "exec_qty": 10,
-                "exec_price": 65000
-            }]
-        }
-        
         executor = TradingExecutor(
             api=mock_api,
             strategy=strategy,
             stock_code="005930",
-            order_quantity=10,
-            auto_sync=False
+            order_quantity=10
         )
         
         signal = Signal(
@@ -528,19 +413,12 @@ class TestDailySummary:
     def test_empty_daily_summary(self, strategy):
         """거래 없는 일일 요약 테스트"""
         mock_api = Mock(spec=KISApi)
-        def mock_order_status(order_no=None):
-            return {
-                "success": True,
-                "orders": [{"order_no": order_no or "0001234567", "exec_qty": 100, "exec_price": 65000}]
-            }
-        mock_api.get_order_status.side_effect = mock_order_status
         
         executor = TradingExecutor(
             api=mock_api,
             strategy=strategy,
             stock_code="005930",
-            order_quantity=10,
-            auto_sync=False
+            order_quantity=10
         )
         
         summary = executor.get_daily_summary()
@@ -553,12 +431,6 @@ class TestDailySummary:
     def test_daily_summary_with_trades(self, strategy):
         """거래 있는 일일 요약 테스트"""
         mock_api = Mock(spec=KISApi)
-        def mock_order_status(order_no=None):
-            return {
-                "success": True,
-                "orders": [{"order_no": order_no or "0001234567", "exec_qty": 100, "exec_price": 65000}]
-            }
-        mock_api.get_order_status.side_effect = mock_order_status
         mock_api.place_buy_order.return_value = {
             "success": True,
             "order_no": "0001234567",
@@ -574,8 +446,7 @@ class TestDailySummary:
             api=mock_api,
             strategy=strategy,
             stock_code="005930",
-            order_quantity=10,
-            auto_sync=False
+            order_quantity=10
         )
         
         # 매수
@@ -611,12 +482,6 @@ class TestDailySummary:
     def test_reset_daily_trades(self, strategy):
         """일일 거래 기록 초기화 테스트"""
         mock_api = Mock(spec=KISApi)
-        def mock_order_status(order_no=None):
-            return {
-                "success": True,
-                "orders": [{"order_no": order_no or "0001234567", "exec_qty": 100, "exec_price": 65000}]
-            }
-        mock_api.get_order_status.side_effect = mock_order_status
         mock_api.place_buy_order.return_value = {
             "success": True,
             "order_no": "0001234567",
@@ -627,8 +492,7 @@ class TestDailySummary:
             api=mock_api,
             strategy=strategy,
             stock_code="005930",
-            order_quantity=10,
-            auto_sync=False
+            order_quantity=10
         )
         
         # 거래 실행
@@ -663,12 +527,6 @@ class TestPositionRecognitionAfterRestart:
     def test_position_lost_after_restart_simulation(self, strategy):
         """재시작 시 포지션 손실 시뮬레이션"""
         mock_api = Mock(spec=KISApi)
-        def mock_order_status(order_no=None):
-            return {
-                "success": True,
-                "orders": [{"order_no": order_no or "0001234567", "exec_qty": 100, "exec_price": 65000}]
-            }
-        mock_api.get_order_status.side_effect = mock_order_status
         mock_api.place_buy_order.return_value = {
             "success": True,
             "order_no": "0001234567",
@@ -698,8 +556,7 @@ class TestPositionRecognitionAfterRestart:
             api=mock_api,
             strategy=strategy,
             stock_code="005930",
-            order_quantity=10,
-            auto_sync=False
+            order_quantity=10
         )
         
         # 매수 주문 실행
@@ -725,8 +582,7 @@ class TestPositionRecognitionAfterRestart:
             api=mock_api,
             strategy=new_strategy,
             stock_code="005930",
-            order_quantity=10,
-            auto_sync=False
+            order_quantity=10
         )
         
         # 문제점: 재시작 후 포지션 정보 손실
@@ -750,12 +606,6 @@ class TestPositionRecognitionAfterRestart:
         제안: TradingExecutor 시작 시 계좌 잔고를 조회하여 포지션 동기화
         """
         mock_api = Mock(spec=KISApi)
-        def mock_order_status(order_no=None):
-            return {
-                "success": True,
-                "orders": [{"order_no": order_no or "0001234567", "exec_qty": 100, "exec_price": 65000}]
-            }
-        mock_api.get_order_status.side_effect = mock_order_status
         mock_api.get_account_balance.return_value = {
             "success": True,
             "holdings": [
@@ -810,8 +660,7 @@ class TestPositionRecognitionAfterRestart:
             api=mock_api,
             strategy=strategy,
             stock_code="005930",
-            order_quantity=10,
-            auto_sync=False
+            order_quantity=10
         )
         
         # 동기화 전: 포지션 없음
@@ -834,20 +683,13 @@ class TestAPIErrorHandling:
     def test_buy_order_api_exception(self, strategy):
         """매수 주문 시 API 예외 처리 테스트"""
         mock_api = Mock(spec=KISApi)
-        def mock_order_status(order_no=None):
-            return {
-                "success": True,
-                "orders": [{"order_no": order_no or "0001234567", "exec_qty": 100, "exec_price": 65000}]
-            }
-        mock_api.get_order_status.side_effect = mock_order_status
         mock_api.place_buy_order.side_effect = KISApiError("API 타임아웃")
         
         executor = TradingExecutor(
             api=mock_api,
             strategy=strategy,
             stock_code="005930",
-            order_quantity=10,
-            auto_sync=False
+            order_quantity=10
         )
         
         signal = Signal(
@@ -869,20 +711,13 @@ class TestAPIErrorHandling:
     def test_sell_order_api_exception(self, strategy_with_position):
         """매도 주문 시 API 예외 처리 테스트"""
         mock_api = Mock(spec=KISApi)
-        def mock_order_status(order_no=None):
-            return {
-                "success": True,
-                "orders": [{"order_no": order_no or "0001234567", "exec_qty": 100, "exec_price": 65000}]
-            }
-        mock_api.get_order_status.side_effect = mock_order_status
         mock_api.place_sell_order.side_effect = KISApiError("네트워크 오류")
         
         executor = TradingExecutor(
             api=mock_api,
             strategy=strategy_with_position,
             stock_code="005930",
-            order_quantity=10,
-            auto_sync=False
+            order_quantity=10
         )
         
         signal = Signal(
@@ -909,20 +744,13 @@ class TestRunOnce:
     def test_run_once_with_no_data(self, strategy):
         """데이터 없을 때 run_once 테스트"""
         mock_api = Mock(spec=KISApi)
-        def mock_order_status(order_no=None):
-            return {
-                "success": True,
-                "orders": [{"order_no": order_no or "0001234567", "exec_qty": 100, "exec_price": 65000}]
-            }
-        mock_api.get_order_status.side_effect = mock_order_status
         mock_api.get_daily_ohlcv.return_value = pd.DataFrame()
         
         executor = TradingExecutor(
             api=mock_api,
             strategy=strategy,
             stock_code="005930",
-            order_quantity=10,
-            auto_sync=False
+            order_quantity=10
         )
         
         result = executor.run_once()
@@ -933,12 +761,6 @@ class TestRunOnce:
     def test_run_once_with_zero_price(self, strategy, sample_uptrend_df):
         """현재가 0일 때 run_once 테스트"""
         mock_api = Mock(spec=KISApi)
-        def mock_order_status(order_no=None):
-            return {
-                "success": True,
-                "orders": [{"order_no": order_no or "0001234567", "exec_qty": 100, "exec_price": 65000}]
-            }
-        mock_api.get_order_status.side_effect = mock_order_status
         mock_api.get_daily_ohlcv.return_value = sample_uptrend_df
         mock_api.get_current_price.return_value = {
             "stock_code": "005930",
@@ -949,8 +771,7 @@ class TestRunOnce:
             api=mock_api,
             strategy=strategy,
             stock_code="005930",
-            order_quantity=10,
-            auto_sync=False
+            order_quantity=10
         )
         
         result = executor.run_once()
@@ -965,19 +786,12 @@ class TestExecutorStop:
     def test_stop_executor(self, strategy):
         """실행 중지 테스트"""
         mock_api = Mock(spec=KISApi)
-        def mock_order_status(order_no=None):
-            return {
-                "success": True,
-                "orders": [{"order_no": order_no or "0001234567", "exec_qty": 100, "exec_price": 65000}]
-            }
-        mock_api.get_order_status.side_effect = mock_order_status
         
         executor = TradingExecutor(
             api=mock_api,
             strategy=strategy,
             stock_code="005930",
-            order_quantity=10,
-            auto_sync=False
+            order_quantity=10
         )
         
         executor.is_running = True

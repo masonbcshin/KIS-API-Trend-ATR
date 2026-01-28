@@ -40,12 +40,6 @@ class TestCompleteTradingCycle:
         3. 익절가 도달로 매도
         """
         mock_api = Mock(spec=KISApi)
-        def mock_order_status(order_no=None):
-            return {
-                "success": True,
-                "orders": [{"order_no": order_no or "0001234567", "exec_qty": 100, "exec_price": 65000}]
-            }
-        mock_api.get_order_status.side_effect = mock_order_status
         mock_api.get_daily_ohlcv.return_value = sample_uptrend_df
         mock_api.place_buy_order.return_value = {
             "success": True,
@@ -63,8 +57,7 @@ class TestCompleteTradingCycle:
             api=mock_api,
             strategy=strategy,
             stock_code="005930",
-            order_quantity=10,
-            auto_sync=False
+            order_quantity=10
         )
         
         df_with_indicators = strategy.add_indicators(sample_uptrend_df)
@@ -177,12 +170,6 @@ class TestCompleteTradingCycle:
         )
         
         mock_api = Mock(spec=KISApi)
-        def mock_order_status(order_no=None):
-            return {
-                "success": True,
-                "orders": [{"order_no": order_no or "0001234567", "exec_qty": 100, "exec_price": 65000}]
-            }
-        mock_api.get_order_status.side_effect = mock_order_status
         mock_api.get_daily_ohlcv.return_value = sample_uptrend_df
         mock_api.place_sell_order.return_value = {
             "success": True,
@@ -194,8 +181,7 @@ class TestCompleteTradingCycle:
             api=mock_api,
             strategy=strategy,
             stock_code="005930",
-            order_quantity=100,
-            auto_sync=False
+            order_quantity=100
         )
         
         df_with_indicators = strategy.add_indicators(sample_uptrend_df)
@@ -296,12 +282,6 @@ class TestErrorRecovery:
         - 포지션은 그대로 유지되어야 함
         """
         mock_api = Mock(spec=KISApi)
-        def mock_order_status(order_no=None):
-            return {
-                "success": True,
-                "orders": [{"order_no": order_no or "0001234567", "exec_qty": 100, "exec_price": 65000}]
-            }
-        mock_api.get_order_status.side_effect = mock_order_status
         mock_api.place_sell_order.return_value = {
             "success": False,
             "order_no": "",
@@ -312,8 +292,7 @@ class TestErrorRecovery:
             api=mock_api,
             strategy=strategy_with_position,
             stock_code="005930",
-            order_quantity=100,
-            auto_sync=False
+            order_quantity=100
         )
         
         original_position = strategy_with_position.position
@@ -441,12 +420,6 @@ class TestRiskManagement:
         strategy = TrendATRStrategy()
         
         mock_api = Mock(spec=KISApi)
-        def mock_order_status(order_no=None):
-            return {
-                "success": True,
-                "orders": [{"order_no": order_no or "0001234567", "exec_qty": 100, "exec_price": 65000}]
-            }
-        mock_api.get_order_status.side_effect = mock_order_status
         mock_api.get_daily_ohlcv.return_value = sample_uptrend_df
         mock_api.place_buy_order.return_value = {
             "success": True,
@@ -463,8 +436,7 @@ class TestRiskManagement:
             api=mock_api,
             strategy=strategy,
             stock_code="005930",
-            order_quantity=10,
-            auto_sync=False
+            order_quantity=10
         )
         
         total_losses = 0
@@ -564,12 +536,6 @@ class TestEndToEndWorkflow:
         strategy = TrendATRStrategy()
         
         mock_api = Mock(spec=KISApi)
-        def mock_order_status(order_no=None):
-            return {
-                "success": True,
-                "orders": [{"order_no": order_no or "0001234567", "exec_qty": 100, "exec_price": 65000}]
-            }
-        mock_api.get_order_status.side_effect = mock_order_status
         mock_api.get_daily_ohlcv.return_value = sample_uptrend_df
         mock_api.place_buy_order.return_value = {
             "success": True,
@@ -586,8 +552,7 @@ class TestEndToEndWorkflow:
             api=mock_api,
             strategy=strategy,
             stock_code="005930",
-            order_quantity=10,
-            auto_sync=False
+            order_quantity=10
         )
         
         df_with_indicators = strategy.add_indicators(sample_uptrend_df)
