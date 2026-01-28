@@ -23,10 +23,12 @@ from config import settings
 from api.kis_api import KISApi, KISApiError
 from strategy.trend_atr import TrendATRStrategy, Signal, SignalType, Position
 from utils.logger import get_logger, TradeLogger
-from utils.market_hours import is_market_open, get_market_status, should_skip_trading
-from utils.position_store import (
-    PositionStore, StoredPosition, DailyTradeStore,
-    get_position_store, get_daily_trade_store
+from utils.telegram_notifier import TelegramNotifier, get_telegram_notifier
+from engine.risk_manager import (
+    RiskManager,
+    RiskCheckResult,
+    create_risk_manager_from_settings,
+    safe_exit_with_message
 )
 
 logger = get_logger("executor")
@@ -66,7 +68,8 @@ class TradingExecutor:
         strategy: TrendATRStrategy = None,
         stock_code: str = None,
         order_quantity: int = None,
-        auto_sync: bool = True
+        risk_manager: RiskManager = None,
+        telegram_notifier: TelegramNotifier = None
     ):
         """
         거래 실행 엔진 초기화
@@ -76,12 +79,19 @@ class TradingExecutor:
             strategy: 전략 인스턴스 (미입력 시 자동 생성)
             stock_code: 거래 종목 코드 (기본: 설정 파일 값)
             order_quantity: 주문 수량 (기본: 설정 파일 값)
-            auto_sync: 시작 시 포지션 자동 동기화 여부
+            risk_manager: 리스크 매니저 (미입력 시 자동 생성)
+            telegram_notifier: 텔레그램 알림기 (미입력 시 자동 생성)
         """
         self.api = api or KISApi(is_paper_trading=True)
         self.strategy = strategy or TrendATRStrategy()
         self.stock_code = stock_code or settings.DEFAULT_STOCK_CODE
         self.order_quantity = order_quantity or settings.ORDER_QUANTITY
+        
+        # 리스크 매니저 초기화 (필수!)
+        self.risk_manager = risk_manager or create_risk_manager_from_settings()
+        
+        # 텔레그램 알림기 초기화
+        self.telegram = telegram_notifier or get_telegram_notifier()
         
         # 실행 상태
         self.is_running = False
@@ -106,6 +116,9 @@ class TradingExecutor:
             f"거래 실행 엔진 초기화: 종목={self.stock_code}, "
             f"수량={self.order_quantity}주"
         )
+        
+        # 리스크 매니저 상태 출력
+        self.risk_manager.print_status()
     
     # ════════════════════════════════════════════════════════════════
     # 포지션 동기화 (v2.0 신규)
@@ -419,6 +432,14 @@ class TradingExecutor:
         Returns:
             Dict: 주문 결과
         """
+        # ★ 리스크 체크 (신규 진입 주문)
+        risk_check = self.risk_manager.check_order_allowed(is_closing_position=False)
+        if not risk_check.passed:
+            logger.warning(risk_check.reason)
+            if risk_check.should_exit:
+                safe_exit_with_message(risk_check.reason)
+            return {"success": False, "message": risk_check.reason}
+        
         if not self._can_execute_order(signal):
             return {"success": False, "message": "주문 조건 미충족"}
         
@@ -446,49 +467,29 @@ class TradingExecutor:
                 # 체결 확인 대기
                 executed = self._wait_for_execution(result["order_no"])
                 
-                if executed and executed.get("exec_qty", 0) > 0:
-                    # 실제 체결가로 포지션 오픈
-                    exec_price = executed.get("exec_price", signal.price)
-                    exec_qty = executed.get("exec_qty", self.order_quantity)
-                    
-                    # 실제 체결가 기준 손절/익절 재계산
-                    stop_loss = self.strategy.calculate_stop_loss(exec_price, signal.atr)
-                    take_profit = self.strategy.calculate_take_profit(exec_price, signal.atr)
-                    
-                    self.strategy.open_position(
-                        stock_code=self.stock_code,
-                        entry_price=exec_price,
-                        quantity=exec_qty,
-                        stop_loss=stop_loss,
-                        take_profit=take_profit,
-                        entry_date=datetime.now().strftime("%Y-%m-%d"),
-                        atr=signal.atr
-                    )
-                    
-                    # 포지션 파일 저장
-                    self._save_position_to_store()
-                    
-                    # 주문 추적 업데이트
-                    self._last_order_time = datetime.now()
-                    self._last_signal_type = SignalType.BUY
-                    
-                    # 거래 기록
-                    trade_record = {
-                        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "type": "BUY",
-                        "price": exec_price,
-                        "quantity": exec_qty,
-                        "order_no": result["order_no"]
-                    }
-                    self._daily_trades.append(trade_record)
-                    self._daily_trade_store.save_trade(trade_record)
-                    
-                    logger.info(f"매수 주문 체결: {result['order_no']}, 체결가={exec_price:,.0f}")
-                    return {"success": True, "order_no": result["order_no"], "executed": True}
-                else:
-                    # 미체결 - 주문 취소 시도
-                    logger.warning(f"매수 주문 미체결: {result['order_no']}")
-                    return {"success": False, "message": "주문 미체결", "order_no": result["order_no"]}
+                # 주문 추적 업데이트
+                self._last_order_time = datetime.now()
+                self._last_signal_type = SignalType.BUY
+                
+                # 거래 기록
+                self._daily_trades.append({
+                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "type": "BUY",
+                    "price": signal.price,
+                    "quantity": self.order_quantity,
+                    "order_no": result["order_no"]
+                })
+                
+                logger.info(f"매수 주문 성공: {result['order_no']}")
+                
+                # 📱 텔레그램 알림 전송
+                self.telegram.notify_buy_order(
+                    stock_code=self.stock_code,
+                    price=signal.price,
+                    quantity=self.order_quantity,
+                    stop_loss=signal.stop_loss,
+                    take_profit=signal.take_profit
+                )
             else:
                 logger.error(f"매수 주문 실패: {result['message']}")
             
@@ -496,6 +497,8 @@ class TradingExecutor:
             
         except KISApiError as e:
             trade_logger.log_error("매수 주문", str(e))
+            # 📱 텔레그램 에러 알림
+            self.telegram.notify_error("매수 주문 실패", str(e))
             return {"success": False, "message": str(e)}
     
     def execute_sell_order(self, signal: Signal, is_emergency: bool = False) -> Dict:
@@ -514,7 +517,15 @@ class TradingExecutor:
         Returns:
             Dict: 주문 결과
         """
-        if not is_emergency and not self._can_execute_order(signal):
+        # ★ 리스크 체크 (청산 주문 - 손실 한도 도달해도 청산은 허용)
+        risk_check = self.risk_manager.check_order_allowed(is_closing_position=True)
+        if not risk_check.passed:
+            logger.warning(risk_check.reason)
+            if risk_check.should_exit:
+                safe_exit_with_message(risk_check.reason)
+            return {"success": False, "message": risk_check.reason}
+        
+        if not self._can_execute_order(signal):
             return {"success": False, "message": "주문 조건 미충족"}
         
         # 포지션 미보유 시
@@ -538,84 +549,68 @@ class TradingExecutor:
                     order_type="01"  # 시장가 주문
                 )
                 
-                if result["success"]:
-                    # 체결 확인 대기
-                    executed = self._wait_for_execution(result["order_no"])
-                    
-                    if executed and executed.get("exec_qty", 0) > 0:
-                        exec_price = executed.get("exec_price", signal.price)
-                        
-                        # 포지션 청산
-                        close_result = self.strategy.close_position(
-                            exit_price=exec_price,
-                            reason=signal.reason
-                        )
-                        
-                        # 포지션 파일 삭제
-                        self._position_store.clear_position()
-                        
-                        # 주문 추적 업데이트
-                        self._last_order_time = datetime.now()
-                        self._last_signal_type = SignalType.SELL
-                        
-                        # 거래 기록
-                        pnl = close_result["pnl"] if close_result else 0
-                        pnl_pct = close_result["pnl_pct"] if close_result else 0
-                        
-                        trade_record = {
-                            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            "type": "SELL",
-                            "price": exec_price,
-                            "quantity": position.quantity,
-                            "order_no": result["order_no"],
-                            "pnl": pnl,
-                            "pnl_pct": pnl_pct,
-                            "entry_price": position.entry_price
-                        }
-                        self._daily_trades.append(trade_record)
-                        self._daily_trade_store.save_trade(trade_record)
-                        
-                        logger.info(f"매도 주문 체결: {result['order_no']}, 체결가={exec_price:,.0f}")
-                        return {"success": True, "order_no": result["order_no"], "executed": True}
-                    else:
-                        logger.warning(f"매도 주문 미체결 (시도 {attempt+1}/{max_retries})")
-                else:
-                    logger.error(f"매도 주문 실패 (시도 {attempt+1}/{max_retries}): {result['message']}")
+                # ★ 리스크 매니저에 손익 기록
+                if close_result:
+                    self.risk_manager.record_trade_pnl(close_result["pnl"])
                 
-            except KISApiError as e:
-                logger.error(f"매도 주문 에러 (시도 {attempt+1}/{max_retries}): {e}")
+                # 주문 추적 업데이트
+                self._last_order_time = datetime.now()
+                self._last_signal_type = SignalType.SELL
+                
+                # 거래 기록
+                pnl = close_result["pnl"] if close_result else 0
+                pnl_pct = close_result["pnl_pct"] if close_result else 0
+                
+                self._daily_trades.append({
+                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "type": "SELL",
+                    "price": signal.price,
+                    "quantity": position.quantity,
+                    "order_no": result["order_no"],
+                    "pnl": pnl,
+                    "pnl_pct": pnl_pct
+                })
+                
+                logger.info(f"매도 주문 성공: {result['order_no']}")
+                
+                # 📱 텔레그램 알림 전송 (손절/익절 구분)
+                if close_result:
+                    if "손절" in signal.reason or pnl < 0:
+                        self.telegram.notify_stop_loss(
+                            stock_code=self.stock_code,
+                            entry_price=position.entry_price,
+                            exit_price=signal.price,
+                            pnl=pnl,
+                            pnl_pct=pnl_pct
+                        )
+                    elif "익절" in signal.reason or pnl > 0:
+                        self.telegram.notify_take_profit(
+                            stock_code=self.stock_code,
+                            entry_price=position.entry_price,
+                            exit_price=signal.price,
+                            pnl=pnl,
+                            pnl_pct=pnl_pct
+                        )
+                    else:
+                        # 일반 청산
+                        self.telegram.notify_sell_order(
+                            stock_code=self.stock_code,
+                            price=signal.price,
+                            quantity=position.quantity,
+                            reason=signal.reason,
+                            pnl=pnl,
+                            pnl_pct=pnl_pct
+                        )
+            else:
+                logger.error(f"매도 주문 실패: {result['message']}")
             
-            # 재시도 대기
-            if attempt < max_retries - 1:
-                logger.info(f"매도 재시도 대기: {retry_interval}초...")
-                time.sleep(retry_interval)
-        
-        # 모든 재시도 실패
-        if is_emergency:
-            self._handle_emergency_sell_failure()
-        
-        trade_logger.log_error("매도 주문", "모든 재시도 실패")
-        return {"success": False, "message": "매도 주문 실패 (모든 재시도 실패)"}
-    
-    def _handle_emergency_sell_failure(self) -> None:
-        """
-        긴급 손절 실패 시 처리합니다.
-        
-        - 프로그램 긴급 정지
-        - 경고 로그 기록
-        - (향후) 알림 발송
-        """
-        logger.critical(
-            "⚠️ 긴급 손절 실패! 수동 개입 필요!\n"
-            f"종목: {self.stock_code}\n"
-            f"포지션: {self.strategy.position}"
-        )
-        
-        self._is_emergency_stop = True
-        self.is_running = False
-        
-        # TODO: SMS/텔레그램 알림 발송
-        # self._send_emergency_alert("긴급 손절 실패! 수동 청산 필요")
+            return result
+            
+        except KISApiError as e:
+            trade_logger.log_error("매도 주문", str(e))
+            # 📱 텔레그램 에러 알림
+            self.telegram.notify_error("매도 주문 실패", str(e))
+            return {"success": False, "message": str(e)}
     
     # ════════════════════════════════════════════════════════════════
     # 메인 실행 로직
@@ -625,16 +620,25 @@ class TradingExecutor:
         """
         전략을 1회 실행합니다 (v2.0 개선).
         
-        개선 사항:
-        - 거래시간 검증
-        - 일일 한도 체크
-        - 긴급 손절 처리
+        실행 순서:
+            0. 리스크 체크 (Kill Switch)
+            1. 시장 데이터 조회
+            2. 현재가 조회
+            3. 전략 시그널 생성
+            4. 시그널에 따른 주문 실행
         
         Returns:
             Dict: 실행 결과
         """
         logger.info("=" * 50)
         logger.info("전략 실행 시작")
+        
+        # ★ 실행 전 킬 스위치 체크
+        kill_check = self.risk_manager.check_kill_switch()
+        if not kill_check.passed:
+            logger.error(kill_check.reason)
+            if kill_check.should_exit:
+                safe_exit_with_message(kill_check.reason)
         
         result = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -753,6 +757,8 @@ class TradingExecutor:
         except Exception as e:
             result["error"] = str(e)
             logger.error(f"전략 실행 오류: {e}")
+            # 📱 텔레그램 에러 알림
+            self.telegram.notify_error("전략 실행 오류", str(e))
         
         logger.info("전략 실행 완료")
         logger.info("=" * 50)
@@ -771,6 +777,14 @@ class TradingExecutor:
             interval_seconds: 실행 간격 (초, 최소 60초)
             max_iterations: 최대 반복 횟수 (None = 무한)
         """
+        # ★ 시작 전 킬 스위치 체크
+        kill_check = self.risk_manager.check_kill_switch()
+        if not kill_check.passed:
+            logger.error(kill_check.reason)
+            if kill_check.should_exit:
+                safe_exit_with_message(kill_check.reason)
+            return
+        
         # 초단타 방지: 최소 60초 간격
         if interval_seconds < 60:
             logger.warning("실행 간격이 60초 미만입니다. 60초로 조정합니다.")
@@ -780,6 +794,14 @@ class TradingExecutor:
         iteration = 0
         
         logger.info(f"거래 실행 시작 (간격: {interval_seconds}초)")
+        
+        # 📱 텔레그램 시작 알림
+        self.telegram.notify_system_start(
+            stock_code=self.stock_code,
+            order_quantity=self.order_quantity,
+            interval=interval_seconds,
+            mode="모의투자" if settings.IS_PAPER_TRADING else "실계좌"
+        )
         
         try:
             while self.is_running:
@@ -806,9 +828,25 @@ class TradingExecutor:
                 
         except KeyboardInterrupt:
             logger.info("사용자에 의해 중단됨")
+            stop_reason = "사용자 중단"
+        except Exception as e:
+            logger.error(f"예기치 않은 오류: {e}")
+            stop_reason = f"오류 발생: {str(e)}"
+            # 📱 텔레그램 에러 알림
+            self.telegram.notify_error("시스템 오류", str(e))
+        else:
+            stop_reason = "정상 종료"
         finally:
             self.is_running = False
             logger.info("거래 실행 종료")
+            
+            # 📱 텔레그램 종료 알림
+            summary = self.get_daily_summary()
+            self.telegram.notify_system_stop(
+                reason=stop_reason,
+                total_trades=summary["total_trades"],
+                daily_pnl=summary["total_pnl"]
+            )
     
     def stop(self) -> None:
         """거래 실행을 중지합니다."""

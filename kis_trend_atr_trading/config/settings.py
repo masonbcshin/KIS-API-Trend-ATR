@@ -84,36 +84,19 @@ ADX_THRESHOLD = 25.0
 ADX_PERIOD = 14
 
 # ════════════════════════════════════════════════════════════════
-# 일일 리스크 한도 (계좌 보호)
+# 긴급 정지 및 일일 손실 제한 (Kill Switch & Daily Loss Limit)
 # ════════════════════════════════════════════════════════════════
 
-# 일일 최대 손실 비율 (%)
-# 당일 누적 손실이 이 비율을 초과하면 자동 거래 중지
-DAILY_MAX_LOSS_PCT = 10.0
+# 킬 스위치 (긴급 정지)
+# True로 설정하면 모든 신규 주문이 즉시 차단되고 프로그램이 안전 종료됩니다.
+# 긴급 상황 발생 시 이 값을 True로 변경하세요.
+ENABLE_KILL_SWITCH = False
 
-# 일일 최대 거래 횟수
-# 당일 거래 횟수가 이를 초과하면 신규 진입 중지
-DAILY_MAX_TRADES = 5
-
-# 연속 손실 허용 횟수
-# 연속 손실이 이를 초과하면 당일 거래 중지
-MAX_CONSECUTIVE_LOSSES = 3
-
-# ════════════════════════════════════════════════════════════════
-# 긴급 손절 설정
-# ════════════════════════════════════════════════════════════════
-
-# 긴급 손절 최대 재시도 횟수
-EMERGENCY_SELL_MAX_RETRIES = 10
-
-# 긴급 손절 재시도 간격 (초)
-EMERGENCY_SELL_RETRY_INTERVAL = 3
-
-# 체결 확인 최대 대기 시간 (초)
-ORDER_EXECUTION_TIMEOUT = 30
-
-# 체결 확인 간격 (초)
-ORDER_CHECK_INTERVAL = 2
+# 일일 최대 손실 허용 비율 (%)
+# 당일 누적 손실이 이 비율을 초과하면 신규 주문이 차단됩니다.
+# 예: 3.0 = 시작 자본금의 3% 손실 시 거래 중단
+# 주의: 기존 포지션의 청산은 허용됩니다 (추가 손실 방지 목적)
+DAILY_MAX_LOSS_PERCENT = 3.0
 
 # ════════════════════════════════════════════════════════════════
 # API 호출 설정
@@ -150,6 +133,19 @@ LOG_LEVEL = "INFO"
 
 # 로그 파일 저장 경로
 LOG_DIR = Path(__file__).parent.parent / "logs"
+
+# ════════════════════════════════════════════════════════════════
+# 텔레그램 알림 설정
+# ════════════════════════════════════════════════════════════════
+
+# 텔레그램 봇 토큰 (@BotFather에서 발급)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+
+# 텔레그램 채팅 ID (1:1 또는 그룹)
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# 텔레그램 알림 활성화 여부
+TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "true").lower() in ("true", "1", "yes")
 
 # ════════════════════════════════════════════════════════════════
 # 설정 검증 함수
@@ -195,6 +191,8 @@ def get_settings_summary() -> str:
     Returns:
         str: 설정 요약 문자열
     """
+    telegram_status = "✅ 활성화" if (TELEGRAM_ENABLED and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID) else "❌ 비활성화"
+    
     return f"""
 ═══════════════════════════════════════════════════
 KIS Trend-ATR Trading System - 설정 요약
@@ -213,5 +211,8 @@ KIS Trend-ATR Trading System - 설정 요약
 
 [주문 설정]
 - 주문 수량: {ORDER_QUANTITY}주
+
+[텔레그램 알림]
+- 상태: {telegram_status}
 ═══════════════════════════════════════════════════
 """
