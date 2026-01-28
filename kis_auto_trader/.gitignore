@@ -1,0 +1,65 @@
+# ═══════════════════════════════════════════════════════════════
+# KIS Auto Trader - Git 제외 파일
+# ═══════════════════════════════════════════════════════════════
+
+# 환경변수 (민감정보 포함)
+.env
+*.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 가상환경
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 로그
+logs/
+*.log
+
+# 테스트/캐시
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 토큰/인증 파일
+token.dat
+*.token
+*.key
+*.pem
