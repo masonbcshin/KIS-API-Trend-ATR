@@ -1,8 +1,14 @@
 """
 KIS Trend-ATR Trading System - 포지션 영속화 모듈
 
-포지션 정보를 파일에 저장하고 복구합니다.
+멀티데이 포지션 정보를 파일에 저장하고 복구합니다.
 프로그램 재시작 시 포지션 손실을 방지합니다.
+
+★ 핵심 기능:
+    1. 포지션 상태 영속화 (JSON)
+    2. 프로그램 종료 시 자동 저장
+    3. 프로그램 시작 시 자동 로드
+    4. API를 통한 실제 보유 확인
 
 저장 위치: data/positions.json
 """
@@ -11,7 +17,7 @@ import json
 import os
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 import logging
 from dataclasses import dataclass, asdict
 
@@ -25,30 +31,89 @@ POSITION_FILE = DATA_DIR / "positions.json"
 @dataclass
 class StoredPosition:
     """
-    저장되는 포지션 정보
+    저장되는 멀티데이 포지션 정보
+    
+    ★ 필수 저장 필드:
+        - atr_at_entry: 진입 시 ATR (고정, 재계산 금지)
+        - stop_loss: 손절가 (진입 시 설정, 변경 금지)
+        - trailing_stop: 현재 트레일링 스탑 가격
+        - highest_price: 보유 중 최고가
     
     Attributes:
         stock_code: 종목 코드
+        position: 포지션 방향 (LONG)
         entry_price: 진입가
         quantity: 수량
+        atr_at_entry: 진입 시 ATR (★ 고정값, 재계산 금지)
         stop_loss: 손절가
-        take_profit: 익절가
-        entry_date: 진입일
-        atr_at_entry: 진입 시 ATR
+        take_profit: 익절가 (None 가능)
+        trailing_stop: 현재 트레일링 스탑 가격
+        highest_price: 보유 중 최고가
+        entry_date: 진입일 (YYYY-MM-DD)
+        entry_time: 진입 시간 (HH:MM:SS)
+        state: 트레이딩 상태
         saved_at: 저장 시간
     """
     stock_code: str
     entry_price: float
     quantity: int
     stop_loss: float
-    take_profit: float
+    take_profit: Optional[float]
     entry_date: str
     atr_at_entry: float
+    position: str = "LONG"
+    trailing_stop: float = 0.0
+    highest_price: float = 0.0
+    entry_time: str = ""
+    state: str = "ENTERED"
     saved_at: str = ""
     
     def __post_init__(self):
         if not self.saved_at:
             self.saved_at = datetime.now().isoformat()
+        if not self.entry_time:
+            self.entry_time = datetime.now().strftime("%H:%M:%S")
+        if self.highest_price == 0.0 and self.entry_price > 0:
+            self.highest_price = self.entry_price
+        if self.trailing_stop == 0.0 and self.stop_loss > 0:
+            self.trailing_stop = self.stop_loss
+    
+    def to_multiday_position(self):
+        """MultidayPosition 객체로 변환"""
+        from engine.trading_state import MultidayPosition, TradingState
+        
+        return MultidayPosition(
+            symbol=self.stock_code,
+            position=self.position,
+            entry_price=self.entry_price,
+            quantity=self.quantity,
+            atr_at_entry=self.atr_at_entry,
+            stop_loss=self.stop_loss,
+            take_profit=self.take_profit,
+            trailing_stop=self.trailing_stop,
+            highest_price=self.highest_price,
+            entry_date=self.entry_date,
+            entry_time=self.entry_time,
+            state=TradingState(self.state)
+        )
+    
+    @classmethod
+    def from_multiday_position(cls, pos) -> "StoredPosition":
+        """MultidayPosition 객체에서 생성"""
+        return cls(
+            stock_code=pos.symbol,
+            position=pos.position,
+            entry_price=pos.entry_price,
+            quantity=pos.quantity,
+            atr_at_entry=pos.atr_at_entry,
+            stop_loss=pos.stop_loss,
+            take_profit=pos.take_profit,
+            trailing_stop=pos.trailing_stop,
+            highest_price=pos.highest_price,
+            entry_date=pos.entry_date,
+            entry_time=pos.entry_time,
+            state=pos.state.value
+        )
 
 
 class PositionStore:
@@ -162,6 +227,106 @@ class PositionStore:
         """
         position = self.load_position()
         return position is not None
+    
+    def verify_with_api(self, api_client, stock_code: str) -> Tuple[bool, int, float]:
+        """
+        API를 통해 실제 보유 여부를 확인합니다.
+        
+        ★ 프로그램 시작 시 반드시 호출하여 데이터 정합성 검증
+        
+        Args:
+            api_client: KIS API 클라이언트
+            stock_code: 종목 코드
+        
+        Returns:
+            Tuple[bool, int, float]: (보유여부, 보유수량, 평균단가)
+        """
+        try:
+            balance = api_client.get_account_balance()
+            
+            if not balance.get("success"):
+                logger.warning("계좌 잔고 조회 실패")
+                return False, 0, 0.0
+            
+            holdings = balance.get("holdings", [])
+            
+            for holding in holdings:
+                if holding.get("stock_code") == stock_code:
+                    qty = holding.get("quantity", 0)
+                    avg_price = holding.get("avg_price", 0)
+                    
+                    if qty > 0:
+                        logger.info(f"API 보유 확인: {stock_code} {qty}주 @ {avg_price:,.0f}원")
+                        return True, qty, avg_price
+            
+            logger.info(f"API 보유 없음: {stock_code}")
+            return False, 0, 0.0
+            
+        except Exception as e:
+            logger.error(f"API 보유 확인 실패: {e}")
+            return False, 0, 0.0
+    
+    def reconcile_position(
+        self, 
+        api_client, 
+        stored_position: Optional[StoredPosition]
+    ) -> Tuple[Optional[StoredPosition], str]:
+        """
+        저장된 포지션과 실제 보유를 대조합니다.
+        
+        ★ 프로그램 시작 시 호출하여 데이터 정합성 보장
+        
+        시나리오:
+            1. 저장O + 보유O → 저장된 포지션 반환 (정상)
+            2. 저장O + 보유X → 불일치 경고, None 반환
+            3. 저장X + 보유O → 신규 포지션 생성 필요
+            4. 저장X + 보유X → None 반환 (정상)
+        
+        Args:
+            api_client: KIS API 클라이언트
+            stored_position: 저장된 포지션
+        
+        Returns:
+            Tuple[StoredPosition, str]: (유효한 포지션, 상태 메시지)
+        """
+        if stored_position is None:
+            stock_code = None
+        else:
+            stock_code = stored_position.stock_code
+        
+        # 저장된 포지션이 없으면 검증 불필요
+        if stock_code is None:
+            return None, "저장된 포지션 없음"
+        
+        # API로 실제 보유 확인
+        has_holding, qty, avg_price = self.verify_with_api(api_client, stock_code)
+        
+        if stored_position and has_holding:
+            # 시나리오 1: 저장O + 보유O
+            if qty != stored_position.quantity:
+                logger.warning(
+                    f"수량 불일치: 저장={stored_position.quantity}, 실제={qty}"
+                )
+            return stored_position, "포지션 정합성 확인 완료"
+        
+        elif stored_position and not has_holding:
+            # 시나리오 2: 저장O + 보유X
+            logger.warning(
+                f"포지션 불일치: 저장됨({stock_code})이지만 실제 보유 없음"
+            )
+            self.clear_position()
+            return None, "포지션 불일치 - 저장 데이터 삭제됨"
+        
+        elif not stored_position and has_holding:
+            # 시나리오 3: 저장X + 보유O
+            logger.warning(
+                f"미기록 보유 발견: {stock_code} {qty}주 @ {avg_price:,.0f}원"
+            )
+            return None, f"미기록 보유 발견: {stock_code} {qty}주"
+        
+        else:
+            # 시나리오 4: 저장X + 보유X
+            return None, "포지션 없음 확인"
 
 
 class DailyTradeStore:

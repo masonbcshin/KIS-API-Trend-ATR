@@ -34,11 +34,17 @@ ACCOUNT_NO = os.getenv("KIS_ACCOUNT_NO", "")  # 계좌번호 (8자리)
 ACCOUNT_PRODUCT_CODE = os.getenv("KIS_ACCOUNT_PRODUCT_CODE", "01")  # 계좌상품코드
 
 # ════════════════════════════════════════════════════════════════
-# 거래 설정
+# 거래 모드 설정 (중요!)
 # ════════════════════════════════════════════════════════════════
 
-# 모의투자 여부 (항상 True 유지)
-IS_PAPER_TRADING = True
+# 트레이딩 모드 설정
+# - "LIVE"  : 실계좌 주문 (실제 매매 발생)
+# - "CBT"   : 종이 매매 (주문 금지, 텔레그램 알림만)
+# - "PAPER" : 모의투자 (모의투자 서버 주문)
+TRADING_MODE = os.getenv("TRADING_MODE", "PAPER")
+
+# 모의투자 여부 (TRADING_MODE와 연동)
+IS_PAPER_TRADING = TRADING_MODE in ("PAPER", "CBT")
 
 # 기본 거래 종목 (삼성전자)
 DEFAULT_STOCK_CODE = "005930"
@@ -82,6 +88,54 @@ ADX_THRESHOLD = 25.0
 
 # ADX 계산 기간
 ADX_PERIOD = 14
+
+# ════════════════════════════════════════════════════════════════
+# 트레일링 스탑 설정 (멀티데이 전략 필수)
+# ════════════════════════════════════════════════════════════════
+
+# 트레일링 스탑 활성화 여부
+ENABLE_TRAILING_STOP = True
+
+# 트레일링 스탑 ATR 배수 (진입 시 ATR 기준)
+# 트레일링 스탑 = 최고가 - (진입ATR * 배수)
+TRAILING_STOP_ATR_MULTIPLIER = 2.0
+
+# 트레일링 스탑 활성화 기준 (진입가 대비 수익률 %)
+# 이 수익률 이상이면 트레일링 스탑이 작동 시작
+TRAILING_STOP_ACTIVATION_PCT = 1.0
+
+# ════════════════════════════════════════════════════════════════
+# 갭 리스크 관리 (멀티데이 필수 옵션)
+# ════════════════════════════════════════════════════════════════
+
+# 갭 리스크 완화 활성화 여부 (기본 OFF)
+ENABLE_GAP_PROTECTION = False
+
+# 최대 갭 손실 허용 비율 (%)
+# 시가가 손절가보다 이 비율 이상 불리하면 즉시 청산
+MAX_GAP_LOSS_PCT = 3.0
+
+# ════════════════════════════════════════════════════════════════
+# 이벤트 리스크 관리
+# ════════════════════════════════════════════════════════════════
+
+# 고위험 이벤트일 신규 진입 제한 활성화
+ENABLE_EVENT_RISK_CHECK = False
+
+# 고위험 이벤트 날짜 목록 (YYYY-MM-DD 형식)
+# 예: FOMC, 옵션 만기일, 중요 경제지표 발표일 등
+HIGH_RISK_EVENT_DATES = []
+
+# ════════════════════════════════════════════════════════════════
+# 손익 알림 임계값
+# ════════════════════════════════════════════════════════════════
+
+# 손절/익절 근접 알림 비율 (%)
+# 손절선까지 이 비율에 도달하면 텔레그램 알림 전송
+ALERT_NEAR_STOPLOSS_PCT = 80.0
+
+# 익절선 근접 알림 비율 (%)
+ALERT_NEAR_TAKEPROFIT_PCT = 80.0
 
 # ════════════════════════════════════════════════════════════════
 # 긴급 정지 및 일일 손실 제한 (Kill Switch & Daily Loss Limit)
@@ -222,13 +276,23 @@ def get_settings_summary() -> str:
     """
     telegram_status = "✅ 활성화" if (TELEGRAM_ENABLED and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID) else "❌ 비활성화"
     
+    mode_emoji = {
+        "LIVE": "🔴 실계좌",
+        "CBT": "🟡 종이매매",
+        "PAPER": "🟢 모의투자"
+    }
+    mode_display = mode_emoji.get(TRADING_MODE, f"❓ {TRADING_MODE}")
+    
     return f"""
 ═══════════════════════════════════════════════════
 KIS Trend-ATR Trading System - 설정 요약
 ═══════════════════════════════════════════════════
+[트레이딩 모드]
+- 모드: {mode_display}
+- 실주문 여부: {'예' if TRADING_MODE == 'LIVE' else '아니오' if TRADING_MODE == 'CBT' else '모의투자만'}
+
 [API 설정]
 - BASE URL: {KIS_BASE_URL}
-- 모의투자: {'예' if IS_PAPER_TRADING else '아니오 (⚠️ 위험!)'}
 - 계좌번호: {ACCOUNT_NO[:4]}****
 
 [전략 파라미터]
@@ -238,6 +302,11 @@ KIS Trend-ATR Trading System - 설정 요약
 - 손절 배수: {ATR_MULTIPLIER_SL}x ATR
 - 익절 배수: {ATR_MULTIPLIER_TP}x ATR
 
+[멀티데이 설정]
+- 트레일링 스탑: {'✅ ON' if ENABLE_TRAILING_STOP else '❌ OFF'}
+- 갭 보호: {'✅ ON' if ENABLE_GAP_PROTECTION else '❌ OFF'}
+- 이벤트 체크: {'✅ ON' if ENABLE_EVENT_RISK_CHECK else '❌ OFF'}
+
 [주문 설정]
 - 주문 수량: {ORDER_QUANTITY}주
 
@@ -245,3 +314,23 @@ KIS Trend-ATR Trading System - 설정 요약
 - 상태: {telegram_status}
 ═══════════════════════════════════════════════════
 """
+
+
+def is_cbt_mode() -> bool:
+    """CBT(종이매매) 모드인지 확인합니다."""
+    return TRADING_MODE == "CBT"
+
+
+def is_live_mode() -> bool:
+    """LIVE(실계좌) 모드인지 확인합니다."""
+    return TRADING_MODE == "LIVE"
+
+
+def is_paper_mode() -> bool:
+    """PAPER(모의투자) 모드인지 확인합니다."""
+    return TRADING_MODE == "PAPER"
+
+
+def can_place_orders() -> bool:
+    """실제 주문이 가능한 모드인지 확인합니다."""
+    return TRADING_MODE in ("LIVE", "PAPER")
