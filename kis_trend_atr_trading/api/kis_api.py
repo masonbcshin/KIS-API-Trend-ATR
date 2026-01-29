@@ -604,9 +604,12 @@ class KISApi:
                 "order_type": "매수" if item.get("sll_buy_dvsn_cd") == "02" else "매도",
                 "order_qty": int(item.get("ord_qty", 0)),
                 "exec_qty": int(item.get("tot_ccld_qty", 0)),
+                "remain_qty": int(item.get("ord_qty", 0)) - int(item.get("tot_ccld_qty", 0)),
                 "order_price": float(item.get("ord_unpr", 0)),
                 "exec_price": float(item.get("avg_prvs", 0)),
-                "status": "체결" if int(item.get("tot_ccld_qty", 0)) > 0 else "미체결",
+                "status": "체결완료" if int(item.get("tot_ccld_qty", 0)) == int(item.get("ord_qty", 0)) else (
+                    "부분체결" if int(item.get("tot_ccld_qty", 0)) > 0 else "미체결"
+                ),
             })
         
         return {
@@ -614,6 +617,182 @@ class KISApi:
             "orders": orders,
             "total_count": len(orders)
         }
+    
+    def wait_for_execution(
+        self,
+        order_no: str,
+        expected_qty: int,
+        timeout_seconds: int = 30,
+        check_interval: float = 2.0
+    ) -> Dict:
+        """
+        주문 체결을 동기적으로 대기합니다.
+        
+        ★ 핵심 안전장치:
+            - 체결 완료될 때까지 대기
+            - 타임아웃 시 미체결 주문 취소
+            - 부분체결 상황 명시적 처리
+        
+        Args:
+            order_no: 주문 번호
+            expected_qty: 예상 체결 수량
+            timeout_seconds: 최대 대기 시간 (초)
+            check_interval: 체결 확인 간격 (초)
+        
+        Returns:
+            Dict: 체결 결과
+                - success: 완전 체결 여부
+                - exec_qty: 실제 체결 수량
+                - exec_price: 평균 체결가
+                - status: "FILLED" / "PARTIAL" / "TIMEOUT" / "CANCELLED"
+                - message: 상세 메시지
+        """
+        start_time = time.time()
+        last_exec_qty = 0
+        
+        logger.info(f"체결 대기 시작: 주문번호={order_no}, 예상수량={expected_qty}, 타임아웃={timeout_seconds}초")
+        
+        while time.time() - start_time < timeout_seconds:
+            try:
+                status_result = self.get_order_status(order_no)
+                
+                if not status_result.get("success") or not status_result.get("orders"):
+                    time.sleep(check_interval)
+                    continue
+                
+                order = status_result["orders"][0]
+                exec_qty = order.get("exec_qty", 0)
+                exec_price = order.get("exec_price", 0)
+                remain_qty = order.get("remain_qty", expected_qty)
+                
+                # 완전 체결
+                if exec_qty >= expected_qty:
+                    logger.info(f"체결 완료: {exec_qty}주 @ {exec_price:,.0f}원")
+                    return {
+                        "success": True,
+                        "exec_qty": exec_qty,
+                        "exec_price": exec_price,
+                        "status": "FILLED",
+                        "message": f"완전 체결: {exec_qty}주 @ {exec_price:,.0f}원"
+                    }
+                
+                # 부분 체결 진행 중
+                if exec_qty > last_exec_qty:
+                    logger.info(f"부분 체결 진행: {exec_qty}/{expected_qty}주")
+                    last_exec_qty = exec_qty
+                
+                time.sleep(check_interval)
+                
+            except KISApiError as e:
+                logger.warning(f"체결 확인 중 오류: {e}")
+                time.sleep(check_interval)
+        
+        # 타임아웃 - 미체결분 취소 시도
+        logger.warning(f"체결 타임아웃: {timeout_seconds}초 경과")
+        
+        # 최종 상태 확인
+        try:
+            final_status = self.get_order_status(order_no)
+            if final_status.get("orders"):
+                final_order = final_status["orders"][0]
+                final_exec_qty = final_order.get("exec_qty", 0)
+                final_exec_price = final_order.get("exec_price", 0)
+                final_remain = final_order.get("remain_qty", 0)
+                
+                if final_exec_qty > 0:
+                    # 부분 체결된 경우 - 미체결분 취소 시도
+                    if final_remain > 0:
+                        cancel_result = self.cancel_order(order_no)
+                        logger.info(f"미체결분 취소 시도: {cancel_result}")
+                    
+                    return {
+                        "success": False,
+                        "exec_qty": final_exec_qty,
+                        "exec_price": final_exec_price,
+                        "status": "PARTIAL",
+                        "message": f"부분 체결: {final_exec_qty}/{expected_qty}주, 미체결 취소 시도"
+                    }
+                else:
+                    # 완전 미체결 - 주문 취소
+                    cancel_result = self.cancel_order(order_no)
+                    return {
+                        "success": False,
+                        "exec_qty": 0,
+                        "exec_price": 0,
+                        "status": "CANCELLED",
+                        "message": f"미체결로 주문 취소됨: {cancel_result}"
+                    }
+        except Exception as e:
+            logger.error(f"최종 상태 확인 실패: {e}")
+        
+        return {
+            "success": False,
+            "exec_qty": last_exec_qty,
+            "exec_price": 0,
+            "status": "TIMEOUT",
+            "message": f"타임아웃 - 마지막 확인 체결수량: {last_exec_qty}주"
+        }
+    
+    def cancel_order(self, order_no: str) -> Dict:
+        """
+        미체결 주문을 취소합니다 (모의투자 전용).
+        
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        KIS API Endpoint: POST /uapi/domestic-stock/v1/trading/order-rvsecncl
+        TR_ID: VTTC0803U (모의투자 주문취소)
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        
+        Args:
+            order_no: 취소할 주문 번호
+        
+        Returns:
+            Dict: 취소 결과
+        """
+        url = f"{self.base_url}/uapi/domestic-stock/v1/trading/order-rvsecncl"
+        
+        # 모의투자 취소 TR_ID
+        tr_id = "VTTC0803U"
+        headers = self._get_auth_headers(tr_id)
+        
+        body = {
+            "CANO": self.account_no,
+            "ACNT_PRDT_CD": self.account_product_code,
+            "KRX_FWDG_ORD_ORGNO": "",
+            "ORGN_ODNO": order_no,
+            "ORD_DVSN": "00",
+            "RVSE_CNCL_DVSN_CD": "02",  # 취소
+            "ORD_QTY": "0",  # 전량 취소
+            "ORD_UNPR": "0",
+            "QTY_ALL_ORD_YN": "Y",  # 전량
+        }
+        
+        logger.info(f"주문 취소 요청: 주문번호={order_no}")
+        
+        try:
+            response = self._request_with_retry("POST", url, headers, json_data=body)
+            data = response.json()
+            
+            success = data.get("rt_cd") == "0"
+            message = data.get("msg1", "")
+            
+            if success:
+                logger.info(f"주문 취소 성공: {order_no}")
+            else:
+                logger.warning(f"주문 취소 실패: {message}")
+            
+            return {
+                "success": success,
+                "order_no": order_no,
+                "message": message
+            }
+            
+        except KISApiError as e:
+            logger.error(f"주문 취소 에러: {e}")
+            return {
+                "success": False,
+                "order_no": order_no,
+                "message": str(e)
+            }
     
     def get_account_balance(self) -> Dict:
         """
