@@ -97,6 +97,8 @@ class RiskManager:
     기능:
         1. Kill Switch: 긴급 정지 (모든 주문 즉시 차단)
         2. Daily Loss Limit: 일일 손실 한도 초과 시 신규 주문 차단
+        3. API Error Count: API 에러 연속 발생 시 자동 Kill Switch
+        4. Manual Kill Flag: 파일 기반 수동 Kill Switch
     
     Usage:
         risk_manager = RiskManager(
@@ -111,6 +113,9 @@ class RiskManager:
             logger.warning(result.reason)
             if result.should_exit:
                 sys.exit(0)
+        
+        # API 에러 기록
+        risk_manager.record_api_error("토큰 만료")
     """
     
     def __init__(
@@ -118,7 +123,10 @@ class RiskManager:
         enable_kill_switch: bool = False,
         daily_max_loss_percent: float = 3.0,
         starting_capital: float = 0.0,
-        telegram_notifier=None
+        telegram_notifier=None,
+        max_api_errors: int = 5,
+        api_error_reset_minutes: int = 10,
+        kill_switch_file: str = None
     ):
         """
         리스크 매니저 초기화
@@ -128,6 +136,9 @@ class RiskManager:
             daily_max_loss_percent: 일일 최대 손실 허용 비율 (%)
             starting_capital: 시작 자본금 (원)
             telegram_notifier: 텔레그램 알림기 (미입력 시 자동 생성)
+            max_api_errors: API 에러 최대 허용 횟수
+            api_error_reset_minutes: API 에러 카운터 리셋 시간 (분)
+            kill_switch_file: 수동 Kill Switch 플래그 파일 경로
         """
         self._enable_kill_switch = enable_kill_switch
         self._daily_max_loss_percent = daily_max_loss_percent
@@ -140,13 +151,27 @@ class RiskManager:
         # 일일 손실 한도 도달 플래그
         self._daily_limit_reached = False
         
+        # API 에러 추적 (신규)
+        self._max_api_errors = max_api_errors
+        self._api_error_reset_minutes = api_error_reset_minutes
+        self._api_error_count = 0
+        self._last_api_error_time: Optional[datetime] = None
+        self._api_error_reasons: list = []
+        
+        # 수동 Kill Switch 파일 (신규)
+        from pathlib import Path
+        self._kill_switch_file = Path(kill_switch_file) if kill_switch_file else (
+            Path(__file__).parent.parent / "data" / "KILL_SWITCH"
+        )
+        
         # 텔레그램 알림기
         self._telegram = telegram_notifier or get_telegram_notifier()
         
         logger.info(
             f"[RISK] 리스크 매니저 초기화 완료 | "
             f"Kill Switch: {'ON' if enable_kill_switch else 'OFF'} | "
-            f"일일 손실 한도: {daily_max_loss_percent}%"
+            f"일일 손실 한도: {daily_max_loss_percent}% | "
+            f"API 에러 한도: {max_api_errors}회"
         )
         
         # 킬 스위치 활성화 상태면 즉시 경고
@@ -157,6 +182,9 @@ class RiskManager:
             )
             # 📱 텔레그램 킬 스위치 알림
             self._telegram.notify_kill_switch("초기화 시 킬 스위치가 활성화되어 있습니다.")
+        
+        # 수동 Kill Switch 파일 체크
+        self._check_manual_kill_switch()
     
     # ════════════════════════════════════════════════════════════════
     # 설정 조회/변경
@@ -300,6 +328,129 @@ class RiskManager:
         )
     
     # ════════════════════════════════════════════════════════════════
+    # API 에러 관리 (신규)
+    # ════════════════════════════════════════════════════════════════
+    
+    def record_api_error(self, reason: str = "") -> bool:
+        """
+        API 에러를 기록합니다.
+        
+        연속 에러가 한도를 초과하면 Kill Switch를 자동 활성화합니다.
+        
+        Args:
+            reason: 에러 사유
+            
+        Returns:
+            bool: Kill Switch 발동 여부
+        """
+        now = datetime.now()
+        
+        # 에러 리셋 시간 체크
+        if self._last_api_error_time:
+            elapsed = (now - self._last_api_error_time).total_seconds() / 60
+            if elapsed > self._api_error_reset_minutes:
+                # 리셋 시간이 지났으면 카운터 초기화
+                self._api_error_count = 0
+                self._api_error_reasons.clear()
+                logger.info(f"[RISK] API 에러 카운터 리셋 ({elapsed:.1f}분 경과)")
+        
+        # 에러 카운트 증가
+        self._api_error_count += 1
+        self._last_api_error_time = now
+        self._api_error_reasons.append({
+            "time": now.strftime("%H:%M:%S"),
+            "reason": reason
+        })
+        
+        # 최근 10개만 유지
+        if len(self._api_error_reasons) > 10:
+            self._api_error_reasons = self._api_error_reasons[-10:]
+        
+        logger.warning(
+            f"[RISK] API 에러 기록: {reason} "
+            f"(연속 {self._api_error_count}/{self._max_api_errors}회)"
+        )
+        
+        # 한도 초과 시 Kill Switch 발동
+        if self._api_error_count >= self._max_api_errors:
+            self.enable_kill_switch(
+                f"API 에러 {self._api_error_count}회 연속 발생: {reason}"
+            )
+            return True
+        
+        return False
+    
+    def reset_api_error_count(self) -> None:
+        """API 에러 카운터를 수동으로 리셋합니다."""
+        self._api_error_count = 0
+        self._api_error_reasons.clear()
+        logger.info("[RISK] API 에러 카운터 수동 리셋")
+    
+    def get_api_error_status(self) -> Dict:
+        """API 에러 상태를 반환합니다."""
+        return {
+            "error_count": self._api_error_count,
+            "max_errors": self._max_api_errors,
+            "last_error_time": (
+                self._last_api_error_time.strftime("%Y-%m-%d %H:%M:%S")
+                if self._last_api_error_time else None
+            ),
+            "recent_errors": self._api_error_reasons
+        }
+    
+    # ════════════════════════════════════════════════════════════════
+    # 수동 Kill Switch 파일 (신규)
+    # ════════════════════════════════════════════════════════════════
+    
+    def _check_manual_kill_switch(self) -> bool:
+        """
+        수동 Kill Switch 파일을 확인합니다.
+        
+        data/KILL_SWITCH 파일이 존재하면 Kill Switch를 활성화합니다.
+        
+        Returns:
+            bool: Kill Switch 발동 여부
+        """
+        if self._kill_switch_file.exists():
+            # 파일 내용 읽기 (사유)
+            try:
+                reason = self._kill_switch_file.read_text().strip()
+            except:
+                reason = "수동 Kill Switch 파일 감지"
+            
+            if not self._enable_kill_switch:
+                self.enable_kill_switch(f"수동 Kill Switch: {reason}")
+            
+            return True
+        
+        return False
+    
+    def create_manual_kill_switch(self, reason: str = "수동 정지") -> None:
+        """
+        수동 Kill Switch 파일을 생성합니다.
+        
+        Args:
+            reason: Kill Switch 사유
+        """
+        self._kill_switch_file.parent.mkdir(parents=True, exist_ok=True)
+        self._kill_switch_file.write_text(f"{reason}\n{datetime.now()}")
+        self.enable_kill_switch(reason)
+        logger.info(f"[RISK] 수동 Kill Switch 파일 생성: {self._kill_switch_file}")
+    
+    def remove_manual_kill_switch(self) -> bool:
+        """
+        수동 Kill Switch 파일을 제거합니다.
+        
+        Returns:
+            bool: 제거 성공 여부
+        """
+        if self._kill_switch_file.exists():
+            self._kill_switch_file.unlink()
+            logger.info("[RISK] 수동 Kill Switch 파일 제거됨")
+            return True
+        return False
+    
+    # ════════════════════════════════════════════════════════════════
     # 리스크 체크 (핵심 기능)
     # ════════════════════════════════════════════════════════════════
     
@@ -310,8 +461,9 @@ class RiskManager:
         이 함수는 모든 주문 실행 전에 반드시 호출해야 합니다.
         
         체크 순서:
-            1. Kill Switch 확인
-            2. Daily Loss Limit 확인
+            1. 수동 Kill Switch 파일 확인
+            2. Kill Switch 확인
+            3. Daily Loss Limit 확인
         
         Args:
             is_closing_position: 청산 주문 여부
@@ -324,6 +476,9 @@ class RiskManager:
         # 날짜가 변경되었으면 일일 추적 초기화
         if self._daily_pnl.date != date.today():
             self._reset_daily_tracking()
+        
+        # 0. 수동 Kill Switch 파일 체크 (신규)
+        self._check_manual_kill_switch()
         
         # 1. Kill Switch 체크
         if self._enable_kill_switch:
