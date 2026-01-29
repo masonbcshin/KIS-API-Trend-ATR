@@ -38,6 +38,16 @@ from engine.risk_manager import (
     create_risk_manager_from_settings,
     safe_exit_with_message
 )
+from engine.order_synchronizer import (
+    SingleInstanceLock,
+    MarketHoursChecker,
+    OrderSynchronizer,
+    PositionResynchronizer,
+    OrderExecutionResult,
+    ensure_single_instance,
+    get_instance_lock,
+    get_market_checker
+)
 from utils.position_store import (
     PositionStore,
     StoredPosition,
@@ -84,6 +94,11 @@ class MultidayExecutor:
             telegram: 텔레그램 알림기
             position_store: 포지션 저장소
         """
+        # ★ 단일 인스턴스 강제 (감사 보고서 지적 해결)
+        if getattr(settings, 'ENFORCE_SINGLE_INSTANCE', True):
+            if not ensure_single_instance():
+                raise RuntimeError("이미 실행 중인 인스턴스가 있습니다. 프로그램을 종료합니다.")
+        
         # 트레이딩 모드 확인
         self.trading_mode = settings.TRADING_MODE
         
@@ -107,8 +122,25 @@ class MultidayExecutor:
         # 포지션 저장소
         self.position_store = position_store or get_position_store()
         
+        # ★ 신규: 주문 동기화 컴포넌트 (감사 보고서 지적 해결)
+        self.market_checker = get_market_checker()
+        self.order_synchronizer = OrderSynchronizer(
+            api=self.api,
+            market_checker=self.market_checker,
+            execution_timeout=getattr(settings, 'ORDER_EXECUTION_TIMEOUT', 45)
+        )
+        self.position_resync = PositionResynchronizer(
+            api=self.api,
+            position_store=self.position_store
+        )
+        
         # 실행 상태
         self.is_running = False
+        
+        # ★ 신규: 동적 실행 간격 (감사 보고서 지적 해결)
+        self._current_interval = getattr(settings, 'DEFAULT_EXECUTION_INTERVAL', 60)
+        self._near_sl_interval = getattr(settings, 'NEAR_STOPLOSS_EXECUTION_INTERVAL', 15)
+        self._near_sl_threshold = getattr(settings, 'NEAR_STOPLOSS_THRESHOLD_PCT', 70.0)
         
         # 알림 추적 (중복 방지)
         self._last_near_sl_alert = None
@@ -117,6 +149,9 @@ class MultidayExecutor:
         
         # 일별 거래 기록
         self._daily_trades = []
+        
+        # ★ 신규: 초기 자본금 기록 (누적 드로다운 계산용)
+        self._initial_capital = getattr(settings, 'BACKTEST_INITIAL_CAPITAL', 10_000_000)
         
         # 시그널 핸들러 등록 (종료 시 포지션 저장)
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -161,10 +196,12 @@ class MultidayExecutor:
         """
         프로그램 시작 시 포지션 복원
         
+        ★ 감사 보고서 해결: API 기준 재동기화로 불일치 방지
+        
         ★ 순서:
-            1. 저장된 포지션 로드
-            2. API로 실제 보유 확인
-            3. 정합성 검증
+            1. API 기준 재동기화 (실제 보유 확인)
+            2. 저장된 데이터와 비교
+            3. 불일치 해결
             4. 전략에 복원
             5. 텔레그램 알림
         
@@ -172,64 +209,92 @@ class MultidayExecutor:
             bool: 복원 성공 여부
         """
         logger.info("=" * 50)
-        logger.info("포지션 복원 프로세스 시작")
+        logger.info("포지션 재동기화 프로세스 시작")
         logger.info("=" * 50)
         
-        # 1. 저장된 포지션 로드
-        stored = self.position_store.load_position()
+        # ★ API 기준 재동기화 (감사 보고서 지적 해결)
+        sync_result = self.position_resync.synchronize_on_startup()
         
-        if stored is None:
-            logger.info("저장된 포지션 없음")
+        # 경고 메시지 출력
+        for warning in sync_result.get("warnings", []):
+            logger.warning(f"[RESYNC] {warning}")
+            self.telegram.notify_warning(f"포지션 동기화: {warning}")
+        
+        action = sync_result.get("action", "")
+        
+        if action == "NO_POSITION":
+            logger.info("포지션 없음 확인")
             return False
         
-        logger.info(
-            f"저장된 포지션 발견: {stored.stock_code} @ {stored.entry_price:,.0f}원, "
-            f"ATR={stored.atr_at_entry:,.0f} (고정)"
-        )
-        
-        # 2. API로 실제 보유 확인
-        try:
-            self.api.get_access_token()
-            validated, status_msg = self.position_store.reconcile_position(
-                self.api, stored
+        elif action == "UNTRACKED_HOLDING":
+            # 미기록 보유 발견 - 위험 상황
+            logger.error("미기록 보유 발견 - 수동 확인 필요")
+            self.telegram.notify_error(
+                "미기록 보유 발견",
+                "저장된 포지션 없이 실제 보유가 발견되었습니다.\n"
+                "수동으로 확인하고 처리하세요."
             )
+            return False
+        
+        elif action == "STORED_INVALID":
+            # 저장 데이터 무효 - 이미 삭제됨
+            logger.warning("저장된 포지션이 무효하여 삭제됨")
+            return False
+        
+        elif action == "CRITICAL_MISMATCH":
+            # 심각한 불일치 - 킬 스위치 권장
+            logger.error("심각한 포지션 불일치 - 수동 확인 필요")
+            self.telegram.notify_error(
+                "심각한 포지션 불일치",
+                "저장된 포지션과 실제 보유가 다릅니다.\n"
+                "즉시 확인하세요!"
+            )
+            # 안전을 위해 킬 스위치 발동 고려
+            return False
+        
+        elif action in ("MATCHED", "QTY_ADJUSTED"):
+            # 정상 또는 수량 조정됨
+            stored = sync_result.get("position")
             
-            logger.info(f"정합성 검증 결과: {status_msg}")
-            
-            if validated is None:
-                logger.warning("포지션 복원 실패 - 정합성 불일치")
+            if stored is None:
+                logger.error("동기화 성공했으나 포지션 데이터 없음")
                 return False
             
-        except Exception as e:
-            logger.warning(f"API 검증 실패, 저장된 데이터로 복원: {e}")
-            validated = stored
+            logger.info(
+                f"포지션 동기화 완료: {stored.stock_code} @ {stored.entry_price:,.0f}원, "
+                f"ATR={stored.atr_at_entry:,.0f} (고정)"
+            )
+            
+            # 전략에 복원
+            multiday_pos = stored.to_multiday_position()
+            self.strategy.restore_position(multiday_pos)
+            
+            # 보유 일수 계산
+            holding_days = self._calculate_holding_days(stored.entry_date)
+            
+            # 텔레그램 알림
+            self.telegram.notify_position_restored(
+                stock_code=stored.stock_code,
+                entry_price=stored.entry_price,
+                quantity=stored.quantity,
+                entry_date=stored.entry_date,
+                holding_days=holding_days,
+                stop_loss=stored.stop_loss,
+                take_profit=stored.take_profit,
+                trailing_stop=stored.trailing_stop,
+                atr_at_entry=stored.atr_at_entry
+            )
+            
+            logger.info(
+                f"포지션 복원 완료: 보유 {holding_days}일째, "
+                f"Exit 조건 감시 재개"
+            )
+            
+            return True
         
-        # 3. 전략에 복원
-        multiday_pos = validated.to_multiday_position()
-        self.strategy.restore_position(multiday_pos)
-        
-        # 4. 보유 일수 계산
-        holding_days = self._calculate_holding_days(validated.entry_date)
-        
-        # 5. 텔레그램 알림
-        self.telegram.notify_position_restored(
-            stock_code=validated.stock_code,
-            entry_price=validated.entry_price,
-            quantity=validated.quantity,
-            entry_date=validated.entry_date,
-            holding_days=holding_days,
-            stop_loss=validated.stop_loss,
-            take_profit=validated.take_profit,
-            trailing_stop=validated.trailing_stop,
-            atr_at_entry=validated.atr_at_entry
-        )
-        
-        logger.info(
-            f"포지션 복원 완료: 보유 {holding_days}일째, "
-            f"Exit 조건 감시 재개"
-        )
-        
-        return True
+        else:
+            logger.warning(f"알 수 없는 동기화 결과: {action}")
+            return False
     
     def _calculate_holding_days(self, entry_date: str) -> int:
         """보유 일수 계산"""
@@ -291,8 +356,12 @@ class MultidayExecutor:
         매수 주문 실행
         
         ★ 모드별 처리:
-            - LIVE/PAPER: 실제 주문
+            - LIVE/PAPER: 실제 주문 (동기화 체결 확인 포함)
             - CBT: 텔레그램 알림만
+        
+        ★ 감사 보고서 해결:
+            - 체결 확인 후에만 포지션 상태 갱신
+            - 장 운영시간 체크
         """
         # 리스크 체크
         risk_check = self.risk_manager.check_order_allowed(is_closing_position=False)
@@ -305,6 +374,13 @@ class MultidayExecutor:
         # 이미 포지션 보유
         if self.strategy.has_position:
             return {"success": False, "message": "이미 포지션 보유 중"}
+        
+        # ★ 장 운영시간 체크 (감사 보고서 지적 해결)
+        if self._can_place_orders():
+            tradeable, reason = self.market_checker.is_tradeable()
+            if not tradeable:
+                logger.warning(f"매수 불가: {reason}")
+                return {"success": False, "message": reason}
         
         # CBT 모드: 알림만
         if self.trading_mode == "CBT":
@@ -333,54 +409,104 @@ class MultidayExecutor:
             
             return {"success": True, "message": "[CBT] 가상 매수", "order_no": "CBT-VIRTUAL"}
         
-        # LIVE/PAPER: 실제 주문
+        # ★ LIVE/PAPER: 동기화 주문 실행 (감사 보고서 지적 해결)
         try:
-            result = self.api.place_buy_order(
+            # 동기화 주문 - 체결 확인 후에만 성공 반환
+            sync_result = self.order_synchronizer.execute_buy_order(
                 stock_code=self.stock_code,
                 quantity=self.order_quantity,
-                price=0,  # 시장가
-                order_type="01"
+                skip_market_check=True  # 위에서 이미 체크함
             )
             
-            if result["success"]:
-                # 포지션 오픈
+            if sync_result.success:
+                # ★ 체결 확인됨 - 실제 체결가로 포지션 오픈
+                actual_price = sync_result.exec_price if sync_result.exec_price > 0 else signal.price
+                actual_qty = sync_result.exec_qty if sync_result.exec_qty > 0 else self.order_quantity
+                
+                # 실제 체결가 기준으로 손절/익절 재계산
+                actual_stop_loss = actual_price - (signal.atr * settings.ATR_MULTIPLIER_SL)
+                actual_take_profit = actual_price + (signal.atr * settings.ATR_MULTIPLIER_TP)
+                
                 self.strategy.open_position(
                     symbol=self.stock_code,
-                    entry_price=signal.price,
-                    quantity=self.order_quantity,
+                    entry_price=actual_price,
+                    quantity=actual_qty,
                     atr=signal.atr,
-                    stop_loss=signal.stop_loss,
-                    take_profit=signal.take_profit
+                    stop_loss=actual_stop_loss,
+                    take_profit=actual_take_profit
                 )
                 
                 # 포지션 저장
                 self._save_position_on_exit()
                 
-                # 거래 기록
+                # 거래 기록 (실제 체결가 사용)
                 self._daily_trades.append({
                     "time": datetime.now().isoformat(),
                     "type": "BUY",
-                    "price": signal.price,
-                    "quantity": self.order_quantity,
-                    "order_no": result["order_no"]
+                    "price": actual_price,
+                    "quantity": actual_qty,
+                    "order_no": sync_result.order_no,
+                    "signal_price": signal.price  # 신호가도 기록
                 })
                 
-                # 텔레그램 알림
+                # 텔레그램 알림 (실제 체결가)
                 self.telegram.notify_buy_order(
                     stock_code=self.stock_code,
-                    price=signal.price,
-                    quantity=self.order_quantity,
-                    stop_loss=signal.stop_loss,
-                    take_profit=signal.take_profit or 0
+                    price=actual_price,
+                    quantity=actual_qty,
+                    stop_loss=actual_stop_loss,
+                    take_profit=actual_take_profit
                 )
                 
-                logger.info(f"매수 주문 성공: {result['order_no']}")
+                logger.info(f"매수 체결 완료: {sync_result.order_no} @ {actual_price:,.0f}원")
+                
+                return {
+                    "success": True,
+                    "order_no": sync_result.order_no,
+                    "exec_price": actual_price,
+                    "exec_qty": actual_qty,
+                    "message": sync_result.message
+                }
+            
+            elif sync_result.result_type == OrderExecutionResult.PARTIAL:
+                # 부분 체결 - 체결된 수량만큼 포지션 오픈
+                if sync_result.exec_qty > 0:
+                    actual_price = sync_result.exec_price
+                    
+                    self.strategy.open_position(
+                        symbol=self.stock_code,
+                        entry_price=actual_price,
+                        quantity=sync_result.exec_qty,
+                        atr=signal.atr,
+                        stop_loss=actual_price - (signal.atr * settings.ATR_MULTIPLIER_SL),
+                        take_profit=actual_price + (signal.atr * settings.ATR_MULTIPLIER_TP)
+                    )
+                    
+                    self._save_position_on_exit()
+                    
+                    self.telegram.notify_warning(
+                        f"부분 체결: {self.stock_code} {sync_result.exec_qty}/{self.order_quantity}주 @ {actual_price:,.0f}원"
+                    )
+                    
+                    logger.warning(f"부분 체결: {sync_result.exec_qty}/{self.order_quantity}주")
+                
+                return {
+                    "success": False,
+                    "order_no": sync_result.order_no,
+                    "exec_qty": sync_result.exec_qty,
+                    "message": sync_result.message
+                }
+            
             else:
-                logger.error(f"매수 주문 실패: {result['message']}")
+                # 완전 실패 - 포지션 상태 변경 없음
+                logger.error(f"매수 실패: {sync_result.message}")
+                return {
+                    "success": False,
+                    "order_no": sync_result.order_no,
+                    "message": sync_result.message
+                }
             
-            return result
-            
-        except KISApiError as e:
+        except Exception as e:
             logger.error(f"매수 주문 에러: {e}")
             self.telegram.notify_error("매수 주문 실패", str(e))
             return {"success": False, "message": str(e)}
@@ -391,6 +517,7 @@ class MultidayExecutor:
         
         ★ 허용된 Exit 사유만 처리
         ★ EOD 청산은 절대 불가
+        ★ 감사 보고서 해결: 체결 확인 후에만 포지션 상태 갱신
         """
         # 리스크 체크 (청산은 항상 허용)
         risk_check = self.risk_manager.check_order_allowed(is_closing_position=True)
@@ -405,6 +532,13 @@ class MultidayExecutor:
         
         pos = self.strategy.position
         exit_reason = signal.exit_reason or ExitReason.MANUAL_EXIT
+        
+        # 손절 여부 판단 (긴급 청산 플래그)
+        is_emergency = exit_reason in (
+            ExitReason.ATR_STOP_LOSS,
+            ExitReason.GAP_PROTECTION,
+            ExitReason.KILL_SWITCH
+        )
         
         # CBT 모드: 알림만
         if self.trading_mode == "CBT":
@@ -436,53 +570,118 @@ class MultidayExecutor:
             
             return {"success": True, "message": "[CBT] 가상 청산", "order_no": "CBT-VIRTUAL"}
         
-        # LIVE/PAPER: 실제 주문
+        # ★ LIVE/PAPER: 동기화 주문 실행 (감사 보고서 지적 해결)
         try:
-            result = self.api.place_sell_order(
+            # 동기화 주문 - 체결 확인 후에만 성공 반환
+            sync_result = self.order_synchronizer.execute_sell_order(
                 stock_code=self.stock_code,
                 quantity=pos.quantity,
-                price=0,  # 시장가
-                order_type="01"
+                is_emergency=is_emergency
             )
             
-            if result["success"]:
-                # 포지션 청산
-                close_result = self.strategy.close_position(signal.price, exit_reason)
+            if sync_result.success:
+                # ★ 체결 확인됨 - 실제 체결가로 청산 처리
+                actual_price = sync_result.exec_price if sync_result.exec_price > 0 else signal.price
+                
+                # 포지션 청산 (실제 체결가 사용)
+                close_result = self.strategy.close_position(actual_price, exit_reason)
                 
                 # 리스크 매니저에 손익 기록
                 if close_result:
                     self.risk_manager.record_trade_pnl(close_result["pnl"])
                     
-                    # 거래 기록
+                    # 거래 기록 (실제 체결가)
                     self._daily_trades.append({
                         "time": datetime.now().isoformat(),
                         "type": "SELL",
-                        "price": signal.price,
-                        "quantity": pos.quantity,
-                        "order_no": result["order_no"],
+                        "price": actual_price,
+                        "quantity": sync_result.exec_qty,
+                        "order_no": sync_result.order_no,
                         "pnl": close_result["pnl"],
                         "pnl_pct": close_result["pnl_pct"],
-                        "exit_reason": exit_reason.value
+                        "exit_reason": exit_reason.value,
+                        "signal_price": signal.price  # 신호가도 기록
                     })
                     
                     # 텔레그램 알림 (청산 유형별)
                     self._send_exit_notification(
                         exit_reason,
                         pos,
-                        signal.price,
+                        actual_price,
                         close_result
                     )
                 
                 # 포지션 저장 파일 클리어
                 self.position_store.clear_position()
                 
-                logger.info(f"매도 주문 성공: {result['order_no']}")
+                logger.info(f"매도 체결 완료: {sync_result.order_no} @ {actual_price:,.0f}원")
+                
+                return {
+                    "success": True,
+                    "order_no": sync_result.order_no,
+                    "exec_price": actual_price,
+                    "exec_qty": sync_result.exec_qty,
+                    "pnl": close_result["pnl"] if close_result else 0,
+                    "message": sync_result.message
+                }
+            
+            elif sync_result.result_type == OrderExecutionResult.PARTIAL:
+                # 부분 체결 - 체결된 수량만큼만 청산 처리
+                if sync_result.exec_qty > 0:
+                    actual_price = sync_result.exec_price
+                    
+                    # 부분 청산 손익 계산
+                    partial_pnl = (actual_price - pos.entry_price) * sync_result.exec_qty
+                    partial_pnl_pct = (actual_price - pos.entry_price) / pos.entry_price * 100
+                    
+                    # 남은 수량으로 포지션 축소 (전략 상태는 유지)
+                    remaining_qty = pos.quantity - sync_result.exec_qty
+                    if remaining_qty > 0:
+                        pos.quantity = remaining_qty
+                        self._save_position_on_exit()
+                        
+                        self.telegram.notify_warning(
+                            f"부분 청산: {self.stock_code} {sync_result.exec_qty}/{pos.quantity + sync_result.exec_qty}주\n"
+                            f"손익: {partial_pnl:+,.0f}원 ({partial_pnl_pct:+.2f}%)\n"
+                            f"잔여: {remaining_qty}주 보유 중"
+                        )
+                    else:
+                        # 전량 청산된 경우
+                        close_result = self.strategy.close_position(actual_price, exit_reason)
+                        self.position_store.clear_position()
+                        if close_result:
+                            self.risk_manager.record_trade_pnl(close_result["pnl"])
+                    
+                    logger.warning(f"부분 청산: {sync_result.exec_qty}/{pos.quantity}주")
+                
+                return {
+                    "success": False,
+                    "order_no": sync_result.order_no,
+                    "exec_qty": sync_result.exec_qty,
+                    "message": sync_result.message
+                }
+            
             else:
-                logger.error(f"매도 주문 실패: {result['message']}")
+                # 완전 실패 - 포지션 상태 변경 없음 (매우 위험!)
+                logger.error(f"매도 실패 (포지션 유지됨): {sync_result.message}")
+                
+                # 긴급 손절 실패 시 킬 스위치 발동
+                if is_emergency:
+                    self.telegram.notify_error(
+                        "긴급 청산 실패",
+                        f"종목: {self.stock_code}\n"
+                        f"사유: {exit_reason.value}\n"
+                        f"오류: {sync_result.message}\n"
+                        f"⚠️ 수동 청산 필요!"
+                    )
+                
+                return {
+                    "success": False,
+                    "order_no": sync_result.order_no,
+                    "message": f"청산 실패 - {sync_result.message}"
+                }
             
-            return result
-            
-        except KISApiError as e:
+        except Exception as e:
             logger.error(f"매도 주문 에러: {e}")
             self.telegram.notify_error("매도 주문 실패", str(e))
             return {"success": False, "message": str(e)}
@@ -722,15 +921,48 @@ class MultidayExecutor:
         logger.info("=" * 50)
         return result
     
+    def _calculate_dynamic_interval(self) -> int:
+        """
+        동적 실행 간격 계산
+        
+        ★ 감사 보고서 해결: 손절선 근접 시 실행 간격 단축
+        
+        Returns:
+            int: 적용할 실행 간격 (초)
+        """
+        if not self.strategy.has_position:
+            return self._current_interval
+        
+        pos = self.strategy.position
+        
+        # 현재가 조회
+        try:
+            current_price, _ = self.fetch_current_price()
+            if current_price <= 0:
+                return self._current_interval
+        except Exception:
+            return self._current_interval
+        
+        # 손절선까지의 거리 계산
+        near_sl_pct = pos.get_distance_to_stop_loss(current_price)
+        
+        if near_sl_pct >= self._near_sl_threshold:
+            # 손절선 근접 - 간격 단축
+            logger.info(f"손절선 근접 ({near_sl_pct:.1f}%) - 실행 간격 {self._near_sl_interval}초로 단축")
+            return self._near_sl_interval
+        
+        return self._current_interval
+    
     def run(self, interval_seconds: int = 60, max_iterations: int = None) -> None:
         """
         전략 연속 실행
         
         ★ EOD 청산 로직 없음
         ★ 프로그램 종료 시에도 포지션 유지
+        ★ 감사 보고서 해결: 동적 실행 간격 적용
         
         Args:
-            interval_seconds: 실행 간격 (초, 최소 60초)
+            interval_seconds: 기본 실행 간격 (초)
             max_iterations: 최대 반복 횟수 (None = 무한)
         """
         # 킬 스위치 체크
@@ -741,15 +973,17 @@ class MultidayExecutor:
                 safe_exit_with_message(kill_check.reason)
             return
         
-        # 최소 간격 보장
-        if interval_seconds < 60:
-            logger.warning("실행 간격이 60초 미만입니다. 60초로 조정합니다.")
-            interval_seconds = 60
+        # 기본 간격 설정 (최소 15초 허용 - 손절 감시용)
+        min_interval = self._near_sl_interval
+        if interval_seconds < min_interval:
+            logger.warning(f"실행 간격이 {min_interval}초 미만입니다. {min_interval}초로 조정합니다.")
+            interval_seconds = min_interval
         
+        self._current_interval = interval_seconds
         self.is_running = True
         iteration = 0
         
-        logger.info(f"멀티데이 거래 시작 (모드: {self.trading_mode}, 간격: {interval_seconds}초)")
+        logger.info(f"멀티데이 거래 시작 (모드: {self.trading_mode}, 기본 간격: {interval_seconds}초)")
         
         # 시작 알림
         mode_display = {
@@ -765,10 +999,16 @@ class MultidayExecutor:
             mode=mode_display
         )
         
+        stop_reason = "정상 종료"
+        
         try:
             while self.is_running:
                 iteration += 1
-                logger.info(f"[반복 #{iteration}]")
+                
+                # ★ 동적 실행 간격 계산 (감사 보고서 해결)
+                current_interval = self._calculate_dynamic_interval()
+                
+                logger.info(f"[반복 #{iteration}] (간격: {current_interval}초)")
                 
                 self.run_once()
                 
@@ -777,8 +1017,16 @@ class MultidayExecutor:
                     logger.info(f"최대 반복 도달: {max_iterations}")
                     break
                 
-                logger.info(f"다음 실행까지 {interval_seconds}초 대기...")
-                time.sleep(interval_seconds)
+                # ★ 장 상태 체크 (선택적 대기)
+                market_status = self.market_checker.get_market_status()
+                if market_status.value == "CLOSED":
+                    # 폐장 시 장 시작까지 대기 시간 계산
+                    wait_time = min(current_interval, 300)  # 최대 5분
+                    logger.info(f"폐장 중 - {wait_time}초 대기")
+                    time.sleep(wait_time)
+                else:
+                    logger.info(f"다음 실행까지 {current_interval}초 대기...")
+                    time.sleep(current_interval)
                 
         except KeyboardInterrupt:
             logger.info("사용자 중단")
@@ -787,13 +1035,19 @@ class MultidayExecutor:
             logger.error(f"예기치 않은 오류: {e}")
             stop_reason = f"오류: {str(e)}"
             self.telegram.notify_error("시스템 오류", str(e))
-        else:
-            stop_reason = "정상 종료"
         finally:
             self.is_running = False
             
             # 포지션 저장
             self._save_position_on_exit()
+            
+            # ★ 인스턴스 락 해제
+            try:
+                lock = get_instance_lock()
+                if lock.is_acquired:
+                    lock.release()
+            except Exception:
+                pass
             
             # 종료 알림
             summary = self.get_daily_summary()
