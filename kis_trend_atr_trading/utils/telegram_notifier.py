@@ -216,6 +216,107 @@ MESSAGE_TEMPLATES = {
 • 최대 손실: {max_loss:,}원
 ━━━━━━━━━━━━━━━━━━
 ⏰ {timestamp}
+""",
+
+    # 포지션 복원 알림 (멀티데이)
+    "position_restored": """
+🔄 *포지션 복원 완료*
+━━━━━━━━━━━━━━━━━━
+• 종목: `{stock_code}`
+• 진입가: {entry_price:,}원
+• 보유수량: {quantity}주
+• 진입일: {entry_date}
+• 보유일수: {holding_days}일
+━━━━━━━━━━━━━━━━━━
+• 손절가: {stop_loss:,}원
+• 익절가: {take_profit}
+• 트레일링: {trailing_stop:,}원
+• 진입ATR: {atr_at_entry:,.0f} (고정)
+━━━━━━━━━━━━━━━━━━
+✅ Exit 조건 감시 재개
+⏰ {timestamp}
+""",
+
+    # 손절선 근접 경고
+    "near_stop_loss": """
+⚠️ *손절선 근접 경고*
+━━━━━━━━━━━━━━━━━━
+• 종목: `{stock_code}`
+• 현재가: {current_price:,}원
+• 손절가: {stop_loss:,}원
+• 도달률: {progress:.1f}%
+━━━━━━━━━━━━━━━━━━
+• 진입가: {entry_price:,}원
+• 현재 손익: {pnl:+,}원 ({pnl_pct:+.2f}%)
+━━━━━━━━━━━━━━━━━━
+💡 손절선까지 {remaining:,.0f}원 남음
+⏰ {timestamp}
+""",
+
+    # 익절선 근접 알림
+    "near_take_profit": """
+🎯 *익절선 근접 알림*
+━━━━━━━━━━━━━━━━━━
+• 종목: `{stock_code}`
+• 현재가: {current_price:,}원
+• 익절가: {take_profit:,}원
+• 도달률: {progress:.1f}%
+━━━━━━━━━━━━━━━━━━
+• 진입가: {entry_price:,}원
+• 현재 손익: {pnl:+,}원 ({pnl_pct:+.2f}%)
+━━━━━━━━━━━━━━━━━━
+🎉 익절선까지 {remaining:,.0f}원 남음
+⏰ {timestamp}
+""",
+
+    # 트레일링 스탑 갱신 알림
+    "trailing_stop_updated": """
+📈 *트레일링 스탑 갱신*
+━━━━━━━━━━━━━━━━━━
+• 종목: `{stock_code}`
+• 최고가 갱신: {highest_price:,}원
+• 새 트레일링: {trailing_stop:,}원
+━━━━━━━━━━━━━━━━━━
+• 진입가: {entry_price:,}원
+• 현재 손익: {pnl:+,}원 ({pnl_pct:+.2f}%)
+━━━━━━━━━━━━━━━━━━
+💡 수익 보호 구간 확대
+⏰ {timestamp}
+""",
+
+    # CBT 모드 시그널 알림
+    "cbt_signal": """
+📋 *[CBT] 매매 시그널*
+━━━━━━━━━━━━━━━━━━
+• 시그널: {signal_type}
+• 종목: `{stock_code}`
+• 가격: {price:,}원
+━━━━━━━━━━━━━━━━━━
+• 손절가: {stop_loss:,}원
+• 익절가: {take_profit}
+• ATR: {atr:,.0f}원
+• 추세: {trend}
+━━━━━━━━━━━━━━━━━━
+📝 사유: {reason}
+━━━━━━━━━━━━━━━━━━
+🔒 CBT 모드: 실주문 없음
+⏰ {timestamp}
+""",
+
+    # 갭 보호 발동 알림
+    "gap_protection": """
+🛡️ *갭 보호 발동*
+━━━━━━━━━━━━━━━━━━
+• 종목: `{stock_code}`
+• 시가: {open_price:,}원
+• 손절가: {stop_loss:,}원
+• 갭 손실: {gap_loss_pct:.1f}%
+━━━━━━━━━━━━━━━━━━
+• 진입가: {entry_price:,}원
+• 예상 손익: {pnl:+,}원 ({pnl_pct:+.2f}%)
+━━━━━━━━━━━━━━━━━━
+⚠️ 즉시 시장가 청산 실행
+⏰ {timestamp}
 """
 }
 
@@ -776,6 +877,248 @@ class TelegramNotifier:
             win_rate=win_rate,
             max_profit=int(max_profit),
             max_loss=int(max_loss),
+            timestamp=self._get_timestamp()
+        )
+        return self.send_message(message)
+    
+    # ════════════════════════════════════════════════════════════════
+    # 멀티데이 전용 알림 메서드
+    # ════════════════════════════════════════════════════════════════
+    
+    def notify_position_restored(
+        self,
+        stock_code: str,
+        entry_price: float,
+        quantity: int,
+        entry_date: str,
+        holding_days: int,
+        stop_loss: float,
+        take_profit: Optional[float],
+        trailing_stop: float,
+        atr_at_entry: float
+    ) -> bool:
+        """
+        포지션 복원 알림 (멀티데이)
+        
+        Args:
+            stock_code: 종목 코드
+            entry_price: 진입가
+            quantity: 수량
+            entry_date: 진입일
+            holding_days: 보유일수
+            stop_loss: 손절가
+            take_profit: 익절가
+            trailing_stop: 트레일링 스탑
+            atr_at_entry: 진입 시 ATR
+        
+        Returns:
+            bool: 전송 성공 여부
+        """
+        tp_str = f"{int(take_profit):,}원" if take_profit else "트레일링만"
+        
+        message = MESSAGE_TEMPLATES["position_restored"].format(
+            stock_code=stock_code,
+            entry_price=int(entry_price),
+            quantity=quantity,
+            entry_date=entry_date,
+            holding_days=holding_days,
+            stop_loss=int(stop_loss),
+            take_profit=tp_str,
+            trailing_stop=int(trailing_stop),
+            atr_at_entry=atr_at_entry,
+            timestamp=self._get_timestamp()
+        )
+        return self.send_message(message)
+    
+    def notify_near_stop_loss(
+        self,
+        stock_code: str,
+        current_price: float,
+        entry_price: float,
+        stop_loss: float,
+        progress: float,
+        pnl: float,
+        pnl_pct: float
+    ) -> bool:
+        """
+        손절선 근접 경고 알림
+        
+        Args:
+            stock_code: 종목 코드
+            current_price: 현재가
+            entry_price: 진입가
+            stop_loss: 손절가
+            progress: 손절선 도달률 (%)
+            pnl: 현재 손익
+            pnl_pct: 손익률
+        
+        Returns:
+            bool: 전송 성공 여부
+        """
+        remaining = current_price - stop_loss
+        
+        message = MESSAGE_TEMPLATES["near_stop_loss"].format(
+            stock_code=stock_code,
+            current_price=int(current_price),
+            stop_loss=int(stop_loss),
+            progress=progress,
+            entry_price=int(entry_price),
+            pnl=int(pnl),
+            pnl_pct=pnl_pct,
+            remaining=remaining,
+            timestamp=self._get_timestamp()
+        )
+        return self.send_message(message)
+    
+    def notify_near_take_profit(
+        self,
+        stock_code: str,
+        current_price: float,
+        entry_price: float,
+        take_profit: float,
+        progress: float,
+        pnl: float,
+        pnl_pct: float
+    ) -> bool:
+        """
+        익절선 근접 알림
+        
+        Args:
+            stock_code: 종목 코드
+            current_price: 현재가
+            entry_price: 진입가
+            take_profit: 익절가
+            progress: 익절선 도달률 (%)
+            pnl: 현재 손익
+            pnl_pct: 손익률
+        
+        Returns:
+            bool: 전송 성공 여부
+        """
+        remaining = take_profit - current_price
+        
+        message = MESSAGE_TEMPLATES["near_take_profit"].format(
+            stock_code=stock_code,
+            current_price=int(current_price),
+            take_profit=int(take_profit),
+            progress=progress,
+            entry_price=int(entry_price),
+            pnl=int(pnl),
+            pnl_pct=pnl_pct,
+            remaining=remaining,
+            timestamp=self._get_timestamp()
+        )
+        return self.send_message(message)
+    
+    def notify_trailing_stop_updated(
+        self,
+        stock_code: str,
+        highest_price: float,
+        trailing_stop: float,
+        entry_price: float,
+        pnl: float,
+        pnl_pct: float
+    ) -> bool:
+        """
+        트레일링 스탑 갱신 알림
+        
+        Args:
+            stock_code: 종목 코드
+            highest_price: 최고가
+            trailing_stop: 새 트레일링 스탑
+            entry_price: 진입가
+            pnl: 현재 손익
+            pnl_pct: 손익률
+        
+        Returns:
+            bool: 전송 성공 여부
+        """
+        message = MESSAGE_TEMPLATES["trailing_stop_updated"].format(
+            stock_code=stock_code,
+            highest_price=int(highest_price),
+            trailing_stop=int(trailing_stop),
+            entry_price=int(entry_price),
+            pnl=int(pnl),
+            pnl_pct=pnl_pct,
+            timestamp=self._get_timestamp()
+        )
+        return self.send_message(message)
+    
+    def notify_cbt_signal(
+        self,
+        signal_type: str,
+        stock_code: str,
+        price: float,
+        stop_loss: float,
+        take_profit: Optional[float],
+        atr: float,
+        trend: str,
+        reason: str
+    ) -> bool:
+        """
+        CBT 모드 시그널 알림 (실주문 없음)
+        
+        Args:
+            signal_type: 시그널 타입 (BUY/SELL)
+            stock_code: 종목 코드
+            price: 가격
+            stop_loss: 손절가
+            take_profit: 익절가
+            atr: ATR
+            trend: 추세
+            reason: 사유
+        
+        Returns:
+            bool: 전송 성공 여부
+        """
+        tp_str = f"{int(take_profit):,}원" if take_profit else "트레일링만"
+        
+        message = MESSAGE_TEMPLATES["cbt_signal"].format(
+            signal_type=signal_type,
+            stock_code=stock_code,
+            price=int(price),
+            stop_loss=int(stop_loss),
+            take_profit=tp_str,
+            atr=atr,
+            trend=trend,
+            reason=reason,
+            timestamp=self._get_timestamp()
+        )
+        return self.send_message(message)
+    
+    def notify_gap_protection(
+        self,
+        stock_code: str,
+        open_price: float,
+        stop_loss: float,
+        entry_price: float,
+        gap_loss_pct: float,
+        pnl: float,
+        pnl_pct: float
+    ) -> bool:
+        """
+        갭 보호 발동 알림
+        
+        Args:
+            stock_code: 종목 코드
+            open_price: 시가
+            stop_loss: 손절가
+            entry_price: 진입가
+            gap_loss_pct: 갭 손실률
+            pnl: 예상 손익
+            pnl_pct: 예상 손익률
+        
+        Returns:
+            bool: 전송 성공 여부
+        """
+        message = MESSAGE_TEMPLATES["gap_protection"].format(
+            stock_code=stock_code,
+            open_price=int(open_price),
+            stop_loss=int(stop_loss),
+            entry_price=int(entry_price),
+            gap_loss_pct=gap_loss_pct,
+            pnl=int(pnl),
+            pnl_pct=pnl_pct,
             timestamp=self._get_timestamp()
         )
         return self.send_message(message)
