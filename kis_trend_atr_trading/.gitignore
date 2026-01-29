@@ -47,6 +47,10 @@ data/*.db
 !data/trades_sample.csv
 !data/.gitkeep
 
+# CBT 데이터 (가상 거래 기록)
+cbt_data/*
+!cbt_data/.gitkeep
+
 # OS
 .DS_Store
 Thumbs.db

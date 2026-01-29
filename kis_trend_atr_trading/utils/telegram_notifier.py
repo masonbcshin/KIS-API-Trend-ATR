@@ -317,6 +317,59 @@ MESSAGE_TEMPLATES = {
 ━━━━━━━━━━━━━━━━━━
 ⚠️ 즉시 시장가 청산 실행
 ⏰ {timestamp}
+""",
+
+    # CBT 누적 성과 리포트
+    "cbt_performance_report": """
+🧪 *CBT 성과 리포트*
+━━━━━━━━━━━━━━━━━━
+📅 기준일: {report_date}
+
+💰 자본금 현황
+━━━━━━━━━━━━━━━━━━
+• 초기 자본금: {initial_capital:,}원
+• 현재 평가금: {final_equity:,}원
+• 총 수익률: {total_return_pct:+.2f}%
+• 실현 손익: {realized_pnl:+,}원
+• 미실현 손익: {unrealized_pnl:+,}원
+
+📈 거래 성과
+━━━━━━━━━━━━━━━━━━
+• 총 거래: {total_trades}회
+• 승률: {win_rate:.1f}%
+• Expectancy: {expectancy:+,.0f}원
+
+📉 리스크 지표
+━━━━━━━━━━━━━━━━━━
+• Maximum Drawdown: {max_drawdown_pct:.2f}%
+• Profit Factor: {profit_factor:.2f}
+
+━━━━━━━━━━━━━━━━━━
+🔒 CBT 모드: 실주문 없음
+⏰ {timestamp}
+""",
+
+    # CBT 거래 완료 알림
+    "cbt_trade_complete": """
+🧪 *[CBT] 거래 완료*
+━━━━━━━━━━━━━━━━━━
+• 종목: `{stock_code}`
+• 방향: {trade_type}
+• 진입가: {entry_price:,}원
+• 청산가: {exit_price:,}원
+• 수량: {quantity}주
+━━━━━━━━━━━━━━━━━━
+• 순손익: {pnl:+,}원 ({return_pct:+.2f}%)
+• 보유일수: {holding_days}일
+• 청산사유: {exit_reason}
+━━━━━━━━━━━━━━━━━━
+📊 누적 성과
+• 총 거래: {total_trades}회
+• 누적 수익률: {cumulative_return_pct:+.2f}%
+• 승률: {win_rate:.1f}%
+━━━━━━━━━━━━━━━━━━
+🔒 CBT 모드: 실주문 없음
+⏰ {timestamp}
 """
 }
 
@@ -1119,6 +1172,111 @@ class TelegramNotifier:
             gap_loss_pct=gap_loss_pct,
             pnl=int(pnl),
             pnl_pct=pnl_pct,
+            timestamp=self._get_timestamp()
+        )
+        return self.send_message(message)
+    
+    # ════════════════════════════════════════════════════════════════
+    # CBT 전용 알림 메서드
+    # ════════════════════════════════════════════════════════════════
+    
+    def notify_cbt_performance_report(
+        self,
+        report_date: str,
+        initial_capital: float,
+        final_equity: float,
+        total_return_pct: float,
+        realized_pnl: float,
+        unrealized_pnl: float,
+        total_trades: int,
+        win_rate: float,
+        expectancy: float,
+        max_drawdown_pct: float,
+        profit_factor: float
+    ) -> bool:
+        """
+        CBT 성과 리포트 알림
+        
+        Args:
+            report_date: 리포트 날짜
+            initial_capital: 초기 자본금
+            final_equity: 최종 평가금
+            total_return_pct: 총 수익률
+            realized_pnl: 실현 손익
+            unrealized_pnl: 미실현 손익
+            total_trades: 총 거래 횟수
+            win_rate: 승률
+            expectancy: 기대값
+            max_drawdown_pct: 최대 낙폭
+            profit_factor: Profit Factor
+        
+        Returns:
+            bool: 전송 성공 여부
+        """
+        message = MESSAGE_TEMPLATES["cbt_performance_report"].format(
+            report_date=report_date,
+            initial_capital=int(initial_capital),
+            final_equity=int(final_equity),
+            total_return_pct=total_return_pct,
+            realized_pnl=int(realized_pnl),
+            unrealized_pnl=int(unrealized_pnl),
+            total_trades=total_trades,
+            win_rate=win_rate,
+            expectancy=expectancy,
+            max_drawdown_pct=max_drawdown_pct,
+            profit_factor=profit_factor,
+            timestamp=self._get_timestamp()
+        )
+        return self.send_message(message)
+    
+    def notify_cbt_trade_complete(
+        self,
+        stock_code: str,
+        trade_type: str,
+        entry_price: float,
+        exit_price: float,
+        quantity: int,
+        pnl: float,
+        return_pct: float,
+        holding_days: int,
+        exit_reason: str,
+        total_trades: int,
+        cumulative_return_pct: float,
+        win_rate: float
+    ) -> bool:
+        """
+        CBT 거래 완료 알림 (누적 성과 포함)
+        
+        Args:
+            stock_code: 종목 코드
+            trade_type: 거래 유형 (매수/매도)
+            entry_price: 진입가
+            exit_price: 청산가
+            quantity: 수량
+            pnl: 손익
+            return_pct: 수익률
+            holding_days: 보유일수
+            exit_reason: 청산 사유
+            total_trades: 누적 거래 횟수
+            cumulative_return_pct: 누적 수익률
+            win_rate: 승률
+        
+        Returns:
+            bool: 전송 성공 여부
+        """
+        message = MESSAGE_TEMPLATES["cbt_trade_complete"].format(
+            stock_code=stock_code,
+            trade_type=trade_type,
+            entry_price=int(entry_price),
+            exit_price=int(exit_price),
+            quantity=quantity,
+            pnl=int(pnl),
+            return_pct=return_pct,
+            holding_days=holding_days,
+            exit_reason=exit_reason,
+            total_trades=total_trades,
+            cumulative_return_pct=cumulative_return_pct,
+            win_rate=win_rate,
             timestamp=self._get_timestamp()
         )
         return self.send_message(message)

@@ -239,8 +239,8 @@ def main():
         "--mode",
         type=str,
         required=True,
-        choices=["backtest", "trade"],
-        help="실행 모드 (backtest: 백테스트, trade: 모의투자)"
+        choices=["backtest", "trade", "cbt"],
+        help="실행 모드 (backtest: 백테스트, trade: 모의투자, cbt: CBT 가상거래)"
     )
     
     parser.add_argument(
@@ -298,6 +298,45 @@ def main():
             interval=interval,
             max_runs=args.max_runs
         )
+    elif args.mode == "cbt":
+        # CBT 모드는 main_cbt.py를 사용하도록 안내
+        print("\n" + "=" * 70)
+        print("                    CBT 모드 안내")
+        print("=" * 70)
+        print("\n🧪 CBT (Closed Beta Test) 모드를 사용하려면:")
+        print("   python main_cbt.py --mode cbt")
+        print("\n   자세한 옵션은 'python main_cbt.py --help'를 참조하세요.")
+        print("\n" + "=" * 70)
+        
+        # 또는 직접 CBT 실행
+        from cbt import CBTExecutor
+        from api.kis_api import KISApi
+        from strategy.trend_atr import TrendATRStrategy
+        
+        interval = max(60, args.interval)
+        
+        try:
+            api = KISApi(is_paper_trading=True)
+            print("🔑 API 토큰 발급 중...")
+            api.get_access_token()
+            print("✅ 토큰 발급 완료\n")
+            
+            strategy = TrendATRStrategy()
+            executor = CBTExecutor(
+                api=api,
+                strategy=strategy,
+                stock_code=args.stock,
+                order_quantity=settings.ORDER_QUANTITY
+            )
+            
+            print("🚀 CBT 거래 시작...\n")
+            executor.run(
+                interval_seconds=interval,
+                max_iterations=args.max_runs
+            )
+        except Exception as e:
+            print(f"❌ CBT 오류: {e}")
+            logger.error(f"CBT 오류: {e}")
     
     # 종료 시간 기록
     end_time = datetime.now()
