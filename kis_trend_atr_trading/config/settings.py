@@ -208,6 +208,30 @@ BACKTEST_INITIAL_CAPITAL = 10_000_000
 BACKTEST_COMMISSION_RATE = 0.00015
 
 # ════════════════════════════════════════════════════════════════
+# CBT (Closed Beta Test) 모드 설정
+# ════════════════════════════════════════════════════════════════
+# CBT 모드: 실계좌 주문 없이 가상 체결로 성과 측정
+# TRADING_MODE = "CBT"로 설정하면 활성화됩니다.
+
+# CBT 초기 자본금 (원)
+CBT_INITIAL_CAPITAL = int(os.getenv("CBT_INITIAL_CAPITAL", "10000000"))
+
+# CBT 데이터 저장 경로
+CBT_DATA_DIR = Path(__file__).parent.parent / "cbt_data"
+
+# CBT 거래 기록 저장 방식 ("json" 또는 "sqlite")
+CBT_STORAGE_TYPE = os.getenv("CBT_STORAGE_TYPE", "json")
+
+# CBT 가상 수수료율 (0.015% = 0.00015, 실제 거래와 동일)
+CBT_COMMISSION_RATE = float(os.getenv("CBT_COMMISSION_RATE", "0.00015"))
+
+# CBT 일일 리포트 자동 전송 활성화
+CBT_AUTO_REPORT_ENABLED = os.getenv("CBT_AUTO_REPORT_ENABLED", "true").lower() in ("true", "1", "yes")
+
+# CBT Equity Curve 저장 간격 (분)
+CBT_EQUITY_SAVE_INTERVAL = int(os.getenv("CBT_EQUITY_SAVE_INTERVAL", "60"))
+
+# ════════════════════════════════════════════════════════════════
 # 로깅 설정
 # ════════════════════════════════════════════════════════════════
 
@@ -334,3 +358,29 @@ def is_paper_mode() -> bool:
 def can_place_orders() -> bool:
     """실제 주문이 가능한 모드인지 확인합니다."""
     return TRADING_MODE in ("LIVE", "PAPER")
+
+
+def get_cbt_settings_summary() -> str:
+    """
+    CBT 모드 설정 요약을 반환합니다.
+    
+    Returns:
+        str: CBT 설정 요약 문자열
+    """
+    if TRADING_MODE != "CBT":
+        return ""
+    
+    return f"""
+═══════════════════════════════════════════════════
+🧪 CBT (Closed Beta Test) 모드 설정
+═══════════════════════════════════════════════════
+• 초기 자본금: {CBT_INITIAL_CAPITAL:,}원
+• 저장 방식: {CBT_STORAGE_TYPE.upper()}
+• 수수료율: {CBT_COMMISSION_RATE * 100:.3f}%
+• 자동 리포트: {'✅ 활성화' if CBT_AUTO_REPORT_ENABLED else '❌ 비활성화'}
+• 데이터 저장 경로: {CBT_DATA_DIR}
+═══════════════════════════════════════════════════
+⚠️ CBT 모드: 실계좌 주문이 발생하지 않습니다.
+   모든 체결은 가상으로 처리됩니다.
+═══════════════════════════════════════════════════
+"""
