@@ -1,0 +1,19 @@
+# ═══════════════════════════════════════════════════════════════════
+# KIS WebSocket 자동매매 시스템 의존성
+# ═══════════════════════════════════════════════════════════════════
+# 설치: pip install -r requirements.txt
+
+# 환경변수 관리
+python-dotenv>=1.0.0
+
+# HTTP 요청 (인증키 발급, 텔레그램 API)
+requests>=2.31.0
+
+# WebSocket 클라이언트
+websockets>=12.0
+
+# 비동기 처리
+asyncio>=3.4.3;python_version<"3.7"
+
+# 타입 힌트 (Python 3.8 이하 호환)
+typing-extensions>=4.0.0;python_version<"3.10"
