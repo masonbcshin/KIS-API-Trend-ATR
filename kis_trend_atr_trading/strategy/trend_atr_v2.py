@@ -403,12 +403,22 @@ class TrendATRStrategy:
         adx_str = f"{adx:.1f}" if adx is not None and not pd.isna(adx) else "N/A"
         return True, f"상승 추세(ADX:{adx_str}) + 직전 고가({prev_high:,.0f}) 돌파"
     
-    def check_exit_condition(self, current_price: float) -> Tuple[bool, str]:
+    def check_exit_condition(
+        self, 
+        current_price: float,
+        df: pd.DataFrame = None
+    ) -> Tuple[bool, str]:
         """
         청산 조건을 확인합니다.
         
+        ★ 청산 조건 (우선순위 순):
+            1. 손절가 도달 (ATR Stop)
+            2. 익절가 도달 (Take Profit)
+            3. 추세 이탈 (MA 하향 돌파)
+        
         Args:
             current_price: 현재가
+            df: OHLCV 데이터프레임 (추세 이탈 체크용)
         
         Returns:
             Tuple[bool, str]: (청산 여부, 사유)
@@ -416,17 +426,57 @@ class TrendATRStrategy:
         if self.position is None:
             return False, "포지션 없음"
         
+        pnl_pct = ((current_price - self.position.entry_price) / 
+                   self.position.entry_price * 100)
+        
+        # 1. 손절 체크 (ATR Stop)
         if current_price <= self.position.stop_loss:
-            pnl_pct = ((current_price - self.position.entry_price) / 
-                       self.position.entry_price * 100)
             return True, f"손절 도달 (손절가: {self.position.stop_loss:,.0f}, 손익: {pnl_pct:.2f}%)"
         
+        # 2. 익절 체크 (Take Profit)
         if current_price >= self.position.take_profit:
-            pnl_pct = ((current_price - self.position.entry_price) / 
-                       self.position.entry_price * 100)
             return True, f"익절 도달 (익절가: {self.position.take_profit:,.0f}, 손익: {pnl_pct:.2f}%)"
         
+        # 3. 추세 이탈 체크 (MA 하향 돌파)
+        if df is not None and len(df) >= self.params.trend_ma_period:
+            trend = self.get_trend(df)
+            if trend == TrendType.DOWNTREND:
+                # 하락 추세로 전환된 경우
+                return True, f"추세 이탈 - MA 하향 돌파 (손익: {pnl_pct:.2f}%)"
+        
         return False, "청산 조건 미충족"
+    
+    def check_trend_exit(self, df: pd.DataFrame) -> Tuple[bool, str]:
+        """
+        추세 이탈 조건만 별도로 확인합니다.
+        
+        포지션 보유 중 추세가 하락으로 전환되면 청산합니다.
+        
+        Args:
+            df: OHLCV 데이터프레임
+        
+        Returns:
+            Tuple[bool, str]: (청산 여부, 사유)
+        """
+        if self.position is None:
+            return False, "포지션 없음"
+        
+        if df is None or len(df) < self.params.trend_ma_period:
+            return False, "데이터 부족"
+        
+        df_with_indicators = self.add_indicators(df)
+        trend = self.get_trend(df_with_indicators)
+        
+        if trend == TrendType.DOWNTREND:
+            latest = df_with_indicators.iloc[-1]
+            ma = latest.get('ma', 0)
+            close = latest.get('close', 0)
+            
+            return True, (
+                f"추세 이탈 - 종가({close:,.0f}) < MA({ma:,.0f})"
+            )
+        
+        return False, "추세 유지 중"
     
     # ═══════════════════════════════════════════════════════════════════════════
     # 시그널 생성
@@ -442,6 +492,11 @@ class TrendATRStrategy:
         
         ★ 환경 독립: 이 메서드는 순수하게 데이터만 분석합니다.
             주문 실행은 호출자의 책임입니다.
+        
+        ★ 청산 조건 (우선순위 순):
+            1. 손절가 도달 (ATR Stop)
+            2. 익절가 도달 (Take Profit)
+            3. 추세 이탈 (MA 하향 돌파)
         
         Args:
             df: OHLCV 데이터프레임
@@ -465,7 +520,11 @@ class TrendATRStrategy:
         
         # 포지션 보유 중 → 청산 조건 확인
         if self.position is not None:
-            should_exit, exit_reason = self.check_exit_condition(current_price)
+            # ★ 추세 이탈 체크를 포함한 청산 조건 확인
+            should_exit, exit_reason = self.check_exit_condition(
+                current_price, 
+                df_with_indicators  # 추세 이탈 체크용
+            )
             
             if should_exit:
                 return Signal(
