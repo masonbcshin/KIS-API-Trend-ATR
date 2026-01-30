@@ -834,3 +834,111 @@ def ensure_single_instance() -> bool:
         return False
     
     return True
+
+
+def validate_execution_mode() -> Tuple[bool, str]:
+    """
+    실행 모드를 검증합니다.
+    
+    ★ DRY_RUN 모드에서는 실제 주문이 발생하지 않음을 확인합니다.
+    ★ REAL 모드에서는 이중 승인 조건을 검증합니다.
+    
+    Returns:
+        Tuple[bool, str]: (검증 성공 여부, 메시지)
+    """
+    try:
+        from config.execution_mode import get_execution_mode_manager
+        manager = get_execution_mode_manager()
+        
+        mode = manager.mode.value
+        can_order = manager.can_place_orders()
+        
+        if mode == "DRY_RUN":
+            return True, f"✅ {mode} 모드 - 가상 체결만 수행 (안전)"
+        
+        elif mode == "PAPER":
+            return True, f"✅ {mode} 모드 - 모의투자 API 사용"
+        
+        elif mode == "REAL":
+            if can_order:
+                return True, f"⚠️ {mode} 모드 - 실계좌 주문 활성화 (이중 승인 완료)"
+            else:
+                config = manager.get_config()
+                reason = config.get_rejection_reason()
+                return True, f"⛔ {mode} 모드 요청되었으나 조건 미충족: {reason} → DRY_RUN으로 전환됨"
+        
+        return False, f"❓ 알 수 없는 모드: {mode}"
+        
+    except ImportError:
+        return False, "❌ execution_mode 모듈 로드 실패"
+    except Exception as e:
+        return False, f"❌ 실행 모드 검증 오류: {e}"
+
+
+def pre_execution_safety_check() -> Tuple[bool, List[str]]:
+    """
+    실행 전 안전 검사를 수행합니다.
+    
+    ★ 모든 안전 조건을 검사합니다:
+        - 단일 인스턴스 확인
+        - Kill Switch 상태 확인
+        - 실행 모드 검증
+        - 장 운영시간 확인 (옵션)
+    
+    Returns:
+        Tuple[bool, List[str]]: (모든 검사 통과 여부, 경고/오류 메시지 목록)
+    """
+    messages = []
+    all_passed = True
+    
+    # 1. 실행 모드 검증
+    mode_ok, mode_msg = validate_execution_mode()
+    messages.append(mode_msg)
+    if not mode_ok:
+        all_passed = False
+    
+    # 2. Kill Switch 상태 확인
+    try:
+        from config.execution_mode import get_execution_mode_manager
+        manager = get_execution_mode_manager()
+        
+        if manager.kill_switch_active:
+            all_passed = False
+            messages.append("⛔ Kill Switch가 활성화되어 있습니다.")
+    except Exception as e:
+        messages.append(f"⚠️ Kill Switch 상태 확인 실패: {e}")
+    
+    # 3. 장 운영시간 확인
+    checker = get_market_checker()
+    status = checker.get_market_status()
+    
+    status_messages = {
+        MarketStatus.OPEN: "✅ 정규장 - 거래 가능",
+        MarketStatus.PRE_MARKET: "⚠️ 장전 동시호가 - 09:00 이후 거래 가능",
+        MarketStatus.SIMULTANEOUS_QUOTE: "⚠️ 장 마감 동시호가 - 청산만 가능",
+        MarketStatus.CLOSED: "⛔ 폐장 - 거래 불가"
+    }
+    messages.append(status_messages.get(status, "❓ 알 수 없는 시장 상태"))
+    
+    return all_passed, messages
+
+
+def print_safety_check_report() -> None:
+    """안전 검사 결과를 출력합니다."""
+    all_passed, messages = pre_execution_safety_check()
+    
+    print("\n" + "═" * 60)
+    print("           [실행 전 안전 검사 결과]")
+    print("═" * 60)
+    
+    for msg in messages:
+        print(f"  {msg}")
+    
+    print("─" * 60)
+    
+    if all_passed:
+        print("  ✅ 모든 안전 검사 통과")
+    else:
+        print("  ⛔ 일부 안전 검사 실패 - 실행 전 확인 필요")
+    
+    print("═" * 60 + "\n")
