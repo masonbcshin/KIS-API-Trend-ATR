@@ -17,10 +17,10 @@ PyYAML>=6.0.0
 # 기술적 지표 계산
 ta>=0.10.2
 
-# PostgreSQL 데이터베이스
-# psycopg2-binary는 빌드 없이 설치 가능한 버전
-# 프로덕션에서는 psycopg2 (빌드 필요) 권장
-psycopg2-binary>=2.9.9
+# MySQL 데이터베이스
+# Oracle Cloud Infrastructure Free Tier MySQL 호환
+# mysql-connector-python은 순수 Python 구현 (C 확장 불필요)
+mysql-connector-python>=8.2.0
 
 # 테스트
 pytest>=8.0.0

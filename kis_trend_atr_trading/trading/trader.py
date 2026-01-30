@@ -1,7 +1,7 @@
 """
-KIS Trend-ATR Trading System - PostgreSQL 연동 트레이더
+KIS Trend-ATR Trading System - MySQL 연동 트레이더
 
-이 모듈은 매수/매도 로직을 PostgreSQL과 연동하여 처리합니다.
+이 모듈은 매수/매도 로직을 MySQL과 연동하여 처리합니다.
 
 ★ 핵심 원칙:
     1. 모든 거래는 DB에 기록됩니다
@@ -33,7 +33,7 @@ from typing import Optional, Dict, List, Any, Tuple
 from dataclasses import dataclass
 from enum import Enum
 
-from db.postgres import get_db_manager, PostgresManager
+from db.mysql import get_db_manager, MySQLManager
 from db.repository import (
     PositionRepository,
     TradeRepository,
@@ -110,12 +110,12 @@ class TradeResult:
 
 class DatabaseTrader:
     """
-    PostgreSQL 연동 트레이더 클래스
+    MySQL 연동 트레이더 클래스
     
     ★ 이 클래스가 하는 일:
         - 매수/매도 요청을 받음
         - 트레이딩 모드에 따라 주문 실행 (또는 가상 체결)
-        - 결과를 PostgreSQL에 저장
+        - 결과를 MySQL에 저장
         - 텔레그램으로 알림 전송
     
     ★ 중학생도 이해할 수 있는 비유:
@@ -152,7 +152,7 @@ class DatabaseTrader:
     def __init__(
         self,
         mode: TradingMode = None,
-        db: PostgresManager = None,
+        db: MySQLManager = None,
         position_repo: PositionRepository = None,
         trade_repo: TradeRepository = None,
         snapshot_repo: AccountSnapshotRepository = None,
@@ -164,7 +164,7 @@ class DatabaseTrader:
         
         Args:
             mode: 트레이딩 모드 (환경변수에서 자동 로드)
-            db: PostgresManager
+            db: MySQLManager
             position_repo: 포지션 Repository
             trade_repo: 거래 Repository
             snapshot_repo: 스냅샷 Repository
