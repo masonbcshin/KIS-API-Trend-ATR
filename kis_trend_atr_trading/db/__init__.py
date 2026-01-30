@@ -1,7 +1,8 @@
 """
-KIS Trend-ATR Trading System - PostgreSQL 데이터베이스 모듈
+KIS Trend-ATR Trading System - MySQL 데이터베이스 모듈
 
-이 모듈은 트레이딩 시스템의 모든 데이터를 PostgreSQL에 영속화합니다.
+이 모듈은 트레이딩 시스템의 모든 데이터를 MySQL(InnoDB)에 영속화합니다.
+Oracle Cloud Infrastructure Free Tier MySQL 호환.
 
 ★ 핵심 기능:
     1. 포지션 상태 관리 (서버 재시작 후에도 유지)
@@ -15,6 +16,12 @@ KIS Trend-ATR Trading System - PostgreSQL 데이터베이스 모듈
     - 환경변수 기반 DB 접속 정보 관리
     - 중학생도 이해할 수 있는 명확한 구조
 
+★ PostgreSQL → MySQL 변경 사항:
+    - psycopg2 → mysql-connector-python
+    - SERIAL → AUTO_INCREMENT
+    - RETURNING → LAST_INSERT_ID() + SELECT
+    - ON CONFLICT → ON DUPLICATE KEY UPDATE
+
 사용 예시:
     from db import get_db_manager
     
@@ -23,9 +30,10 @@ KIS Trend-ATR Trading System - PostgreSQL 데이터베이스 모듈
     db.get_open_positions()
 """
 
-from db.postgres import (
-    PostgresManager,
+from db.mysql import (
+    MySQLManager,
     get_db_manager,
+    close_db_manager,
     DatabaseConfig,
     DatabaseError,
     ConnectionError,
@@ -36,19 +44,28 @@ from db.repository import (
     PositionRepository,
     TradeRepository,
     AccountSnapshotRepository,
+    PositionRecord,
+    TradeRecord,
+    AccountSnapshotRecord,
     get_position_repository,
     get_trade_repository,
     get_account_snapshot_repository
 )
 
 __all__ = [
-    # PostgreSQL Manager
-    "PostgresManager",
+    # MySQL Manager
+    "MySQLManager",
     "get_db_manager",
+    "close_db_manager",
     "DatabaseConfig",
     "DatabaseError",
     "ConnectionError",
     "QueryError",
+    
+    # Data Records
+    "PositionRecord",
+    "TradeRecord",
+    "AccountSnapshotRecord",
     
     # Repositories
     "PositionRepository",

@@ -13,6 +13,11 @@ KIS Trend-ATR Trading System - 데이터 접근 계층 (Repository)
     2. TradeRepository: 거래 기록 관리
     3. AccountSnapshotRepository: 계좌 스냅샷 관리
 
+★ 변경 사항 (PostgreSQL → MySQL):
+    - ON CONFLICT → INSERT ... ON DUPLICATE KEY UPDATE
+    - RETURNING * → execute_insert() + SELECT
+    - PostgreSQL 전용 함수 제거 (array_agg 등)
+
 사용 예시:
     from db.repository import get_position_repository
     
@@ -35,7 +40,7 @@ from typing import Optional, Dict, List, Any, Tuple
 from dataclasses import dataclass
 from decimal import Decimal
 
-from db.postgres import PostgresManager, get_db_manager, QueryError
+from db.mysql import MySQLManager, get_db_manager, QueryError
 from utils.logger import get_logger
 
 logger = get_logger("repository")
@@ -199,10 +204,10 @@ class PositionRepository:
         repo.close_position("005930")
     """
     
-    def __init__(self, db: PostgresManager = None):
+    def __init__(self, db: MySQLManager = None):
         """
         Args:
-            db: PostgresManager 인스턴스 (미입력 시 싱글톤 사용)
+            db: MySQLManager 인스턴스 (미입력 시 싱글톤 사용)
         """
         self.db = db or get_db_manager()
     
@@ -221,7 +226,8 @@ class PositionRepository:
         """
         새 포지션을 저장합니다.
         
-        ★ 동일 종목에 이미 OPEN 포지션이 있으면 실패
+        ★ 동일 종목에 이미 OPEN 포지션이 있으면 업데이트
+        ★ MySQL의 INSERT ... ON DUPLICATE KEY UPDATE 사용
         
         Args:
             symbol: 종목 코드
@@ -248,36 +254,39 @@ class PositionRepository:
                 logger.warning(f"[REPO] 이미 열린 포지션 존재: {symbol}")
                 return None
             
-            result = self.db.execute_command(
+            # MySQL INSERT ... ON DUPLICATE KEY UPDATE
+            # ★ PostgreSQL의 ON CONFLICT 대체
+            self.db.execute_command(
                 """
                 INSERT INTO positions (
                     symbol, entry_price, quantity, entry_time,
                     atr_at_entry, stop_price, take_profit_price,
                     trailing_stop, highest_price, status
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN')
-                ON CONFLICT (symbol) DO UPDATE SET
-                    entry_price = EXCLUDED.entry_price,
-                    quantity = EXCLUDED.quantity,
-                    entry_time = EXCLUDED.entry_time,
-                    atr_at_entry = EXCLUDED.atr_at_entry,
-                    stop_price = EXCLUDED.stop_price,
-                    take_profit_price = EXCLUDED.take_profit_price,
-                    trailing_stop = EXCLUDED.trailing_stop,
-                    highest_price = EXCLUDED.highest_price,
+                ON DUPLICATE KEY UPDATE
+                    entry_price = VALUES(entry_price),
+                    quantity = VALUES(quantity),
+                    entry_time = VALUES(entry_time),
+                    atr_at_entry = VALUES(atr_at_entry),
+                    stop_price = VALUES(stop_price),
+                    take_profit_price = VALUES(take_profit_price),
+                    trailing_stop = VALUES(trailing_stop),
+                    highest_price = VALUES(highest_price),
                     status = 'OPEN'
-                RETURNING *
                 """,
                 (
                     symbol, entry_price, quantity, entry_time,
                     atr_at_entry, stop_price, take_profit_price,
                     trailing_stop, highest_price
-                ),
-                returning=True
+                )
             )
+            
+            # 저장된 데이터 조회 (RETURNING 대체)
+            result = self.get_by_symbol(symbol)
             
             if result:
                 logger.info(f"[REPO] 포지션 저장: {symbol} @ {entry_price:,.0f}원 x {quantity}주")
-                return PositionRecord.from_dict(result)
+                return result
             return None
             
         except QueryError as e:
@@ -464,7 +473,7 @@ class TradeRepository:
         trades = repo.get_trades_by_date(date.today())
     """
     
-    def __init__(self, db: PostgresManager = None):
+    def __init__(self, db: MySQLManager = None):
         self.db = db or get_db_manager()
     
     def save_buy(
@@ -491,27 +500,25 @@ class TradeRepository:
         executed_at = executed_at or datetime.now()
         
         try:
-            result = self.db.execute_command(
+            # INSERT 실행 후 LAST_INSERT_ID 반환
+            trade_id = self.db.execute_insert(
                 """
                 INSERT INTO trades (symbol, side, price, quantity, executed_at, order_no)
                 VALUES (%s, 'BUY', %s, %s, %s, %s)
-                RETURNING *
                 """,
-                (symbol, price, quantity, executed_at, order_no),
-                returning=True
+                (symbol, price, quantity, executed_at, order_no)
             )
             
-            if result:
+            if trade_id:
                 logger.info(f"[REPO] 매수 기록: {symbol} @ {price:,.0f}원 x {quantity}주")
                 return TradeRecord(
-                    id=result["id"],
+                    id=trade_id,
                     symbol=symbol,
                     side="BUY",
                     price=price,
                     quantity=quantity,
                     executed_at=executed_at,
-                    order_no=order_no,
-                    created_at=result.get("created_at")
+                    order_no=order_no
                 )
             return None
             
@@ -558,28 +565,26 @@ class TradeRepository:
             pnl_percent = ((price - entry_price) / entry_price) * 100
         
         try:
-            result = self.db.execute_command(
+            trade_id = self.db.execute_insert(
                 """
                 INSERT INTO trades (
                     symbol, side, price, quantity, executed_at,
                     reason, pnl, pnl_percent, entry_price, holding_days, order_no
                 )
                 VALUES (%s, 'SELL', %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING *
                 """,
                 (
                     symbol, price, quantity, executed_at,
                     reason, pnl, pnl_percent, entry_price, holding_days, order_no
-                ),
-                returning=True
+                )
             )
             
-            if result:
+            if trade_id:
                 pnl_str = f"{pnl:+,.0f}원 ({pnl_percent:+.2f}%)" if pnl else "N/A"
                 logger.info(f"[REPO] 매도 기록: {symbol} @ {price:,.0f}원 x {quantity}주, 손익={pnl_str}")
                 
                 return TradeRecord(
-                    id=result["id"],
+                    id=trade_id,
                     symbol=symbol,
                     side="SELL",
                     price=price,
@@ -590,8 +595,7 @@ class TradeRepository:
                     pnl_percent=pnl_percent,
                     entry_price=entry_price,
                     holding_days=holding_days,
-                    order_no=order_no,
-                    created_at=result.get("created_at")
+                    order_no=order_no
                 )
             return None
             
@@ -636,23 +640,21 @@ class TradeRepository:
             pnl_percent = ((price - entry_price) / entry_price) * 100
         
         try:
-            result = self.db.execute_command(
+            trade_id = self.db.execute_insert(
                 """
                 INSERT INTO trades (
                     symbol, side, price, quantity, executed_at,
                     reason, pnl, pnl_percent, entry_price
                 )
                 VALUES (%s, %s, %s, %s, %s, 'SIGNAL_ONLY', %s, %s, %s)
-                RETURNING *
                 """,
-                (symbol, side, price, quantity, executed_at, pnl, pnl_percent, entry_price),
-                returning=True
+                (symbol, side, price, quantity, executed_at, pnl, pnl_percent, entry_price)
             )
             
-            if result:
+            if trade_id:
                 logger.info(f"[REPO] 신호 기록: {side} {symbol} @ {price:,.0f}원")
                 return TradeRecord(
-                    id=result["id"],
+                    id=trade_id,
                     symbol=symbol,
                     side=side,
                     price=price,
@@ -661,8 +663,7 @@ class TradeRepository:
                     reason="SIGNAL_ONLY",
                     pnl=pnl,
                     pnl_percent=pnl_percent,
-                    entry_price=entry_price,
-                    created_at=result.get("created_at")
+                    entry_price=entry_price
                 )
             return None
             
@@ -938,7 +939,7 @@ class AccountSnapshotRepository:
         - MDD (최대 낙폭) 계산
     """
     
-    def __init__(self, db: PostgresManager = None):
+    def __init__(self, db: MySQLManager = None):
         self.db = db or get_db_manager()
     
     def save(
@@ -967,40 +968,36 @@ class AccountSnapshotRepository:
         snapshot_time = snapshot_time or datetime.now()
         
         try:
-            result = self.db.execute_command(
+            # MySQL INSERT ... ON DUPLICATE KEY UPDATE
+            self.db.execute_command(
                 """
                 INSERT INTO account_snapshots (
                     snapshot_time, total_equity, cash, 
                     unrealized_pnl, realized_pnl, position_count
                 )
                 VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (snapshot_time) DO UPDATE SET
-                    total_equity = EXCLUDED.total_equity,
-                    cash = EXCLUDED.cash,
-                    unrealized_pnl = EXCLUDED.unrealized_pnl,
-                    realized_pnl = EXCLUDED.realized_pnl,
-                    position_count = EXCLUDED.position_count
-                RETURNING *
+                ON DUPLICATE KEY UPDATE
+                    total_equity = VALUES(total_equity),
+                    cash = VALUES(cash),
+                    unrealized_pnl = VALUES(unrealized_pnl),
+                    realized_pnl = VALUES(realized_pnl),
+                    position_count = VALUES(position_count)
                 """,
                 (
                     snapshot_time, total_equity, cash,
                     unrealized_pnl, realized_pnl, position_count
-                ),
-                returning=True
+                )
             )
             
-            if result:
-                logger.debug(f"[REPO] 계좌 스냅샷: {total_equity:,.0f}원")
-                return AccountSnapshotRecord(
-                    snapshot_time=snapshot_time,
-                    total_equity=total_equity,
-                    cash=cash,
-                    unrealized_pnl=unrealized_pnl,
-                    realized_pnl=realized_pnl,
-                    position_count=position_count,
-                    created_at=result.get("created_at")
-                )
-            return None
+            logger.debug(f"[REPO] 계좌 스냅샷: {total_equity:,.0f}원")
+            return AccountSnapshotRecord(
+                snapshot_time=snapshot_time,
+                total_equity=total_equity,
+                cash=cash,
+                unrealized_pnl=unrealized_pnl,
+                realized_pnl=realized_pnl,
+                position_count=position_count
+            )
             
         except QueryError as e:
             logger.error(f"[REPO] 스냅샷 저장 실패: {e}")
@@ -1034,21 +1031,26 @@ class AccountSnapshotRepository:
         """
         일별 평가금액 추이를 반환합니다.
         
+        ★ MySQL 호환: array_agg 대신 서브쿼리 사용
+        
         Args:
             days: 조회 일수
         
         Returns:
             List[Dict]: 일별 평가금액
         """
+        # MySQL에서는 array_agg가 없으므로 다른 방법 사용
         results = self.db.execute_query(
             """
             SELECT 
                 DATE(snapshot_time) as trade_date,
                 MIN(total_equity) as min_equity,
                 MAX(total_equity) as max_equity,
-                (array_agg(total_equity ORDER BY snapshot_time DESC))[1] as end_equity
-            FROM account_snapshots
-            WHERE snapshot_time >= CURRENT_DATE - %s
+                (SELECT total_equity FROM account_snapshots a2 
+                 WHERE DATE(a2.snapshot_time) = DATE(a1.snapshot_time)
+                 ORDER BY a2.snapshot_time DESC LIMIT 1) as end_equity
+            FROM account_snapshots a1
+            WHERE snapshot_time >= DATE_SUB(CURDATE(), INTERVAL %s DAY)
             GROUP BY DATE(snapshot_time)
             ORDER BY trade_date
             """,
@@ -1079,7 +1081,7 @@ class AccountSnapshotRepository:
             query = """
                 SELECT snapshot_time, total_equity
                 FROM account_snapshots
-                WHERE snapshot_time >= CURRENT_DATE - %s
+                WHERE snapshot_time >= DATE_SUB(CURDATE(), INTERVAL %s DAY)
                 ORDER BY snapshot_time
             """
             results = self.db.execute_query(query, (days,))

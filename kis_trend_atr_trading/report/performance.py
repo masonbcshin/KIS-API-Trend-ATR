@@ -1,7 +1,7 @@
 """
-KIS Trend-ATR Trading System - 성과 측정 로직 (PostgreSQL 기반)
+KIS Trend-ATR Trading System - 성과 측정 로직 (MySQL 기반)
 
-이 모듈은 PostgreSQL에 저장된 거래 데이터를 기반으로
+이 모듈은 MySQL에 저장된 거래 데이터를 기반으로
 트레이딩 성과를 측정하고 분석합니다.
 
 ★ 핵심 기능:
@@ -37,7 +37,7 @@ from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass
 from decimal import Decimal
 
-from db.postgres import get_db_manager, PostgresManager
+from db.mysql import get_db_manager, MySQLManager
 from db.repository import (
     TradeRepository,
     AccountSnapshotRepository,
@@ -182,7 +182,7 @@ class SymbolPnL:
 
 class PerformanceCalculator:
     """
-    PostgreSQL 기반 성과 계산기
+    MySQL 기반 성과 계산기
     
     ★ 이 클래스가 하는 일:
         - DB에서 거래 기록을 읽어옴
@@ -205,7 +205,7 @@ class PerformanceCalculator:
     
     def __init__(
         self,
-        db: PostgresManager = None,
+        db: MySQLManager = None,
         trade_repo: TradeRepository = None,
         position_repo: PositionRepository = None,
         snapshot_repo: AccountSnapshotRepository = None
@@ -480,6 +480,8 @@ class PerformanceCalculator:
         """
         월별 손익을 반환합니다.
         
+        ★ MySQL 호환: DATE_FORMAT 사용
+        
         Args:
             months: 조회 개월 수
         
@@ -489,7 +491,7 @@ class PerformanceCalculator:
         results = self.db.execute_query(
             """
             SELECT 
-                DATE_TRUNC('month', executed_at) as month,
+                DATE_FORMAT(executed_at, '%%Y-%%m-01') as month,
                 COALESCE(SUM(pnl), 0) as realized_pnl,
                 COUNT(*) as trade_count,
                 SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as win_count,
@@ -497,8 +499,8 @@ class PerformanceCalculator:
             FROM trades
             WHERE side = 'SELL' 
               AND reason != 'SIGNAL_ONLY'
-              AND executed_at >= DATE_TRUNC('month', CURRENT_DATE - INTERVAL '%s months')
-            GROUP BY DATE_TRUNC('month', executed_at)
+              AND executed_at >= DATE_SUB(CURDATE(), INTERVAL %s MONTH)
+            GROUP BY DATE_FORMAT(executed_at, '%%Y-%%m-01')
             ORDER BY month DESC
             """,
             (months,)

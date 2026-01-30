@@ -1,7 +1,7 @@
 """
 KIS Trend-ATR Trading System - 트레이딩 모듈
 
-이 모듈은 PostgreSQL 기반의 매수/매도 로직을 담당합니다.
+이 모듈은 MySQL 기반의 매수/매도 로직을 담당합니다.
 
 ★ 핵심 기능:
     1. 매수 체결 시 positions + trades 테이블 동시 저장

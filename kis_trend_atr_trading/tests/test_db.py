@@ -1,7 +1,7 @@
 """
 KIS Trend-ATR Trading System - 데이터베이스 모듈 테스트
 
-이 모듈은 PostgreSQL 연동 기능을 테스트합니다.
+이 모듈은 MySQL 연동 기능을 테스트합니다.
 
 ★ 테스트 환경:
     - DB_ENABLED=false일 때 테스트 (실제 DB 연결 없이)
@@ -19,7 +19,7 @@ from unittest.mock import Mock, patch, MagicMock
 # DB_ENABLED를 false로 설정하여 실제 연결 방지
 os.environ["DB_ENABLED"] = "false"
 
-from db.postgres import DatabaseConfig, PostgresManager, get_db_manager
+from db.mysql import DatabaseConfig, MySQLManager, get_db_manager
 from db.repository import (
     PositionRepository,
     TradeRepository,
@@ -39,9 +39,10 @@ class TestDatabaseConfig:
         config = DatabaseConfig()
         
         assert config.host == "localhost"
-        assert config.port == 5432
+        assert config.port == 3306  # MySQL 기본 포트
         assert config.database == "kis_trading"
-        assert config.user == "postgres"
+        assert config.user == "root"  # MySQL 기본 사용자
+        assert config.db_type == "mysql"
         # DB_ENABLED=false로 설정했으므로
         assert config.enabled == False
     
@@ -49,14 +50,14 @@ class TestDatabaseConfig:
         """커스텀 설정값 테스트"""
         config = DatabaseConfig(
             host="custom-host",
-            port=5433,
+            port=3307,
             database="custom_db",
             user="custom_user",
             password="secret"
         )
         
         assert config.host == "custom-host"
-        assert config.port == 5433
+        assert config.port == 3307
         assert config.database == "custom_db"
         assert config.user == "custom_user"
         assert config.password == "secret"
@@ -65,15 +66,16 @@ class TestDatabaseConfig:
         """딕셔너리 변환 테스트"""
         config = DatabaseConfig(
             host="localhost",
-            port=5432,
+            port=3306,
             database="test_db"
         )
         
         d = config.to_dict()
         
         assert d["host"] == "localhost"
-        assert d["port"] == 5432
+        assert d["port"] == 3306
         assert d["database"] == "test_db"
+        assert d["charset"] == "utf8mb4"
     
     def test_repr_masks_password(self):
         """비밀번호 마스킹 테스트"""
@@ -85,19 +87,19 @@ class TestDatabaseConfig:
         assert "****" in repr_str
 
 
-class TestPostgresManager:
-    """PostgresManager 테스트"""
+class TestMySQLManager:
+    """MySQLManager 테스트"""
     
     def test_manager_initialization(self):
         """매니저 초기화 테스트"""
-        manager = PostgresManager()
+        manager = MySQLManager()
         
         assert manager.config is not None
         assert manager.is_connected() == False
     
     def test_disabled_manager_returns_empty(self):
         """비활성화된 매니저는 빈 결과 반환"""
-        manager = PostgresManager()
+        manager = MySQLManager()
         
         # 비활성화 상태에서 쿼리 실행
         result = manager.execute_query("SELECT 1")
@@ -106,9 +108,17 @@ class TestPostgresManager:
     
     def test_disabled_manager_command_returns_zero(self):
         """비활성화된 매니저는 0 반환"""
-        manager = PostgresManager()
+        manager = MySQLManager()
         
         result = manager.execute_command("INSERT INTO test VALUES (1)")
+        
+        assert result == 0
+    
+    def test_disabled_manager_insert_returns_zero(self):
+        """비활성화된 매니저의 INSERT는 0 반환"""
+        manager = MySQLManager()
+        
+        result = manager.execute_insert("INSERT INTO test VALUES (1)")
         
         assert result == 0
 
@@ -353,6 +363,35 @@ class TestAccountSnapshotRecord:
         assert d["unrealized_pnl"] == 100000.0
         assert d["realized_pnl"] == 200000.0
         assert d["position_count"] == 2
+
+
+class TestMySQLSpecificFeatures:
+    """MySQL 특화 기능 테스트"""
+    
+    def test_pool_config(self):
+        """커넥션 풀 설정 테스트"""
+        config = DatabaseConfig(
+            pool_size=10,
+            pool_name="test_pool"
+        )
+        
+        pool_config = config.to_pool_config()
+        
+        assert pool_config["pool_size"] == 10
+        assert pool_config["pool_name"] == "test_pool"
+    
+    def test_charset_config(self):
+        """문자셋 설정 테스트"""
+        config = DatabaseConfig()
+        
+        assert config.charset == "utf8mb4"
+        assert config.collation == "utf8mb4_unicode_ci"
+    
+    def test_autocommit_disabled_by_default(self):
+        """자동 커밋이 기본으로 비활성화"""
+        config = DatabaseConfig()
+        
+        assert config.autocommit == False
 
 
 # 실행 시 환경 복원
