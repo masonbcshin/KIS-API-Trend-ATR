@@ -40,8 +40,8 @@ EXECUTION_MODE = "PAPER"
 # 일일 최대 손실 비율 (%) - 모의투자는 5%까지 허용
 DAILY_MAX_LOSS_PERCENT = 5.0
 
-# 일일 최대 거래 횟수 - 모의투자는 5회까지 허용
-DAILY_MAX_TRADES = 5
+# 일일 최대 거래 횟수 - 모의투자는 20회까지 허용
+DAILY_MAX_TRADES = 20
 
 # 연속 손실 허용 횟수 - 모의투자는 3회까지 허용
 MAX_CONSECUTIVE_LOSSES = 3
