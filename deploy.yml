@@ -18,6 +18,17 @@ jobs:
           key: ${{ secrets.GCP_SSH_KEY }}
           script: |
             cd ${{ secrets.PROJECT_PATH }}
+
+            echo ">>> Git pull"
             git pull
-            pkill -f python || true
-            python main.py &
+
+            echo ">>> Activate venv"
+            if [ -d "venv" ]; then
+              source venv/bin/activate
+            fi
+
+            echo ">>> Stop old process"
+            pkill -f "main.py" || true
+
+            echo ">>> Start new process"
+            nohup python main.py > app.log 2>&1 &
