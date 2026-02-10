@@ -27,12 +27,11 @@ KIS Trend-ATR Trading System - 멀티데이 전략 실행 파일
     python main_multiday.py --mode trade --max-runs 1
 
 작성자: KIS Trend-ATR Trading System
-버전: 2.0.0 (멀티데이)
+버전: 2.0.1 (멀티데이 타임존 수정)
 """
 
 import argparse
 import sys
-from datetime import datetime
 
 # 프로젝트 모듈 임포트
 from config import settings
@@ -41,6 +40,7 @@ from strategy.multiday_trend_atr import MultidayTrendATRStrategy
 from engine.multiday_executor import MultidayExecutor
 from backtest.backtester import Backtester
 from utils.logger import setup_logger, get_logger
+from utils.market_hours import get_kst_now # KST 시간 함수 임포트
 
 
 def print_banner():
@@ -409,9 +409,9 @@ def main():
     # 배너 출력
     print_banner()
     
-    # 시작 시간
-    start_time = datetime.now()
-    logger.info(f"프로그램 시작: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    # 시작 시간 (KST 기준)
+    start_time = get_kst_now()
+    logger.info(f"프로그램 시작: {start_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
     logger.info(f"실행 모드: {args.mode}, 트레이딩 모드: {settings.TRADING_MODE}")
     
     # 모드별 실행
@@ -432,10 +432,11 @@ def main():
     elif args.mode == "verify":
         run_verification()
     
-    # 종료 시간
-    end_time = datetime.now()
+    # 종료 시간 (KST 기준)
+    end_time = get_kst_now()
     elapsed = (end_time - start_time).total_seconds()
-    logger.info(f"프로그램 종료: 실행 시간 {elapsed:.1f}초")
+    logger.info(f"프로그램 종료: {end_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    logger.info(f"총 실행 시간: {elapsed:.1f}초")
     
     print(f"\n✅ 프로그램 종료 (실행 시간: {elapsed:.1f}초)")
 
