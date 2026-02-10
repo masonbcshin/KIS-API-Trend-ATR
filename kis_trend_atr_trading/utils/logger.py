@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
+from logging.handlers import TimedRotatingFileHandler # TimedRotatingFileHandler 임포트
 
 # KST 타임존 정의
 KST = ZoneInfo("Asia/Seoul")
