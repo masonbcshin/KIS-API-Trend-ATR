@@ -7,45 +7,30 @@ KIS Trend-ATR Trading System - 거래시간 검증 모듈
 - 동시호가: 08:30~09:00, 15:20~15:30
 - 안전 마진을 위해 09:00~15:20 사이에만 주문
 
-⚠️ 공휴일은 별도 캘린더 연동이 필요합니다.
+✅ `holidays` 라이브러리를 사용하여 공휴일을 동적으로 처리합니다.
 """
 
 from datetime import datetime, time, date, timedelta
 from typing import Tuple
 import logging
 from zoneinfo import ZoneInfo
+import holidays  # 휴장일 관리를 위해 추가
 
 logger = logging.getLogger(__name__)
 
 # KST (Korea Standard Time) 타임존 객체 생성
 KST = ZoneInfo("Asia/Seoul")
 
+#  대한민국 공휴일 객체 생성
+KR_HOLIDAYS = holidays.KR()
+
 # ════════════════════════════════════════════════════════════════
 # 거래시간 설정
 # ════════════════════════════════════════════════════════════════
 MARKET_OPEN = time(9, 0, 0)
-MARKET_CLOSE = time(15, 20, 0)
+MARKET_CLOSE = time(15, 20, 0)  # 동시호가 회피
 LUNCH_START = time(11, 30, 0)
 LUNCH_END = time(13, 0, 0)
-HOLIDAYS_2024_2025 = {
-    date(2024, 1, 1), date(2024, 2, 9), date(2024, 2, 10), date(2024, 2, 11),
-    date(2024, 2, 12), date(2024, 3, 1), date(2024, 4, 10), date(2024, 5, 1),
-    date(2024, 5, 6), date(2024, 5, 15), date(2024, 6, 6), date(2024, 8, 15),
-    date(2024, 9, 16), date(2024, 9, 17), date(2024, 9, 18), date(2024, 10, 3),
-    date(2024, 10, 9), date(2024, 12, 25), date(2024, 12, 31),
-    date(2025, 1, 1), date(2025, 1, 28), date(2025, 1, 29), date(2025, 1, 30),
-    date(2025, 3, 1), date(2025, 5, 1), date(2025, 5, 5), date(2025, 5, 6),
-    date(2025, 6, 6), date(2025, 8, 15), date(2025, 10, 3), date(2025, 10, 5),
-    date(2025, 10, 6), date(2025, 10, 7), date(2025, 10, 8), date(2025, 10, 9),
-    date(2025, 12, 25), date(2025, 12, 31),
-    date(2026, 1, 1), date(2026, 2, 16), date(2026, 2, 17), date(2026, 2, 18),
-    date(2026, 3, 1), date(2026, 3, 2), date(2026, 5, 1), date(2026, 5, 5),
-    date(2026, 5, 24), date(2026, 5, 25), date(2026, 6, 6), date(2026, 8, 15),
-    date(2026, 8, 17), date(2026, 9, 24), date(2026, 9, 25), date(2026, 9, 26),
-    date(2026, 10, 3), date(2026, 10, 5), date(2026, 10, 9), date(2026, 12, 25),
-    date(2026, 12, 31),
-}
-
 
 def get_kst_now() -> datetime:
     """현재 한국 시간을 반환합니다."""
@@ -61,7 +46,7 @@ def get_kst_today() -> date:
 
 def is_holiday(check_date: date = None) -> bool:
     """
-    주어진 날짜가 휴장일인지 확인합니다.
+    주어진 날짜가 휴장일인지 확인합니다. (대한민국 기준)
     
     Args:
         check_date: 확인할 날짜 (None이면 오늘)
@@ -72,8 +57,7 @@ def is_holiday(check_date: date = None) -> bool:
     if check_date is None:
         check_date = get_kst_today()
     
-    return check_date in HOLIDAYS_2024_2025
-
+    return check_date in KR_HOLIDAYS
 
 def is_weekend(check_date: date = None) -> bool:
     """
@@ -90,7 +74,6 @@ def is_weekend(check_date: date = None) -> bool:
     
     # 5: 토요일, 6: 일요일
     return check_date.weekday() >= 5
-
 
 def is_market_open(check_time: datetime = None) -> bool:
     """
@@ -110,17 +93,12 @@ def is_market_open(check_time: datetime = None) -> bool:
     check_date = check_time.date()
     current_time = check_time.time()
     
-    # 주말 체크
-    if is_weekend(check_date):
-        return False
-    
-    # 휴장일 체크
-    if is_holiday(check_date):
+    # 주말 또는 휴장일이면 거래 불가
+    if is_weekend(check_date) or is_holiday(check_date):
         return False
     
     # 거래시간 체크
     return MARKET_OPEN <= current_time <= MARKET_CLOSE
-
 
 def get_market_status(check_time: datetime = None) -> Tuple[bool, str]:
     """
@@ -138,13 +116,12 @@ def get_market_status(check_time: datetime = None) -> Tuple[bool, str]:
     check_date = check_time.date()
     current_time = check_time.time()
     
-    # 주말 체크
+    # 휴장일 체크 (주말 포함)
     if is_weekend(check_date):
         return False, "주말 휴장"
-    
-    # 휴장일 체크
     if is_holiday(check_date):
-        return False, "공휴일 휴장"
+        # f-string으로 휴일 이름 표시
+        return False, f"{KR_HOLIDAYS.get(check_date)} 휴장"
     
     # 장 시작 전
     if current_time < MARKET_OPEN:
@@ -159,7 +136,6 @@ def get_market_status(check_time: datetime = None) -> Tuple[bool, str]:
         return True, "점심시간 (거래 가능)"
     
     return True, "정규장 운영 중"
-
 
 def get_time_to_market_open() -> int:
     """
@@ -180,16 +156,14 @@ def get_time_to_market_open() -> int:
         # 오늘 장 시작 전
         return int((today_open - now).total_seconds())
     else:
-        # 오늘 장 마감 후 - 다음 영업일 계산 필요
+        # 오늘 장 마감 후 - 다음 영업일 계산
         next_day = now.date() + timedelta(days=1)
         
-        # 주말/휴장일 건너뛰기
         while is_weekend(next_day) or is_holiday(next_day):
             next_day += timedelta(days=1)
         
         next_open = datetime.combine(next_day, MARKET_OPEN, tzinfo=KST)
         return int((next_open - now).total_seconds())
-
 
 def should_skip_trading(check_time: datetime = None) -> Tuple[bool, str]:
     """
@@ -219,7 +193,6 @@ def should_skip_trading(check_time: datetime = None) -> Tuple[bool, str]:
 def format_market_hours() -> str:
     """거래시간 정보를 문자열로 반환합니다."""
     return f"정규장: {MARKET_OPEN.strftime('%H:%M')} ~ {MARKET_CLOSE.strftime('%H:%M')}"
-
 
 def get_next_trading_day(from_date: date = None) -> date:
     """

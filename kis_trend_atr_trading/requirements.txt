@@ -25,6 +25,9 @@ SQLAlchemy>=2.0.0
 # mysql-connector-python은 순수 Python 구현 (C 확장 불필요)
 mysql-connector-python>=8.2.0
 
+# 휴장일 관리
+holidays>=0.41
+
 # 테스트
 pytest>=8.0.0
 pytest-cov>=4.0.0

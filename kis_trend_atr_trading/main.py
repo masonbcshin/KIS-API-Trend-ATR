@@ -14,12 +14,11 @@ KIS Trend-ATR Trading System - 메인 실행 파일
     - .env 파일에 API 키 설정 필요
 
 작성자: KIS Trend-ATR Trading System
-버전: 1.0.0
+버전: 1.1.0
 """
 
 import argparse
 import sys
-from datetime import datetime
 
 # 프로젝트 모듈 임포트
 from config import settings
@@ -28,6 +27,7 @@ from strategy.trend_atr import TrendATRStrategy
 from engine.executor import TradingExecutor
 from backtest.backtester import Backtester
 from utils.logger import setup_logger, get_logger
+from utils.market_hours import get_kst_now # KST 시간 함수 임포트
 
 
 def print_banner():
@@ -127,7 +127,6 @@ def run_backtest(stock_code: str, days: int = 365):
         print(f"\n❌ 오류 발생: {e}")
         logger.error(f"백테스트 오류: {e}")
 
-
 def run_trade(stock_code: str, interval: int = 60, max_runs: int = None):
     """
     모의투자 거래를 실행합니다.
@@ -209,7 +208,6 @@ def run_trade(stock_code: str, interval: int = 60, max_runs: int = None):
         print(f"\n❌ 오류 발생: {e}")
         logger.error(f"거래 오류: {e}")
 
-
 def main():
     """메인 함수"""
     # 로거 초기화
@@ -276,9 +274,9 @@ def main():
     # 배너 출력
     print_banner()
     
-    # 시작 시간 기록
-    start_time = datetime.now()
-    logger.info(f"프로그램 시작: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    # 시작 시간 기록 (KST 기준)
+    start_time = get_kst_now()
+    logger.info(f"프로그램 시작: {start_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
     logger.info(f"실행 모드: {args.mode}, 종목: {args.stock}")
     
     # 모드별 실행
@@ -338,10 +336,10 @@ def main():
             print(f"❌ CBT 오류: {e}")
             logger.error(f"CBT 오류: {e}")
     
-    # 종료 시간 기록
-    end_time = datetime.now()
+    # 종료 시간 기록 (KST 기준)
+    end_time = get_kst_now()
     elapsed = (end_time - start_time).total_seconds()
-    logger.info(f"프로그램 종료: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"프로그램 종료: {end_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
     logger.info(f"총 실행 시간: {elapsed:.1f}초")
     
     print(f"\n✅ 프로그램 종료 (실행 시간: {elapsed:.1f}초)")

@@ -2,7 +2,7 @@
 KIS Trend-ATR Trading System - 데이터베이스 ORM 모델
 """
 from sqlalchemy import (
-    Column, Integer, String, DECIMAL, DateTime, Date, Enum as SAEnum
+    Column, Integer, String, DECIMAL, DateTime, Date, Enum as SAEnum, func
 )
 from sqlalchemy.orm import declarative_base
 
@@ -33,6 +33,10 @@ Base = declarative_base()
 class Position(Base):
     """
     `positions` 테이블에 매핑되는 SQLAlchemy ORM 모델
+    
+    [타임존 관리]
+    모든 DateTime 필드는 `timezone=True` 옵션을 사용하여, 타임존 정보가 포함된
+    TIMESTAMP WITH TIME ZONE 타입으로 데이터베이스에 저장됩니다.
     """
     __tablename__ = 'positions'
 
@@ -45,7 +49,7 @@ class Position(Base):
     entry_price = Column(DECIMAL(15, 2), nullable=False, comment="매수 평균가")
     quantity = Column(Integer, nullable=False, comment="보유 수량")
     entry_date = Column(Date, nullable=False, comment="최초 매수 날짜")
-    entry_time = Column(DateTime, nullable=False, comment="최초 매수 시간")
+    entry_time = Column(DateTime(timezone=True), nullable=False, comment="최초 매수 시간 (KST)")
     entry_order_no = Column(String(50), comment="진입 주문 번호")
     
     atr_at_entry = Column(DECIMAL(15, 2), nullable=False, comment="진입 시점 ATR")
@@ -61,7 +65,7 @@ class Position(Base):
     
     exit_price = Column(DECIMAL(15, 2), comment="매도 평균가")
     exit_date = Column(Date, comment="청산 날짜")
-    exit_time = Column(DateTime, comment="청산 시간")
+    exit_time = Column(DateTime(timezone=True), comment="청산 시간 (KST)")
     exit_reason = Column(SAEnum(ExitReason), comment="청산 사유")
     exit_order_no = Column(String(50), comment="청산 주문 번호")
     
@@ -70,8 +74,8 @@ class Position(Base):
     commission = Column(DECIMAL(15, 2), comment="수수료")
     holding_days = Column(Integer, comment="보유 기간(일)")
     
-    created_at = Column(DateTime, nullable=False, comment="생성 시간")
-    updated_at = Column(DateTime, nullable=False, comment="수정 시간")
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), comment="생성 시간 (UTC)")
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now(), comment="수정 시간 (UTC)")
 
     def __repr__(self):
         return (f"<Position(id='{self.position_id}', stock='{self.stock_code}', "
