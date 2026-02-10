@@ -28,6 +28,7 @@ import threading
 
 from utils.logger import get_logger
 from utils.telegram_notifier import get_telegram_notifier
+from utils.market_hours import get_kst_now
 
 logger = get_logger("position_manager")
 
@@ -111,14 +112,15 @@ class ManagedPosition:
     holding_days: int = 0
     
     def __post_init__(self):
+        kst_now = get_kst_now()
         if not self.created_at:
-            self.created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.created_at = kst_now.strftime("%Y-%m-%d %H:%M:%S")
+        self.updated_at = kst_now.strftime("%Y-%m-%d %H:%M:%S")
         
         if not self.entry_date:
-            self.entry_date = datetime.now().strftime("%Y-%m-%d")
+            self.entry_date = kst_now.strftime("%Y-%m-%d")
         if not self.entry_time:
-            self.entry_time = datetime.now().strftime("%H:%M:%S")
+            self.entry_time = kst_now.strftime("%H:%M:%S")
         
         if self.highest_price == 0.0 and self.entry_price > 0:
             self.highest_price = self.entry_price
@@ -156,11 +158,11 @@ class ManagedPosition:
         # 보유일수 계산
         try:
             entry_dt = datetime.strptime(self.entry_date, "%Y-%m-%d")
-            self.holding_days = (datetime.now() - entry_dt).days + 1
+            self.holding_days = (get_kst_now() - entry_dt).days + 1
         except:
             pass
         
-        self.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.updated_at = get_kst_now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -297,7 +299,7 @@ class PositionManager:
                 return None
             
             # 포지션 생성
-            position_id = f"P{datetime.now().strftime('%Y%m%d%H%M%S')}_{stock_code}"
+            position_id = f"P{get_kst_now().strftime('%Y%m%d%H%M%S')}_{stock_code}"
             
             position = ManagedPosition(
                 position_id=position_id,
@@ -351,12 +353,13 @@ class PositionManager:
                 return None
             
             position = self._positions[stock_code]
+            kst_now = get_kst_now()
             
             # 청산 정보 업데이트
             position.state = PositionState.EXITED
             position.exit_price = exit_price
-            position.exit_date = datetime.now().strftime("%Y-%m-%d")
-            position.exit_time = datetime.now().strftime("%H:%M:%S")
+            position.exit_date = kst_now.strftime("%Y-%m-%d")
+            position.exit_time = kst_now.strftime("%H:%M:%S")
             position.exit_reason = reason
             position.exit_order_no = order_no
             position.commission = commission
@@ -371,7 +374,7 @@ class PositionManager:
             # 보유일수
             try:
                 entry_dt = datetime.strptime(position.entry_date, "%Y-%m-%d")
-                position.holding_days = (datetime.now() - entry_dt).days + 1
+                position.holding_days = (kst_now - entry_dt).days + 1
             except:
                 pass
             
@@ -685,7 +688,7 @@ class PositionManager:
                     code: [p.to_dict() for p in positions]
                     for code, positions in self._closed_positions.items()
                 },
-                "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                "updated_at": get_kst_now().strftime("%Y-%m-%d %H:%M:%S")
             }
             
             with open(self._positions_file, 'w', encoding='utf-8') as f:

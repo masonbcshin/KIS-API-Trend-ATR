@@ -114,7 +114,7 @@ class SafetyGuard:
     
     def __init__(self):
         """안전장치 초기화"""
-        self._confirmation_cache: Optional[bool] = None
+        self._is_confirmed_for_session: bool = False
     
     def check_order_allowed(self) -> bool:
         """
@@ -157,27 +157,18 @@ class SafetyGuard:
     
     def confirm_order(self, stock_code: str, quantity: int, is_buy: bool) -> bool:
         """
-        ★ 안전장치 2단계: 사용자 콘솔 입력 확인
+        ★ 안전장치 2단계: 사용자 콘솔 입력 확인 (세션당 1회)
         
-        - DEV 환경: 확인 없이 True 반환 (모의투자는 안전)
-        - PROD 환경: 사용자가 "YES"를 입력해야만 True 반환
-        
-        Args:
-            stock_code: 종목 코드
-            quantity: 주문 수량
-            is_buy: 매수 여부
-        
-        Returns:
-            bool: 확인 성공 여부
-        
-        Raises:
-            OrderConfirmationError: 사용자가 YES를 입력하지 않은 경우
+        - DEV 환경: 확인 없이 True
+        - PROD 환경: 세션 최초 주문 시 "YES" 입력 필요
         """
-        # DEV 환경은 확인 불필요
         if is_dev():
             return True
-        
-        # PROD 환경: 사용자 확인 필요
+
+        if self._is_confirmed_for_session:
+            print(f"✅ 세션 확인 완료됨. 자동 주문을 진행합니다. ({stock_code})")
+            return True
+
         order_type = "매수" if is_buy else "매도"
         
         print("\n")
@@ -194,7 +185,7 @@ class SafetyGuard:
         print("║                                                               ║")
         print("╚═══════════════════════════════════════════════════════════════╝")
         print("")
-        
+
         try:
             user_input = input(self.CONFIRMATION_PROMPT).strip()
             
@@ -214,8 +205,9 @@ class SafetyGuard:
                     "\n"
                     "═══════════════════════════════════════════════════════════════"
                 )
-            
-            print("✅ 주문 확인 완료")
+
+            print("✅ 최초 주문 확인 완료. 이후 이 세션의 모든 주문은 자동으로 실행됩니다.")
+            self._is_confirmed_for_session = True
             return True
             
         except (EOFError, KeyboardInterrupt):

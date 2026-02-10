@@ -10,16 +10,30 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
+
+# KST 타임존 정의
+KST = ZoneInfo("Asia/Seoul")
 
 # 로그 디렉토리 설정
 LOG_DIR = Path(__file__).parent.parent / "logs"
 
+class KSTFormatter(logging.Formatter):
+    """
+    로그 시간대를 KST로 변환하는 커스텀 포매터
+    """
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, KST)
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.isoformat()
 
 def setup_logger(
     name: str = "kis_trading",
     level: str = "INFO",
     log_to_file: bool = True,
-    log_dir: Optional[Path] = None
+    log_dir: Optional[Path] = None,
+    backup_count: int = 30
 ) -> logging.Logger:
     """
     로거를 설정하고 반환합니다.
@@ -29,6 +43,7 @@ def setup_logger(
         level: 로그 레벨 (DEBUG, INFO, WARNING, ERROR, CRITICAL)
         log_to_file: 파일에 로그 저장 여부
         log_dir: 로그 파일 저장 디렉토리
+        backup_count: 보관할 로그 파일 수 (기본 30개)
     
     Returns:
         logging.Logger: 설정된 로거 인스턴스
@@ -45,7 +60,7 @@ def setup_logger(
     logger.setLevel(log_level)
     
     # 로그 포맷 설정
-    formatter = logging.Formatter(
+    formatter = KSTFormatter(
         fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"
     )
@@ -64,20 +79,24 @@ def setup_logger(
         # 로그 디렉토리 생성
         log_dir.mkdir(parents=True, exist_ok=True)
         
-        # 날짜별 로그 파일
-        log_filename = f"{name}_{datetime.now().strftime('%Y%m%d')}.log"
-        log_filepath = log_dir / log_filename
+        log_filepath = log_dir / f"{name}.log"
         
-        file_handler = logging.FileHandler(
+        # TimedRotatingFileHandler 사용
+        # 매일 자정(midnight)에 로그 파일을 로테이션하고, backup_count 개수만큼 보관
+        file_handler = TimedRotatingFileHandler(
             log_filepath,
-            encoding="utf-8",
-            mode="a"
+            when="midnight",
+            interval=1,
+            backupCount=backup_count,
+            encoding="utf-8"
         )
+        file_handler.suffix = "%Y%m%d" # 로그 파일명 뒤에 날짜 추가 (e.g., app.log.20260210)
+        
         file_handler.setLevel(log_level)
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
         
-        logger.debug(f"로그 파일 경로: {log_filepath}")
+        logger.debug(f"로그 파일 경로: {log_filepath} (자동 로테이션, {backup_count}일 보관)")
     
     return logger
 

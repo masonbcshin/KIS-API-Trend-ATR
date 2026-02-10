@@ -28,6 +28,7 @@ import pandas as pd
 
 from env import get_environment, is_prod, Environment
 from config_loader import get_config
+from utils.market_hours import get_kst_now
 
 
 class KISClientError(Exception):
@@ -191,7 +192,7 @@ class KISClient:
         """
         # 토큰이 유효한 경우 재사용
         if self.access_token and self.token_expires_at:
-            if datetime.now() < self.token_expires_at - timedelta(minutes=10):
+            if get_kst_now() < self.token_expires_at - timedelta(minutes=10):
                 return self.access_token
         
         url = f"{self.base_url}/oauth2/tokenP"
@@ -212,7 +213,7 @@ class KISClient:
         
         self.access_token = data["access_token"]
         expires_in = int(data.get("expires_in", 86400))
-        self.token_expires_at = datetime.now() + timedelta(seconds=expires_in)
+        self.token_expires_at = get_kst_now() + timedelta(seconds=expires_in)
         
         print(f"[KISClient] 토큰 발급 완료 (만료: {self.token_expires_at})")
         

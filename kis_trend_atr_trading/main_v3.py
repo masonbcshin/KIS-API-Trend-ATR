@@ -126,7 +126,8 @@ from utils.audit_logger import (
 from utils.market_hours import (
     is_market_open,
     get_market_status,
-    should_skip_trading
+    should_skip_trading,
+    get_kst_now
 )
 
 from utils.telegram_notifier import get_telegram_notifier
@@ -343,7 +344,7 @@ class TradingEngineV3:
             dict: 실행 결과
         """
         result = {
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp": get_kst_now().strftime("%Y-%m-%d %H:%M:%S"),
             "stocks_processed": 0,
             "signals": [],
             "orders": [],
@@ -507,7 +508,7 @@ class TradingEngineV3:
                     quantity=quantity,
                     stop_loss=signal.stop_loss,
                     take_profit=signal.take_profit,
-                    entry_date=datetime.now().strftime("%Y-%m-%d"),
+                    entry_date=get_kst_now().strftime("%Y-%m-%d"),
                     atr=signal.atr
                 )
                 
@@ -685,7 +686,7 @@ class TradingEngineV3:
             while self.is_running and not self._shutdown_requested:
                 iteration += 1
                 print(f"\n{'═' * 60}")
-                print(f"  반복 #{iteration} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"  반복 #{iteration} - {get_kst_now().strftime('%Y-%m-%d %H:%M:%S')}")
                 print(f"{'═' * 60}")
                 
                 # 장 시간 체크
@@ -850,7 +851,7 @@ def main():
     # 배너 출력
     print(BANNER)
     print(f"버전: {VERSION}")
-    print(f"시작 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"시작 시간: {get_kst_now().strftime('%Y-%m-%d %H:%M:%S')}")
     
     # 환경 정보
     env = get_environment()

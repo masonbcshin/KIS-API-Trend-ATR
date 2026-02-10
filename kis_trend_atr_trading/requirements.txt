@@ -17,6 +17,9 @@ PyYAML>=6.0.0
 # 기술적 지표 계산
 ta>=0.10.2
 
+# 데이터베이스 ORM 및 커넥션 풀
+SQLAlchemy>=2.0.0
+
 # MySQL 데이터베이스
 # Oracle Cloud Infrastructure Free Tier MySQL 호환
 # mysql-connector-python은 순수 Python 구현 (C 확장 불필요)

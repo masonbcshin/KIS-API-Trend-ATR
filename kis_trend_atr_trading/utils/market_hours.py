@@ -10,95 +10,50 @@ KIS Trend-ATR Trading System - 거래시간 검증 모듈
 ⚠️ 공휴일은 별도 캘린더 연동이 필요합니다.
 """
 
-from datetime import datetime, time, date
+from datetime import datetime, time, date, timedelta
 from typing import Tuple
 import logging
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
+# KST (Korea Standard Time) 타임존 객체 생성
+KST = ZoneInfo("Asia/Seoul")
 
 # ════════════════════════════════════════════════════════════════
 # 거래시간 설정
 # ════════════════════════════════════════════════════════════════
-
-# 정규장 시작 시간 (동시호가 종료 후)
 MARKET_OPEN = time(9, 0, 0)
-
-# 정규장 종료 시간 (동시호가 시작 전, 안전 마진 포함)
 MARKET_CLOSE = time(15, 20, 0)
-
-# 점심시간 (선택적 거래 제한용)
 LUNCH_START = time(11, 30, 0)
 LUNCH_END = time(13, 0, 0)
-
-# 2024-2025년 한국 주식시장 휴장일 (수동 관리)
-# 실제 운영 시 외부 API 또는 캘린더 서비스 연동 권장
 HOLIDAYS_2024_2025 = {
-    # 2024년
-    date(2024, 1, 1),   # 신정
-    date(2024, 2, 9),   # 설날 연휴
-    date(2024, 2, 10),  # 설날
-    date(2024, 2, 11),  # 설날 연휴
-    date(2024, 2, 12),  # 대체휴일
-    date(2024, 3, 1),   # 삼일절
-    date(2024, 4, 10),  # 국회의원선거
-    date(2024, 5, 1),   # 근로자의날
-    date(2024, 5, 6),   # 대체휴일
-    date(2024, 5, 15),  # 부처님오신날
-    date(2024, 6, 6),   # 현충일
-    date(2024, 8, 15),  # 광복절
-    date(2024, 9, 16),  # 추석 연휴
-    date(2024, 9, 17),  # 추석
-    date(2024, 9, 18),  # 추석 연휴
-    date(2024, 10, 3),  # 개천절
-    date(2024, 10, 9),  # 한글날
-    date(2024, 12, 25), # 크리스마스
-    date(2024, 12, 31), # 연말휴장
-    
-    # 2025년
-    date(2025, 1, 1),   # 신정
-    date(2025, 1, 28),  # 설날 연휴
-    date(2025, 1, 29),  # 설날
-    date(2025, 1, 30),  # 설날 연휴
-    date(2025, 3, 1),   # 삼일절
-    date(2025, 5, 1),   # 근로자의날
-    date(2025, 5, 5),   # 어린이날
-    date(2025, 5, 6),   # 대체휴일
-    date(2025, 6, 6),   # 현충일
-    date(2025, 8, 15),  # 광복절
-    date(2025, 10, 3),  # 개천절
-    date(2025, 10, 5),  # 추석 연휴
-    date(2025, 10, 6),  # 추석
-    date(2025, 10, 7),  # 추석 연휴
-    date(2025, 10, 8),  # 대체휴일
-    date(2025, 10, 9),  # 한글날
-    date(2025, 12, 25), # 크리스마스
-    date(2025, 12, 31), # 연말휴장
-    
-    # 2026년 (예상)
-    date(2026, 1, 1),   # 신정
-    date(2026, 2, 16),  # 설날 연휴
-    date(2026, 2, 17),  # 설날
-    date(2026, 2, 18),  # 설날 연휴
-    date(2026, 3, 1),   # 삼일절
-    date(2026, 3, 2),   # 대체휴일
-    date(2026, 5, 1),   # 근로자의날
-    date(2026, 5, 5),   # 어린이날
-    date(2026, 5, 24),  # 부처님오신날
-    date(2026, 5, 25),  # 대체휴일
-    date(2026, 6, 6),   # 현충일
-    date(2026, 8, 15),  # 광복절
-    date(2026, 8, 17),  # 대체휴일
-    date(2026, 9, 24),  # 추석 연휴
-    date(2026, 9, 25),  # 추석
-    date(2026, 9, 26),  # 추석 연휴
-    date(2026, 10, 3),  # 개천절
-    date(2026, 10, 5),  # 대체휴일
-    date(2026, 10, 9),  # 한글날
-    date(2026, 12, 25), # 크리스마스
-    date(2026, 12, 31), # 연말휴장
+    date(2024, 1, 1), date(2024, 2, 9), date(2024, 2, 10), date(2024, 2, 11),
+    date(2024, 2, 12), date(2024, 3, 1), date(2024, 4, 10), date(2024, 5, 1),
+    date(2024, 5, 6), date(2024, 5, 15), date(2024, 6, 6), date(2024, 8, 15),
+    date(2024, 9, 16), date(2024, 9, 17), date(2024, 9, 18), date(2024, 10, 3),
+    date(2024, 10, 9), date(2024, 12, 25), date(2024, 12, 31),
+    date(2025, 1, 1), date(2025, 1, 28), date(2025, 1, 29), date(2025, 1, 30),
+    date(2025, 3, 1), date(2025, 5, 1), date(2025, 5, 5), date(2025, 5, 6),
+    date(2025, 6, 6), date(2025, 8, 15), date(2025, 10, 3), date(2025, 10, 5),
+    date(2025, 10, 6), date(2025, 10, 7), date(2025, 10, 8), date(2025, 10, 9),
+    date(2025, 12, 25), date(2025, 12, 31),
+    date(2026, 1, 1), date(2026, 2, 16), date(2026, 2, 17), date(2026, 2, 18),
+    date(2026, 3, 1), date(2026, 3, 2), date(2026, 5, 1), date(2026, 5, 5),
+    date(2026, 5, 24), date(2026, 5, 25), date(2026, 6, 6), date(2026, 8, 15),
+    date(2026, 8, 17), date(2026, 9, 24), date(2026, 9, 25), date(2026, 9, 26),
+    date(2026, 10, 3), date(2026, 10, 5), date(2026, 10, 9), date(2026, 12, 25),
+    date(2026, 12, 31),
 }
 
+
+def get_kst_now() -> datetime:
+    """현재 한국 시간을 반환합니다."""
+    return datetime.now(KST)
+
+def get_kst_today() -> date:
+    """현재 한국 날짜를 반환합니다."""
+    return datetime.now(KST).date()
 
 # ════════════════════════════════════════════════════════════════
 # 공개 함수
@@ -115,7 +70,7 @@ def is_holiday(check_date: date = None) -> bool:
         bool: 휴장일 여부
     """
     if check_date is None:
-        check_date = date.today()
+        check_date = get_kst_today()
     
     return check_date in HOLIDAYS_2024_2025
 
@@ -131,7 +86,7 @@ def is_weekend(check_date: date = None) -> bool:
         bool: 주말 여부
     """
     if check_date is None:
-        check_date = date.today()
+        check_date = get_kst_today()
     
     # 5: 토요일, 6: 일요일
     return check_date.weekday() >= 5
@@ -150,7 +105,7 @@ def is_market_open(check_time: datetime = None) -> bool:
         bool: 시장 오픈 여부
     """
     if check_time is None:
-        check_time = datetime.now()
+        check_time = get_kst_now()
     
     check_date = check_time.date()
     current_time = check_time.time()
@@ -178,7 +133,7 @@ def get_market_status(check_time: datetime = None) -> Tuple[bool, str]:
         Tuple[bool, str]: (시장 오픈 여부, 상태 설명)
     """
     if check_time is None:
-        check_time = datetime.now()
+        check_time = get_kst_now()
     
     check_date = check_time.date()
     current_time = check_time.time()
@@ -213,28 +168,26 @@ def get_time_to_market_open() -> int:
     Returns:
         int: 남은 시간 (초), 이미 열려있으면 0
     """
-    now = datetime.now()
+    now = get_kst_now()
     
     if is_market_open(now):
         return 0
     
     # 오늘 장 시작 시간
-    today_open = datetime.combine(now.date(), MARKET_OPEN)
+    today_open = now.replace(hour=MARKET_OPEN.hour, minute=MARKET_OPEN.minute, second=0, microsecond=0)
     
     if now < today_open:
         # 오늘 장 시작 전
         return int((today_open - now).total_seconds())
     else:
         # 오늘 장 마감 후 - 다음 영업일 계산 필요
-        # 단순화를 위해 다음날 09:00 기준
-        from datetime import timedelta
         next_day = now.date() + timedelta(days=1)
         
         # 주말/휴장일 건너뛰기
         while is_weekend(next_day) or is_holiday(next_day):
             next_day += timedelta(days=1)
         
-        next_open = datetime.combine(next_day, MARKET_OPEN)
+        next_open = datetime.combine(next_day, MARKET_OPEN, tzinfo=KST)
         return int((next_open - now).total_seconds())
 
 
@@ -248,6 +201,9 @@ def should_skip_trading(check_time: datetime = None) -> Tuple[bool, str]:
     Returns:
         Tuple[bool, str]: (건너뛰기 여부, 사유)
     """
+    if check_time is None:
+        check_time = get_kst_now()
+
     is_open, reason = get_market_status(check_time)
     
     if not is_open:
@@ -275,10 +231,8 @@ def get_next_trading_day(from_date: date = None) -> date:
     Returns:
         date: 다음 거래일
     """
-    from datetime import timedelta
-    
     if from_date is None:
-        from_date = date.today()
+        from_date = get_kst_today()
     
     next_day = from_date + timedelta(days=1)
     

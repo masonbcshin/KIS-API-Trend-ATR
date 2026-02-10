@@ -45,37 +45,52 @@
 --    - status: OPEN(들고있음) / CLOSED(다 팔았음)
 --
 CREATE TABLE IF NOT EXISTS positions (
-    -- 기본 키: 종목 코드 (한 종목에 하나의 포지션만 가질 수 있음)
-    symbol VARCHAR(20) NOT NULL PRIMARY KEY COMMENT '종목 코드',
+    position_id VARCHAR(64) NOT NULL PRIMARY KEY COMMENT '포지션 고유 ID',
+    stock_code VARCHAR(20) NOT NULL COMMENT '종목 코드',
+    stock_name VARCHAR(100) NULL COMMENT '종목명',
     
-    -- 진입 정보 ────────────────────────────────────────
+    -- 포지션 상태
+    state VARCHAR(20) NOT NULL COMMENT 'PENDING, ENTERED, EXITED',
+    side VARCHAR(10) NOT NULL DEFAULT 'LONG' COMMENT '포지션 방향 (현재는 LONG만 지원)',
+    
+    -- 진입 정보
     entry_price DECIMAL(15, 2) NOT NULL COMMENT '매수 평균가',
     quantity INT NOT NULL COMMENT '보유 수량',
+    entry_date DATE NOT NULL COMMENT '최초 매수 날짜',
     entry_time DATETIME NOT NULL COMMENT '최초 매수 시간',
+    entry_order_no VARCHAR(50) NULL COMMENT '진입 주문 번호',
     
-    -- ATR 정보 (★★★ 절대 변경 금지 ★★★) ─────────────
-    -- 왜? 진입할 때의 변동성을 기준으로 손절/익절을 정했기 때문
-    -- 익일에 ATR이 바뀌어도 기존 포지션의 손절선은 그대로 유지!
-    atr_at_entry DECIMAL(15, 2) NOT NULL COMMENT '진입 시점 ATR - 절대 재계산하여 변경하지 말 것!',
+    -- 리스크 관리 정보 (진입 시 고정)
+    atr_at_entry DECIMAL(15, 2) NOT NULL COMMENT '진입 시점 ATR',
+    stop_loss DECIMAL(15, 2) NOT NULL COMMENT '기본 손절가',
+    take_profit DECIMAL(15, 2) NOT NULL COMMENT '기본 익절가',
     
-    -- 손절/익절 가격 ──────────────────────────────────
-    stop_price DECIMAL(15, 2) NOT NULL COMMENT '손절가 (이 가격 이하면 손절)',
-    take_profit_price DECIMAL(15, 2) NULL COMMENT '익절가 (이 가격 이상이면 익절, NULL 가능)',
-    trailing_stop DECIMAL(15, 2) NULL COMMENT '트레일링 스탑 (최고가 기준으로 움직임)',
+    -- 동적 업데이트 정보
+    trailing_stop DECIMAL(15, 2) NULL COMMENT '트레일링 스탑 가격',
     highest_price DECIMAL(15, 2) NULL COMMENT '보유 중 최고가 (트레일링 계산용)',
+    current_price DECIMAL(15, 2) NULL COMMENT '현재가 (업데이트용)',
+    unrealized_pnl DECIMAL(15, 2) NULL COMMENT '미실현 손익',
+    unrealized_pnl_pct DECIMAL(10, 4) NULL COMMENT '미실현 손익률',
     
-    -- 상태 ─────────────────────────────────────────────
-    -- OPEN: 현재 보유 중
-    -- CLOSED: 청산 완료 (히스토리용으로 남겨둠)
-    status VARCHAR(20) NOT NULL DEFAULT 'OPEN' COMMENT 'OPEN(보유중) / CLOSED(청산완료)',
+    -- 청산 정보
+    exit_price DECIMAL(15, 2) NULL COMMENT '매도 평균가',
+    exit_date DATE NULL COMMENT '청산 날짜',
+    exit_time DATETIME NULL COMMENT '청산 시간',
+    exit_reason VARCHAR(50) NULL COMMENT '청산 사유',
+    exit_order_no VARCHAR(50) NULL COMMENT '청산 주문 번호',
+    realized_pnl DECIMAL(15, 2) NULL COMMENT '실현 손익',
+    realized_pnl_pct DECIMAL(10, 4) NULL COMMENT '실현 손익률',
+    commission DECIMAL(15, 2) NULL COMMENT '수수료',
+    holding_days INT NULL COMMENT '보유 기간(일)',
     
-    -- 메타 정보 ─────────────────────────────────────────
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '생성 시간',
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '수정 시간'
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='현재 보유 중인 포지션 정보. 서버 재시작 시 복구용.';
+    -- 메타 정보
+    created_at DATETIME NOT NULL COMMENT '생성 시간',
+    updated_at DATETIME NOT NULL COMMENT '수정 시간'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='모든 포지션의 전체 생명주기를 기록하는 테이블';
 
--- 상태별 조회를 빠르게 하기 위한 인덱스
-CREATE INDEX idx_positions_status ON positions(status);
+-- 상태와 종목코드는 자주 조회되므로 인덱스 추가
+CREATE INDEX idx_positions_state ON positions(state);
+CREATE INDEX idx_positions_stock_code ON positions(stock_code);
 
 
 -- ───────────────────────────────────────────────────────────────────────────────
