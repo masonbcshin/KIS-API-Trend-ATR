@@ -13,8 +13,21 @@ KIS Trend-ATR Trading System - 거래시간 검증 모듈
 from datetime import datetime, time, date
 from typing import Tuple
 import logging
+import pytz
 
 logger = logging.getLogger(__name__)
+
+# ════════════════════════════════════════════════════════════════
+# 시간대 설정 (KST)
+# ════════════════════════════════════════════════════════════════
+KST = pytz.timezone('Asia/Seoul')
+
+
+def _combine_kst(target_date: date, target_time: time) -> datetime:
+    """
+    pytz에서 tzinfo 직접 주입 대신 localize를 사용해 올바른 KST datetime을 생성합니다.
+    """
+    return KST.localize(datetime.combine(target_date, target_time))
 
 
 # ════════════════════════════════════════════════════════════════
@@ -104,6 +117,15 @@ HOLIDAYS_2024_2025 = {
 # 공개 함수
 # ════════════════════════════════════════════════════════════════
 
+def get_now() -> datetime:
+    
+    """현재 시간을 KST 기준으로 반환합니다."""
+    return datetime.now(KST)
+
+def get_today() -> date:
+    """오늘 날짜를 KST 기준으로 반환합니다."""
+    return datetime.now(KST).date()
+
 def is_holiday(check_date: date = None) -> bool:
     """
     주어진 날짜가 휴장일인지 확인합니다.
@@ -115,10 +137,9 @@ def is_holiday(check_date: date = None) -> bool:
         bool: 휴장일 여부
     """
     if check_date is None:
-        check_date = date.today()
+        check_date = get_today()
     
     return check_date in HOLIDAYS_2024_2025
-
 
 def is_weekend(check_date: date = None) -> bool:
     """
@@ -131,11 +152,10 @@ def is_weekend(check_date: date = None) -> bool:
         bool: 주말 여부
     """
     if check_date is None:
-        check_date = date.today()
+        check_date = get_today()
     
     # 5: 토요일, 6: 일요일
     return check_date.weekday() >= 5
-
 
 def is_market_open(check_time: datetime = None) -> bool:
     """
@@ -150,7 +170,7 @@ def is_market_open(check_time: datetime = None) -> bool:
         bool: 시장 오픈 여부
     """
     if check_time is None:
-        check_time = datetime.now()
+        check_time = get_now()
     
     check_date = check_time.date()
     current_time = check_time.time()
@@ -166,7 +186,6 @@ def is_market_open(check_time: datetime = None) -> bool:
     # 거래시간 체크
     return MARKET_OPEN <= current_time <= MARKET_CLOSE
 
-
 def get_market_status(check_time: datetime = None) -> Tuple[bool, str]:
     """
     시장 상태를 상세히 반환합니다.
@@ -178,7 +197,7 @@ def get_market_status(check_time: datetime = None) -> Tuple[bool, str]:
         Tuple[bool, str]: (시장 오픈 여부, 상태 설명)
     """
     if check_time is None:
-        check_time = datetime.now()
+        check_time = get_now()
     
     check_date = check_time.date()
     current_time = check_time.time()
@@ -205,7 +224,6 @@ def get_market_status(check_time: datetime = None) -> Tuple[bool, str]:
     
     return True, "정규장 운영 중"
 
-
 def get_time_to_market_open() -> int:
     """
     장 시작까지 남은 시간을 초 단위로 반환합니다.
@@ -213,30 +231,27 @@ def get_time_to_market_open() -> int:
     Returns:
         int: 남은 시간 (초), 이미 열려있으면 0
     """
-    now = datetime.now()
+    now = get_now()
     
     if is_market_open(now):
         return 0
     
     # 오늘 장 시작 시간
-    today_open = datetime.combine(now.date(), MARKET_OPEN)
-    
+    today_open = now.replace(hour=MARKET_OPEN.hour, minute=MARKET_OPEN.minute, second=0, microsecond=0)
+
     if now < today_open:
         # 오늘 장 시작 전
         return int((today_open - now).total_seconds())
     else:
-        # 오늘 장 마감 후 - 다음 영업일 계산 필요
-        # 단순화를 위해 다음날 09:00 기준
+        # 오늘 장 마감 후 - 다음 영업일 계산
         from datetime import timedelta
         next_day = now.date() + timedelta(days=1)
         
-        # 주말/휴장일 건너뛰기
         while is_weekend(next_day) or is_holiday(next_day):
             next_day += timedelta(days=1)
         
-        next_open = datetime.combine(next_day, MARKET_OPEN)
+        next_open = _combine_kst(next_day, MARKET_OPEN)
         return int((next_open - now).total_seconds())
-
 
 def should_skip_trading(check_time: datetime = None) -> Tuple[bool, str]:
     """
@@ -264,7 +279,6 @@ def format_market_hours() -> str:
     """거래시간 정보를 문자열로 반환합니다."""
     return f"정규장: {MARKET_OPEN.strftime('%H:%M')} ~ {MARKET_CLOSE.strftime('%H:%M')}"
 
-
 def get_next_trading_day(from_date: date = None) -> date:
     """
     다음 거래일을 반환합니다.
@@ -278,7 +292,7 @@ def get_next_trading_day(from_date: date = None) -> date:
     from datetime import timedelta
     
     if from_date is None:
-        from_date = date.today()
+        from_date = get_today()
     
     next_day = from_date + timedelta(days=1)
     

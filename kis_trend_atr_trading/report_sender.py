@@ -62,11 +62,17 @@ from report.message_formatter import MessageFormatter, HTMLFormatter
 from report.telegram_sender import TelegramReportSender
 
 from utils.logger import get_logger
+from utils.market_hours import KST
 
 # 환경변수 로드
 load_dotenv()
 
 logger = get_logger("report_sender")
+
+
+def kst_today() -> date:
+    """KST 기준 오늘 날짜를 반환합니다."""
+    return datetime.now(KST).date()
 
 
 # ════════════════════════════════════════════════════════════════
@@ -138,7 +144,7 @@ class DailyReportSender:
             bool: 전송 성공 여부
         """
         if target_date is None:
-            target_date = date.today()
+            target_date = kst_today()
         
         logger.info(f"[REPORT_SENDER] {target_date} 리포트 생성 시작")
         
@@ -205,9 +211,9 @@ def parse_date(date_str: str) -> date:
     date_str = date_str.lower().strip()
     
     if date_str == "today":
-        return date.today()
+        return kst_today()
     elif date_str == "yesterday":
-        return date.today() - timedelta(days=1)
+        return kst_today() - timedelta(days=1)
     else:
         try:
             return datetime.strptime(date_str, "%Y-%m-%d").date()
@@ -240,7 +246,7 @@ Cron 등록:
     parser.add_argument(
         "--date", "-d",
         type=parse_date,
-        default=date.today(),
+        default=kst_today(),
         help="리포트 대상 날짜 (YYYY-MM-DD, today, yesterday)"
     )
     

@@ -28,6 +28,7 @@ import pandas as pd
 
 from env import get_environment, is_prod, Environment
 from config_loader import get_config
+from utils.market_hours import KST
 
 
 class KISClientError(Exception):
@@ -191,7 +192,7 @@ class KISClient:
         """
         # 토큰이 유효한 경우 재사용
         if self.access_token and self.token_expires_at:
-            if datetime.now() < self.token_expires_at - timedelta(minutes=10):
+            if datetime.now(KST) < self.token_expires_at - timedelta(minutes=10):
                 return self.access_token
         
         url = f"{self.base_url}/oauth2/tokenP"
@@ -212,7 +213,7 @@ class KISClient:
         
         self.access_token = data["access_token"]
         expires_in = int(data.get("expires_in", 86400))
-        self.token_expires_at = datetime.now() + timedelta(seconds=expires_in)
+        self.token_expires_at = datetime.now(KST) + timedelta(seconds=expires_in)
         
         print(f"[KISClient] 토큰 발급 완료 (만료: {self.token_expires_at})")
         
@@ -283,9 +284,9 @@ class KISClient:
             DataFrame: OHLCV 데이터
         """
         if end_date is None:
-            end_date = datetime.now().strftime("%Y%m%d")
+            end_date = datetime.now(KST).strftime("%Y%m%d")
         if start_date is None:
-            start_date = (datetime.now() - timedelta(days=100)).strftime("%Y%m%d")
+            start_date = (datetime.now(KST) - timedelta(days=100)).strftime("%Y%m%d")
         
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
         

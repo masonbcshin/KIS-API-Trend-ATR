@@ -42,6 +42,7 @@ from decimal import Decimal
 
 from db.mysql import MySQLManager, get_db_manager, QueryError
 from utils.logger import get_logger
+from utils.market_hours import KST, get_today
 
 logger = get_logger("repository")
 
@@ -243,7 +244,7 @@ class PositionRepository:
         Returns:
             PositionRecord: 저장된 포지션 (실패 시 None)
         """
-        entry_time = entry_time or datetime.now()
+        entry_time = entry_time or datetime.now(KST)
         highest_price = highest_price or entry_price
         trailing_stop = trailing_stop or stop_price
         
@@ -497,7 +498,7 @@ class TradeRepository:
         Returns:
             TradeRecord: 저장된 거래 기록
         """
-        executed_at = executed_at or datetime.now()
+        executed_at = executed_at or datetime.now(KST)
         
         try:
             # INSERT 실행 후 LAST_INSERT_ID 반환
@@ -555,7 +556,7 @@ class TradeRepository:
         Returns:
             TradeRecord: 저장된 거래 기록
         """
-        executed_at = executed_at or datetime.now()
+        executed_at = executed_at or datetime.now(KST)
         
         # 손익 계산
         pnl = None
@@ -630,7 +631,7 @@ class TradeRepository:
         Returns:
             TradeRecord: 기록된 신호
         """
-        executed_at = executed_at or datetime.now()
+        executed_at = executed_at or datetime.now(KST)
         
         # 손익 계산 (SELL인 경우)
         pnl = None
@@ -752,7 +753,7 @@ class TradeRepository:
         Returns:
             Dict: 요약 정보
         """
-        trade_date = trade_date or date.today()
+        trade_date = trade_date or get_today()
         
         result = self.db.execute_query(
             """
@@ -965,7 +966,7 @@ class AccountSnapshotRepository:
         Returns:
             AccountSnapshotRecord: 저장된 스냅샷
         """
-        snapshot_time = snapshot_time or datetime.now()
+        snapshot_time = snapshot_time or datetime.now(KST)
         
         try:
             # MySQL INSERT ... ON DUPLICATE KEY UPDATE
@@ -1040,6 +1041,8 @@ class AccountSnapshotRepository:
             List[Dict]: 일별 평가금액
         """
         # MySQL에서는 array_agg가 없으므로 다른 방법 사용
+        cutoff = datetime.now(KST) - timedelta(days=days)
+
         results = self.db.execute_query(
             """
             SELECT 
@@ -1050,11 +1053,11 @@ class AccountSnapshotRepository:
                  WHERE DATE(a2.snapshot_time) = DATE(a1.snapshot_time)
                  ORDER BY a2.snapshot_time DESC LIMIT 1) as end_equity
             FROM account_snapshots a1
-            WHERE snapshot_time >= DATE_SUB(CURDATE(), INTERVAL %s DAY)
+            WHERE snapshot_time >= %s
             GROUP BY DATE(snapshot_time)
             ORDER BY trade_date
             """,
-            (days,)
+            (cutoff,)
         )
         
         return [
@@ -1078,13 +1081,14 @@ class AccountSnapshotRepository:
             Dict: MDD 정보
         """
         if days:
+            cutoff = datetime.now(KST) - timedelta(days=days)
             query = """
                 SELECT snapshot_time, total_equity
                 FROM account_snapshots
-                WHERE snapshot_time >= DATE_SUB(CURDATE(), INTERVAL %s DAY)
+                WHERE snapshot_time >= %s
                 ORDER BY snapshot_time
             """
-            results = self.db.execute_query(query, (days,))
+            results = self.db.execute_query(query, (cutoff,))
         else:
             query = """
                 SELECT snapshot_time, total_equity

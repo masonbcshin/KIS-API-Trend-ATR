@@ -307,7 +307,17 @@ class MySQLManager:
         if not self._pool:
             raise ConnectionError("데이터베이스에 연결되어 있지 않습니다.")
         
-        return self._pool.get_connection()
+        conn = self._pool.get_connection()
+
+        # 세션 타임존을 KST로 고정하여 CURDATE/NOW 등 DB 날짜 함수의 기준을 일치시킵니다.
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("SET time_zone = '+09:00'")
+        except MySQLError as e:
+            conn.close()
+            raise ConnectionError(f"세션 타임존 설정 실패: {e}")
+
+        return conn
     
     # ═══════════════════════════════════════════════════════════════════════════
     # 쿼리 실행

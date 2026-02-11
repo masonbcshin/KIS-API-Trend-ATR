@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 
 from utils.logger import get_logger
 from utils.telegram_notifier import get_telegram_notifier
+from utils.market_hours import KST
 
 logger = get_logger("risk_manager")
 
@@ -35,14 +36,14 @@ class DailyPnL:
         realized_pnl: 실현 손익 (청산된 거래)
         trades_count: 거래 횟수
     """
-    date: date = field(default_factory=date.today)
+    date: date = field(default_factory=lambda: datetime.now(KST).date())
     starting_capital: float = 0.0
     realized_pnl: float = 0.0
     trades_count: int = 0
     
     def reset(self, starting_capital: float = 0.0) -> None:
         """당일 기록 초기화"""
-        self.date = date.today()
+        self.date = datetime.now(KST).date()
         self.starting_capital = starting_capital
         self.realized_pnl = 0.0
         self.trades_count = 0
@@ -266,8 +267,10 @@ class RiskManager:
         Args:
             pnl: 손익 금액 (원, 손실은 음수)
         """
+        today = datetime.now(KST).date()
+
         # 날짜가 변경되었으면 초기화
-        if self._daily_pnl.date != date.today():
+        if self._daily_pnl.date != today:
             self._reset_daily_tracking()
         
         self._daily_pnl.add_trade_pnl(pnl)
@@ -343,7 +346,7 @@ class RiskManager:
         Returns:
             bool: Kill Switch 발동 여부
         """
-        now = datetime.now()
+        now = datetime.now(KST)
         
         # 에러 리셋 시간 체크
         if self._last_api_error_time:
@@ -433,7 +436,7 @@ class RiskManager:
             reason: Kill Switch 사유
         """
         self._kill_switch_file.parent.mkdir(parents=True, exist_ok=True)
-        self._kill_switch_file.write_text(f"{reason}\n{datetime.now()}")
+        self._kill_switch_file.write_text(f"{reason}\n{datetime.now(KST)}")
         self.enable_kill_switch(reason)
         logger.info(f"[RISK] 수동 Kill Switch 파일 생성: {self._kill_switch_file}")
     
@@ -473,8 +476,10 @@ class RiskManager:
         Returns:
             RiskCheckResult: 체크 결과
         """
+        today = datetime.now(KST).date()
+
         # 날짜가 변경되었으면 일일 추적 초기화
-        if self._daily_pnl.date != date.today():
+        if self._daily_pnl.date != today:
             self._reset_daily_tracking()
         
         # 0. 수동 Kill Switch 파일 체크 (신규)
@@ -538,8 +543,10 @@ class RiskManager:
         Returns:
             RiskCheckResult: 체크 결과
         """
+        today = datetime.now(KST).date()
+
         # 날짜 변경 체크
-        if self._daily_pnl.date != date.today():
+        if self._daily_pnl.date != today:
             self._reset_daily_tracking()
         
         if self._daily_limit_reached and not is_closing_position:
@@ -565,8 +572,10 @@ class RiskManager:
         Returns:
             Dict: 손익 요약 정보
         """
+        today = datetime.now(KST).date()
+
         # 날짜 변경 체크
-        if self._daily_pnl.date != date.today():
+        if self._daily_pnl.date != today:
             self._reset_daily_tracking()
         
         return {

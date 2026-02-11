@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from utils.logger import get_logger
+from utils.market_hours import KST
 
 logger = get_logger("order_synchronizer")
 
@@ -43,6 +44,11 @@ MARKET_CLOSE = dt_time(15, 30, 0)
 SIMULTANEOUS_QUOTE_START = dt_time(15, 20, 0)  # 동시호가 시작
 PRE_MARKET_START = dt_time(8, 30, 0)  # 장전 동시호가
 PRE_MARKET_END = dt_time(9, 0, 0)
+
+
+def _combine_kst(target_date, target_time: dt_time) -> datetime:
+    """pytz localize를 사용해 정확한 KST datetime을 생성합니다."""
+    return KST.localize(datetime.combine(target_date, target_time))
 
 
 class MarketStatus(Enum):
@@ -113,7 +119,7 @@ class SingleInstanceLock:
             
             # 프로세스 정보 기록
             self._lock_fd.write(f"PID: {os.getpid()}\n")
-            self._lock_fd.write(f"Started: {datetime.now().isoformat()}\n")
+            self._lock_fd.write(f"Started: {datetime.now(KST).isoformat()}\n")
             self._lock_fd.flush()
             
             self._acquired = True
@@ -214,7 +220,7 @@ class MarketHoursChecker:
         Returns:
             MarketStatus: 시장 상태
         """
-        check_time = check_time or datetime.now()
+        check_time = check_time or datetime.now(KST)
         current_time = check_time.time()
         weekday = check_time.weekday()
         
@@ -276,7 +282,7 @@ class MarketHoursChecker:
         Returns:
             int: 남은 시간 (초), 이미 장중이면 0
         """
-        check_time = check_time or datetime.now()
+        check_time = check_time or datetime.now(KST)
         current_time = check_time.time()
         
         if MARKET_OPEN <= current_time < SIMULTANEOUS_QUOTE_START:
@@ -284,7 +290,7 @@ class MarketHoursChecker:
         
         # 오늘 장 시작까지
         if current_time < MARKET_OPEN:
-            market_open_today = datetime.combine(check_time.date(), MARKET_OPEN)
+            market_open_today = _combine_kst(check_time.date(), MARKET_OPEN)
             return int((market_open_today - check_time).total_seconds())
         
         # 내일 장 시작까지
@@ -295,7 +301,7 @@ class MarketHoursChecker:
         while tomorrow.weekday() >= 5:
             tomorrow += timedelta(days=1)
         
-        market_open_next = datetime.combine(tomorrow, MARKET_OPEN)
+        market_open_next = _combine_kst(tomorrow, MARKET_OPEN)
         return int((market_open_next - check_time).total_seconds())
     
     def get_time_until_market_close(self, check_time: datetime = None) -> int:
@@ -310,7 +316,7 @@ class MarketHoursChecker:
         Returns:
             int: 남은 시간 (초), 장 마감 후면 0
         """
-        check_time = check_time or datetime.now()
+        check_time = check_time or datetime.now(KST)
         current_time = check_time.time()
         
         if current_time >= SIMULTANEOUS_QUOTE_START:
@@ -319,7 +325,7 @@ class MarketHoursChecker:
         if current_time < MARKET_OPEN:
             return 0  # 아직 장 시작 전
         
-        close_time = datetime.combine(check_time.date(), SIMULTANEOUS_QUOTE_START)
+        close_time = _combine_kst(check_time.date(), SIMULTANEOUS_QUOTE_START)
         return int((close_time - check_time).total_seconds())
 
 

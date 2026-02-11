@@ -11,6 +11,9 @@ numpy>=1.24.0
 # 환경변수 관리
 python-dotenv>=1.0.0
 
+# 타임존 처리 (KST)
+pytz>=2024.1
+
 # YAML 설정 파일 파싱
 PyYAML>=6.0.0
 
