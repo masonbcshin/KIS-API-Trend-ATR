@@ -641,6 +641,97 @@ class PositionResynchronizer:
         self.api = api
         self.position_store = position_store
         self.db_repository = db_repository
+
+    @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        """숫자 변환 실패 시 기본값을 반환합니다."""
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _safe_int(value: Any, default: int = 0) -> int:
+        """정수 변환 실패 시 기본값을 반환합니다."""
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _sync_db_positions_from_api(
+        self,
+        api_holdings: Dict[str, Dict[str, Any]],
+        result: Dict[str, Any]
+    ) -> None:
+        """
+        DB 포지션을 실제 계좌 보유 기준으로 강제 동기화합니다.
+
+        정책:
+            - 실제 계좌에 없는 DB OPEN 포지션은 CLOSED 처리
+            - 실제 계좌에 있는 종목은 DB에 upsert
+            - 수량/평균단가는 실제 계좌 값을 우선 사용
+        """
+        if not self.db_repository:
+            return
+
+        try:
+            db_open_positions = self.db_repository.get_open_positions()
+            db_map = {p.symbol: p for p in db_open_positions}
+
+            # 1) DB에는 있으나 실제 계좌에는 없는 포지션 정리
+            for symbol, db_pos in db_map.items():
+                if symbol not in api_holdings:
+                    self.db_repository.close_position(symbol)
+                    msg = f"DB OPEN 정리: {symbol} (실계좌 보유 없음)"
+                    result["warnings"].append(msg)
+                    logger.warning(f"[RESYNC][DB] {msg}")
+
+            # 2) 실제 계좌 보유를 DB에 반영
+            for symbol, holding in api_holdings.items():
+                qty = self._safe_int(holding.get("quantity"), 0)
+                if qty <= 0:
+                    continue
+
+                avg_price = self._safe_float(holding.get("avg_price"), 0.0)
+                current_price = self._safe_float(holding.get("current_price"), avg_price)
+                base_price = avg_price if avg_price > 0 else max(current_price, 1.0)
+
+                existing = db_map.get(symbol)
+                if existing:
+                    atr_at_entry = existing.atr_at_entry if existing.atr_at_entry > 0 else max(base_price * 0.01, 1.0)
+                    stop_price = existing.stop_price if existing.stop_price > 0 else round(base_price * 0.95, 2)
+                    take_profit = existing.take_profit_price
+                    trailing_stop = existing.trailing_stop if existing.trailing_stop else stop_price
+                    highest_price = max(existing.highest_price or base_price, current_price, base_price)
+                else:
+                    atr_at_entry = max(base_price * 0.01, 1.0)
+                    stop_price = round(base_price * 0.95, 2)
+                    take_profit = None
+                    trailing_stop = stop_price
+                    highest_price = max(current_price, base_price)
+
+                saved = self.db_repository.upsert_from_account_holding(
+                    symbol=symbol,
+                    entry_price=base_price,
+                    quantity=qty,
+                    atr_at_entry=atr_at_entry,
+                    stop_price=stop_price,
+                    take_profit_price=take_profit,
+                    trailing_stop=trailing_stop,
+                    highest_price=highest_price,
+                    entry_time=datetime.now(KST)
+                )
+
+                if saved is None:
+                    logger.warning(f"[RESYNC][DB] 포지션 저장 실패/보류: {symbol}")
+                else:
+                    logger.info(
+                        f"[RESYNC][DB] 실계좌 기준 반영: {symbol} "
+                        f"qty={qty}, avg={base_price:,.0f}"
+                    )
+        except Exception as e:
+            result["warnings"].append(f"DB 동기화 실패: {str(e)}")
+            logger.error(f"[RESYNC][DB] 동기화 오류: {e}")
     
     def synchronize_on_startup(self) -> Dict[str, Any]:
         """
@@ -677,7 +768,10 @@ class PositionResynchronizer:
             
             holdings = balance.get("holdings", [])
             api_holdings = {h["stock_code"]: h for h in holdings if h.get("quantity", 0) > 0}
-            
+
+            # ★ DB는 항상 실계좌 보유를 기준으로 선반영
+            self._sync_db_positions_from_api(api_holdings, result)
+
         except Exception as e:
             result["warnings"].append(f"API 오류: {str(e)}")
             return result
@@ -779,10 +873,14 @@ class PositionResynchronizer:
             
             holdings = balance.get("holdings", [])
             active_holdings = [h for h in holdings if h.get("quantity", 0) > 0]
+            api_holdings = {h["stock_code"]: h for h in active_holdings}
             
             result["success"] = True
             result["holdings"] = active_holdings
             result["action"] = "SYNCED"
+
+            # DB도 실계좌 기준으로 동기화
+            self._sync_db_positions_from_api(api_holdings, result)
             
             # 저장 데이터 클리어 (보유 없으면)
             if not active_holdings:

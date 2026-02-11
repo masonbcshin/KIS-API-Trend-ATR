@@ -53,6 +53,7 @@ from utils.position_store import (
     StoredPosition,
     get_position_store
 )
+from db.repository import get_position_repository
 from utils.telegram_notifier import TelegramNotifier, get_telegram_notifier
 from utils.logger import get_logger, TradeLogger
 from utils.market_hours import KST
@@ -122,6 +123,12 @@ class MultidayExecutor:
         
         # 포지션 저장소
         self.position_store = position_store or get_position_store()
+
+        # DB 포지션 리포지토리 (실계좌 기준 동기화용)
+        try:
+            self.db_position_repo = get_position_repository()
+        except Exception:
+            self.db_position_repo = None
         
         # ★ 신규: 주문 동기화 컴포넌트 (감사 보고서 지적 해결)
         self.market_checker = get_market_checker()
@@ -132,7 +139,8 @@ class MultidayExecutor:
         )
         self.position_resync = PositionResynchronizer(
             api=self.api,
-            position_store=self.position_store
+            position_store=self.position_store,
+            db_repository=self.db_position_repo
         )
         
         # 실행 상태

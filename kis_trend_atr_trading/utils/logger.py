@@ -6,6 +6,7 @@ KIS Trend-ATR Trading System - 로깅 유틸리티
 """
 
 import logging
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -13,8 +14,18 @@ from typing import Optional
 
 from .market_hours import KST
 
-# 로그 디렉토리 설정
-LOG_DIR = Path(__file__).parent.parent / "logs"
+# 로그 디렉토리 설정 (기본: ~/auto-trade/logs)
+LOG_DIR = Path(os.path.expanduser(os.getenv("AUTO_TRADE_LOG_DIR", "~/auto-trade/logs")))
+
+
+class KSTFormatter(logging.Formatter):
+    """로그 타임스탬프를 KST 기준으로 포맷합니다."""
+
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, tz=KST)
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.isoformat(timespec="seconds")
 
 
 def setup_logger(
@@ -47,7 +58,7 @@ def setup_logger(
     logger.setLevel(log_level)
     
     # 로그 포맷 설정
-    formatter = logging.Formatter(
+    formatter = KSTFormatter(
         fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"
     )

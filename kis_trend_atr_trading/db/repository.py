@@ -293,6 +293,59 @@ class PositionRepository:
         except QueryError as e:
             logger.error(f"[REPO] 포지션 저장 실패: {e}")
             return None
+
+    def upsert_from_account_holding(
+        self,
+        symbol: str,
+        entry_price: float,
+        quantity: int,
+        atr_at_entry: float,
+        stop_price: float,
+        take_profit_price: float = None,
+        trailing_stop: float = None,
+        highest_price: float = None,
+        entry_time: datetime = None
+    ) -> Optional[PositionRecord]:
+        """
+        실계좌 보유를 기준으로 포지션을 강제 upsert합니다.
+
+        ★ synchronize 용 메서드:
+            - 기존 OPEN 포지션이 있어도 수량/평균단가를 업데이트
+            - DB 상태를 실계좌 기준으로 맞출 때 사용
+        """
+        entry_time = entry_time or datetime.now(KST)
+        highest_price = highest_price or entry_price
+        trailing_stop = trailing_stop or stop_price
+
+        try:
+            self.db.execute_command(
+                """
+                INSERT INTO positions (
+                    symbol, entry_price, quantity, entry_time,
+                    atr_at_entry, stop_price, take_profit_price,
+                    trailing_stop, highest_price, status
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN')
+                ON DUPLICATE KEY UPDATE
+                    entry_price = VALUES(entry_price),
+                    quantity = VALUES(quantity),
+                    entry_time = VALUES(entry_time),
+                    atr_at_entry = VALUES(atr_at_entry),
+                    stop_price = VALUES(stop_price),
+                    take_profit_price = VALUES(take_profit_price),
+                    trailing_stop = VALUES(trailing_stop),
+                    highest_price = VALUES(highest_price),
+                    status = 'OPEN'
+                """,
+                (
+                    symbol, entry_price, quantity, entry_time,
+                    atr_at_entry, stop_price, take_profit_price,
+                    trailing_stop, highest_price
+                )
+            )
+            return self.get_by_symbol(symbol)
+        except QueryError as e:
+            logger.error(f"[REPO] 실계좌 기준 upsert 실패: {e}")
+            return None
     
     def get_by_symbol(self, symbol: str) -> Optional[PositionRecord]:
         """
