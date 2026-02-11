@@ -25,6 +25,7 @@ from api.kis_api import KISApi, KISApiError
 from strategy.trend_atr import TrendATRStrategy, Signal, SignalType
 from utils.logger import get_logger, TradeLogger
 from utils.telegram_notifier import TelegramNotifier, get_telegram_notifier
+from utils.market_hours import KST
 from engine.risk_manager import (
     RiskManager,
     create_risk_manager_from_settings,
@@ -196,7 +197,7 @@ class CBTExecutor:
         # 동일 시그널 연속 실행 방지
         if self._last_signal_type == signal.signal_type:
             if self._last_order_time:
-                elapsed = (datetime.now() - self._last_order_time).total_seconds()
+                elapsed = (datetime.now(KST) - self._last_order_time).total_seconds()
                 if elapsed < 60:
                     logger.debug("[CBT] 중복 주문 방지: 동일 시그널 무시")
                     return False
@@ -249,17 +250,17 @@ class CBTExecutor:
                 quantity=self.order_quantity,
                 stop_loss=signal.stop_loss,
                 take_profit=signal.take_profit,
-                entry_date=datetime.now().strftime("%Y-%m-%d"),
+                entry_date=datetime.now(KST).strftime("%Y-%m-%d"),
                 atr=signal.atr
             )
             
             # 주문 추적 업데이트
-            self._last_order_time = datetime.now()
+            self._last_order_time = datetime.now(KST)
             self._last_signal_type = SignalType.BUY
             
             # 일별 거래 기록
             self._daily_trades.append({
-                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "time": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
                 "type": "BUY",
                 "price": signal.price,
                 "quantity": self.order_quantity,
@@ -321,12 +322,12 @@ class CBTExecutor:
             )
             
             # 주문 추적 업데이트
-            self._last_order_time = datetime.now()
+            self._last_order_time = datetime.now(KST)
             self._last_signal_type = SignalType.SELL
             
             # 일별 거래 기록
             self._daily_trades.append({
-                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "time": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
                 "type": "SELL",
                 "price": signal.price,
                 "quantity": result["quantity"],
@@ -382,7 +383,7 @@ class CBTExecutor:
                 safe_exit_with_message(kill_check.reason)
         
         result = {
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
             "stock_code": self.stock_code,
             "mode": "CBT",
             "signal": None,
@@ -632,7 +633,7 @@ class CBTExecutor:
 • 청산사유: {result.get('exit_reason', 'OTHER')}
 ━━━━━━━━━━━━━━━━━━
 🔒 CBT 모드: 실주문 없음
-⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+⏰ {datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')}
 """
         self.telegram.send_message(message)
     
@@ -645,7 +646,7 @@ class CBTExecutor:
             message = f"""
 🧪 *CBT 세션 종료 리포트*
 ━━━━━━━━━━━━━━━━━━
-📅 종료 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+📅 종료 시간: {datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')}
 📝 종료 사유: {stop_reason}
 
 💰 최종 성과

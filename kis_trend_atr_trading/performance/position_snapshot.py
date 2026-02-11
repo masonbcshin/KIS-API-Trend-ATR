@@ -8,6 +8,8 @@ from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from typing import Optional, Dict, Any, List
 
+from utils.market_hours import KST
+
 
 @dataclass
 class PositionSnapshot:
@@ -37,7 +39,7 @@ class PositionSnapshot:
     current_price: float
     quantity: int
     entry_time: datetime
-    snapshot_time: datetime = field(default_factory=datetime.now)
+    snapshot_time: datetime = field(default_factory=lambda: datetime.now(KST))
     unrealized_pnl: float = 0.0
     unrealized_pnl_pct: float = 0.0
     atr_at_entry: Optional[float] = None
@@ -130,8 +132,8 @@ class PositionSnapshot:
             entry_price=float(data['entry_price']),
             current_price=float(data['current_price']),
             quantity=int(data['quantity']),
-            entry_time=entry_time or datetime.now(),
-            snapshot_time=snapshot_time or datetime.now(),
+            entry_time=entry_time or datetime.now(KST),
+            snapshot_time=snapshot_time or datetime.now(KST),
             unrealized_pnl=float(data.get('unrealized_pnl', 0)),
             unrealized_pnl_pct=float(data.get('unrealized_pnl_pct', 0)),
             atr_at_entry=float(data['atr_at_entry']) if data.get('atr_at_entry') else None,
@@ -150,7 +152,7 @@ class AccountSnapshot:
     ★ 특정 시점의 계좌 전체 상태를 기록
     ★ Equity Curve, MDD 계산에 사용
     """
-    snapshot_time: datetime = field(default_factory=datetime.now)
+    snapshot_time: datetime = field(default_factory=lambda: datetime.now(KST))
     total_equity: float = 0.0
     cash: float = 0.0
     position_value: float = 0.0
@@ -190,7 +192,7 @@ class AccountSnapshot:
         ]
         
         return cls(
-            snapshot_time=snapshot_time or datetime.now(),
+            snapshot_time=snapshot_time or datetime.now(KST),
             total_equity=float(data.get('total_equity', 0)),
             cash=float(data.get('cash', 0)),
             position_value=float(data.get('position_value', 0)),

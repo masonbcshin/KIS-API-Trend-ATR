@@ -41,6 +41,7 @@ from strategy.multiday_trend_atr import MultidayTrendATRStrategy
 from engine.multiday_executor import MultidayExecutor
 from backtest.backtester import Backtester
 from utils.logger import setup_logger, get_logger
+from utils.market_hours import KST
 
 
 def print_banner():
@@ -410,7 +411,7 @@ def main():
     print_banner()
     
     # 시작 시간
-    start_time = datetime.now()
+    start_time = datetime.now(KST)
     logger.info(f"프로그램 시작: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"실행 모드: {args.mode}, 트레이딩 모드: {settings.TRADING_MODE}")
     
@@ -433,7 +434,7 @@ def main():
         run_verification()
     
     # 종료 시간
-    end_time = datetime.now()
+    end_time = datetime.now(KST)
     elapsed = (end_time - start_time).total_seconds()
     logger.info(f"프로그램 종료: 실행 시간 {elapsed:.1f}초")
     

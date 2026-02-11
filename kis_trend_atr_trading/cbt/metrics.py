@@ -24,6 +24,7 @@ from dataclasses import dataclass, asdict
 from .trade_store import Trade, TradeStore
 from .virtual_account import VirtualAccount, EquitySnapshot
 from utils.logger import get_logger
+from utils.market_hours import KST
 
 logger = get_logger("cbt_metrics")
 
@@ -426,7 +427,7 @@ class CBTMetrics:
         total_commission = self.calculate_total_commission()
         
         report = PerformanceReport(
-            report_date=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            report_date=datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
             initial_capital=initial,
             final_equity=final,
             
@@ -503,7 +504,7 @@ class CBTMetrics:
             Dict: 일일 리포트
         """
         if date is None:
-            date = datetime.now().strftime("%Y-%m-%d")
+            date = datetime.now(KST).strftime("%Y-%m-%d")
         
         trades = self.trade_store.get_trades_by_date(date, date)
         

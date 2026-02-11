@@ -23,6 +23,7 @@ from engine.risk_manager import (
     create_risk_manager_from_settings,
     safe_exit_with_message
 )
+from utils.market_hours import get_now
 
 logger = get_logger("executor")
 trade_logger = TradeLogger("executor")
@@ -170,7 +171,7 @@ class TradingExecutor:
         # 동일 시그널 연속 실행 방지
         if self._last_signal_type == signal.signal_type:
             if self._last_order_time:
-                elapsed = (datetime.now() - self._last_order_time).total_seconds()
+                elapsed = (get_now() - self._last_order_time).total_seconds()
                 # 1분 이내 동일 시그널 무시
                 if elapsed < 60:
                     logger.debug("중복 주문 방지: 동일 시그널 무시")
@@ -216,6 +217,7 @@ class TradingExecutor:
             )
             
             if result["success"]:
+                now = get_now()
                 # 포지션 오픈
                 self.strategy.open_position(
                     stock_code=self.stock_code,
@@ -223,17 +225,17 @@ class TradingExecutor:
                     quantity=self.order_quantity,
                     stop_loss=signal.stop_loss,
                     take_profit=signal.take_profit,
-                    entry_date=datetime.now().strftime("%Y-%m-%d"),
+                    entry_date=now.strftime("%Y-%m-%d"),
                     atr=signal.atr
                 )
                 
                 # 주문 추적 업데이트
-                self._last_order_time = datetime.now()
+                self._last_order_time = now
                 self._last_signal_type = SignalType.BUY
                 
                 # 거래 기록
                 self._daily_trades.append({
-                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "time": now.strftime("%Y-%m-%d %H:%M:%S"),
                     "type": "BUY",
                     "price": signal.price,
                     "quantity": self.order_quantity,
@@ -301,6 +303,7 @@ class TradingExecutor:
             )
             
             if result["success"]:
+                now = get_now()
                 # 포지션 청산
                 close_result = self.strategy.close_position(
                     exit_price=signal.price,
@@ -312,7 +315,7 @@ class TradingExecutor:
                     self.risk_manager.record_trade_pnl(close_result["pnl"])
                 
                 # 주문 추적 업데이트
-                self._last_order_time = datetime.now()
+                self._last_order_time = now
                 self._last_signal_type = SignalType.SELL
                 
                 # 거래 기록
@@ -320,7 +323,7 @@ class TradingExecutor:
                 pnl_pct = close_result["pnl_pct"] if close_result else 0
                 
                 self._daily_trades.append({
-                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "time": now.strftime("%Y-%m-%d %H:%M:%S"),
                     "type": "SELL",
                     "price": signal.price,
                     "quantity": position.quantity,
@@ -399,7 +402,7 @@ class TradingExecutor:
                 safe_exit_with_message(kill_check.reason)
         
         result = {
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp": get_now().strftime("%Y-%m-%d %H:%M:%S"),
             "stock_code": self.stock_code,
             "signal": None,
             "order_result": None,

@@ -11,6 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from .market_hours import KST
+
 # 로그 디렉토리 설정
 LOG_DIR = Path(__file__).parent.parent / "logs"
 
@@ -65,7 +67,7 @@ def setup_logger(
         log_dir.mkdir(parents=True, exist_ok=True)
         
         # 날짜별 로그 파일
-        log_filename = f"{name}_{datetime.now().strftime('%Y%m%d')}.log"
+        log_filename = f"{name}_{datetime.now(KST).strftime('%Y%m%d')}.log"
         log_filepath = log_dir / log_filename
         
         file_handler = logging.FileHandler(

@@ -26,6 +26,7 @@ import numpy as np
 
 from config import settings
 from utils.logger import get_logger, TradeLogger
+from utils.market_hours import KST
 from engine.trading_state import (
     TradingState, 
     TradingStateMachine, 

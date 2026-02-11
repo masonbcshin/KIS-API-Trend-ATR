@@ -55,6 +55,7 @@ from utils.position_store import (
 )
 from utils.telegram_notifier import TelegramNotifier, get_telegram_notifier
 from utils.logger import get_logger, TradeLogger
+from utils.market_hours import KST
 
 logger = get_logger("multiday_executor")
 trade_logger = TradeLogger("multiday_executor")
@@ -299,8 +300,8 @@ class MultidayExecutor:
     def _calculate_holding_days(self, entry_date: str) -> int:
         """보유 일수 계산"""
         try:
-            entry = datetime.strptime(entry_date, "%Y-%m-%d")
-            return (datetime.now() - entry).days + 1
+            entry = datetime.strptime(entry_date, "%Y-%m-%d").date()
+            return (datetime.now(KST).date() - entry).days + 1
         except ValueError:
             return 0
     
@@ -441,7 +442,7 @@ class MultidayExecutor:
                 
                 # 거래 기록 (실제 체결가 사용)
                 self._daily_trades.append({
-                    "time": datetime.now().isoformat(),
+                    "time": datetime.now(KST).isoformat(),
                     "type": "BUY",
                     "price": actual_price,
                     "quantity": actual_qty,
@@ -592,7 +593,7 @@ class MultidayExecutor:
                     
                     # 거래 기록 (실제 체결가)
                     self._daily_trades.append({
-                        "time": datetime.now().isoformat(),
+                        "time": datetime.now(KST).isoformat(),
                         "type": "SELL",
                         "price": actual_price,
                         "quantity": sync_result.exec_qty,
@@ -822,7 +823,7 @@ class MultidayExecutor:
                 safe_exit_with_message(kill_check.reason)
         
         result = {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(KST).isoformat(),
             "mode": self.trading_mode,
             "stock_code": self.stock_code,
             "signal": None,

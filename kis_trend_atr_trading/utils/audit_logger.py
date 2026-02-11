@@ -24,7 +24,7 @@ KIS Trend-ATR Trading System - 감사 추적 로거
 
 import json
 import os
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, asdict
@@ -33,7 +33,8 @@ import threading
 import gzip
 import shutil
 
-from utils.logger import get_logger
+from .logger import get_logger
+from .market_hours import KST
 
 logger = get_logger("audit_logger")
 
@@ -195,14 +196,14 @@ class AuditLogger:
         self.log_dir = log_dir or Path(__file__).parent.parent / "logs" / "audit"
         self.log_dir.mkdir(parents=True, exist_ok=True)
         
-        self.session_id = session_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.session_id = session_id or datetime.now(KST).strftime("%Y%m%d_%H%M%S")
         self.max_events_per_file = max_events_per_file
         self.compress_old_logs = compress_old_logs
         self.retention_days = retention_days
         
         self._lock = threading.Lock()
         self._event_counter = 0
-        self._current_date = date.today()
+        self._current_date = datetime.now(KST).date()
         self._events_buffer: List[AuditEvent] = []
         
         # 현재 날짜 파일
@@ -219,7 +220,7 @@ class AuditLogger:
     
     def _get_log_file_path(self, target_date: date = None) -> Path:
         """로그 파일 경로를 반환합니다."""
-        target_date = target_date or date.today()
+        target_date = target_date or datetime.now(KST).date()
         return self.log_dir / f"audit_{target_date.strftime('%Y%m%d')}.json"
     
     def _generate_event_id(self) -> str:
@@ -229,7 +230,7 @@ class AuditLogger:
     
     def _check_date_change(self) -> None:
         """날짜 변경을 확인하고 필요시 새 파일을 시작합니다."""
-        today = date.today()
+        today = datetime.now(KST).date()
         if today != self._current_date:
             # 이전 날짜 파일 저장
             self._flush_buffer()
@@ -279,7 +280,7 @@ class AuditLogger:
             event = AuditEvent(
                 event_id=self._generate_event_id(),
                 event_type=event_type,
-                timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                timestamp=datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
                 severity=severity,
                 stock_code=stock_code,
                 order_no=order_no,
@@ -320,7 +321,7 @@ class AuditLogger:
                 "date": str(self._current_date),
                 "event_count": len(existing_events),
                 "events": existing_events,
-                "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                "updated_at": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
             }
             
             with open(self._current_file, 'w', encoding='utf-8') as f:
@@ -343,7 +344,7 @@ class AuditLogger:
             message="Trading system started",
             details={
                 "session_id": self.session_id,
-                "start_time": datetime.now().isoformat(),
+                "start_time": datetime.now(KST).isoformat(),
                 **(details or {})
             },
             source="AuditLogger"
@@ -357,7 +358,7 @@ class AuditLogger:
             message=f"Trading system stopped: {reason}",
             details={
                 "reason": reason,
-                "stop_time": datetime.now().isoformat(),
+                "stop_time": datetime.now(KST).isoformat(),
                 **(details or {})
             },
             source="AuditLogger"
@@ -653,7 +654,7 @@ class AuditLogger:
     
     def _cleanup_old_logs(self) -> None:
         """보관 기간 초과 로그를 삭제합니다."""
-        cutoff_date = date.today() - timedelta(days=self.retention_days)
+        cutoff_date = datetime.now(KST).date() - timedelta(days=self.retention_days)
         
         for file_path in self.log_dir.glob("audit_*.json*"):
             try:

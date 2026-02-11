@@ -43,12 +43,13 @@ KIS Trend-ATR Trading System - 데이터베이스 추상화 인터페이스
 import os
 import json
 from abc import ABC, abstractmethod
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass, asdict
 
 from utils.logger import get_logger
+from utils.market_hours import KST
 
 logger = get_logger("database_interface")
 
@@ -362,7 +363,7 @@ class JsonDatabase(DatabaseInterface):
         order_no: str = None
     ) -> bool:
         """거래 기록 저장"""
-        executed_at = executed_at or datetime.now()
+        executed_at = executed_at or datetime.now(KST)
         
         trade = TradeData(
             symbol=symbol,
@@ -521,7 +522,7 @@ class JsonDatabase(DatabaseInterface):
         snapshot_time: datetime = None
     ) -> bool:
         """성과 스냅샷 저장"""
-        snapshot_time = snapshot_time or datetime.now()
+        snapshot_time = snapshot_time or datetime.now(KST)
         
         snapshot = PerformanceSnapshot(
             snapshot_time=snapshot_time,
@@ -634,8 +635,9 @@ class JsonDatabase(DatabaseInterface):
         # 날짜 필터링
         if days:
             from datetime import timedelta
-            cutoff = datetime.now() - timedelta(days=days)
+            cutoff = datetime.now(KST) - timedelta(days=days)
             snapshots = [
+            
                 s for s in snapshots 
                 if datetime.fromisoformat(s["snapshot_time"]) >= cutoff
             ]

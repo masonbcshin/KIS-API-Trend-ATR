@@ -70,6 +70,8 @@ from strategy.trend_atr_v2 import (
     SignalType
 )
 
+from utils.market_hours import KST
+
 
 def print_banner():
     """프로그램 시작 배너를 출력합니다."""
@@ -138,7 +140,7 @@ class TradingEngine:
             dict: 실행 결과
         """
         result = {
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
             "stock_code": self.stock_code,
             "signal": None,
             "order_result": None,
@@ -204,7 +206,7 @@ class TradingEngine:
                             quantity=self.order_quantity,
                             stop_loss=signal.stop_loss,
                             take_profit=signal.take_profit,
-                            entry_date=datetime.now().strftime("%Y-%m-%d"),
+                            entry_date=datetime.now(KST).strftime("%Y-%m-%d"),
                             atr=signal.atr
                         )
                         print(f"[Engine] ✅ 매수 주문 성공: 주문번호 {order_result.order_no}")
@@ -304,7 +306,7 @@ class TradingEngine:
             while self.is_running:
                 iteration += 1
                 print(f"\n{'═' * 60}")
-                print(f"  반복 #{iteration} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"  반복 #{iteration} - {datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')}")
                 print(f"{'═' * 60}")
                 
                 self.run_once()
@@ -577,7 +579,7 @@ def main():
     print_banner()
     
     # 시작 시간 기록
-    start_time = datetime.now()
+    start_time = datetime.now(KST)
     print(f"프로그램 시작: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     
     # 환경 정보 출력 (env.py에서 자동으로 출력됨)
@@ -601,7 +603,7 @@ def main():
         )
     
     # 종료 시간 기록
-    end_time = datetime.now()
+    end_time = datetime.now(KST)
     elapsed = (end_time - start_time).total_seconds()
     
     print(f"\n✅ 프로그램 종료 (실행 시간: {elapsed:.1f}초)")

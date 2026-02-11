@@ -35,6 +35,7 @@ from api.kis_api import KISApi, KISApiError
 from strategy.trend_atr import TrendATRStrategy
 from cbt import CBTExecutor, VirtualAccount, TradeStore, CBTMetrics
 from utils.logger import setup_logger, get_logger
+from utils.market_hours import KST
 
 
 def print_cbt_banner():
@@ -313,7 +314,7 @@ def main():
     print_cbt_banner()
     
     # 시작 시간 기록
-    start_time = datetime.now()
+    start_time = datetime.now(KST)
     logger.info(f"CBT 프로그램 시작: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"실행 모드: {args.mode}")
     
@@ -337,7 +338,7 @@ def main():
         export_trades_csv()
     
     # 종료 시간 기록
-    end_time = datetime.now()
+    end_time = datetime.now(KST)
     elapsed = (end_time - start_time).total_seconds()
     logger.info(f"CBT 프로그램 종료: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"총 실행 시간: {elapsed:.1f}초")

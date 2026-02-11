@@ -9,6 +9,8 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional, Dict, Any
 from enum import Enum
 
+from utils.market_hours import KST
+
 
 class TradeSide(Enum):
     """거래 방향"""
@@ -53,7 +55,7 @@ class TradeRecord:
     side: str
     price: float
     quantity: int
-    executed_at: datetime = field(default_factory=datetime.now)
+    executed_at: datetime = field(default_factory=lambda: datetime.now(KST))
     is_virtual: bool = False
     reason: Optional[str] = None
     entry_price: Optional[float] = None
@@ -104,7 +106,7 @@ class TradeRecord:
             side=data['side'],
             price=float(data['price']),
             quantity=int(data['quantity']),
-            executed_at=executed_at or datetime.now(),
+            executed_at=executed_at or datetime.now(KST),
             is_virtual=data.get('is_virtual', False),
             reason=data.get('reason'),
             entry_price=float(data['entry_price']) if data.get('entry_price') else None,

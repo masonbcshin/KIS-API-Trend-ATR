@@ -54,6 +54,7 @@ from dataclasses import dataclass
 from performance.trade_record import TradeRecord, DailyTradeStats
 from performance.position_snapshot import PositionSnapshot, AccountSnapshot
 from utils.logger import get_logger
+from utils.market_hours import KST
 
 logger = get_logger("performance_tracker")
 
@@ -251,7 +252,7 @@ class PerformanceTracker:
             side="BUY",
             price=price,
             quantity=quantity,
-            executed_at=datetime.now(),
+            executed_at=datetime.now(KST),
             is_virtual=is_virtual,
             order_no=order_no,
             mode=mode,
@@ -268,7 +269,7 @@ class PerformanceTracker:
             entry_price=price,
             current_price=price,
             quantity=quantity,
-            entry_time=datetime.now(),
+            entry_time=datetime.now(KST),
             atr_at_entry=atr,
             stop_price=stop_price,
             take_profit_price=take_profit,
@@ -325,14 +326,14 @@ class PerformanceTracker:
         pnl -= commission
         
         # 보유 일수
-        holding_days = (datetime.now().date() - position.entry_time.date()).days
+        holding_days = (datetime.now(KST).date() - position.entry_time.date()).days
         
         trade = TradeRecord(
             symbol=symbol,
             side="SELL",
             price=price,
             quantity=quantity,
-            executed_at=datetime.now(),
+            executed_at=datetime.now(KST),
             is_virtual=is_virtual,
             reason=reason,
             entry_price=entry_price,
@@ -369,7 +370,7 @@ class PerformanceTracker:
             pos.current_price = current_price
             pos.unrealized_pnl = (current_price - pos.entry_price) * pos.quantity
             pos.unrealized_pnl_pct = ((current_price - pos.entry_price) / pos.entry_price) * 100
-            pos.snapshot_time = datetime.now()
+            pos.snapshot_time = datetime.now(KST)
             
             # 최고가 갱신
             if current_price > (pos.highest_price or 0):
@@ -385,7 +386,7 @@ class PerformanceTracker:
         total_equity = self.initial_capital + self._realized_pnl + unrealized
         
         snapshot = {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(KST).isoformat(),
             "total_equity": total_equity,
             "realized_pnl": self._realized_pnl,
             "unrealized_pnl": unrealized,
@@ -462,7 +463,7 @@ class PerformanceTracker:
     
     def get_daily_stats(self, trade_date: date = None) -> DailyTradeStats:
         """일별 거래 통계"""
-        trade_date = trade_date or date.today()
+        trade_date = trade_date or datetime.now(KST).date()
         
         stats = DailyTradeStats(trade_date=trade_date.isoformat())
         
@@ -500,7 +501,7 @@ class PerformanceTracker:
         # 날짜 필터링
         equity_data = self._equity_curve
         if days:
-            cutoff = datetime.now() - timedelta(days=days)
+            cutoff = datetime.now(KST) - timedelta(days=days)
             equity_data = [
                 e for e in equity_data 
                 if datetime.fromisoformat(e["timestamp"]) >= cutoff

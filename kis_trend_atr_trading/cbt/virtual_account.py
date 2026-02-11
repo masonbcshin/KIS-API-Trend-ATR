@@ -22,6 +22,7 @@ import threading
 
 from config import settings
 from utils.logger import get_logger
+from utils.market_hours import KST
 
 logger = get_logger("cbt_account")
 
@@ -209,7 +210,7 @@ class VirtualAccount:
             self.cash -= required_cash
             
             # 포지션 생성
-            entry_date = entry_date or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            entry_date = entry_date or datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
             self.position = Position(
                 stock_code=stock_code,
                 entry_price=price,
@@ -223,7 +224,7 @@ class VirtualAccount:
             )
             
             # 가상 주문번호 생성
-            order_no = f"CBT{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            order_no = f"CBT{datetime.now(KST).strftime('%Y%m%d%H%M%S')}"
             
             logger.info(
                 f"[CBT] 가상 매수 체결: {stock_code} @ {price:,.0f}원 x {quantity}주, "
@@ -285,8 +286,8 @@ class VirtualAccount:
                 pos.entry_date.split()[0], 
                 "%Y-%m-%d"
             )
-            exit_dt = datetime.now()
-            holding_days = (exit_dt - entry_dt).days + 1
+            exit_dt = datetime.now(KST)
+            holding_days = (exit_dt.date() - entry_dt.date()).days + 1
             
             # 현금 복구
             self.cash += net_proceeds
@@ -303,7 +304,7 @@ class VirtualAccount:
                 self.losing_trades += 1
             
             # 가상 주문번호
-            order_no = f"CBT{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            order_no = f"CBT{datetime.now(KST).strftime('%Y%m%d%H%M%S')}"
             
             result = {
                 "success": True,
@@ -320,7 +321,7 @@ class VirtualAccount:
                 "holding_days": holding_days,
                 "exit_reason": reason,
                 "entry_date": pos.entry_date,
-                "exit_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                "exit_date": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
             }
             
             logger.info(
@@ -460,7 +461,7 @@ class VirtualAccount:
         total_equity = self.cash + position_value
         
         snapshot = EquitySnapshot(
-            timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            timestamp=datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
             cash=self.cash,
             position_value=position_value,
             total_equity=total_equity,
@@ -489,7 +490,7 @@ class VirtualAccount:
             losing_trades=self.losing_trades,
             position=asdict(self.position) if self.position else None,
             equity_curve=[asdict(s) for s in self.equity_curve[-1000:]],  # 최근 1000개만
-            last_updated=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            last_updated=datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
         )
         
         with open(self._state_file, "w", encoding="utf-8") as f:

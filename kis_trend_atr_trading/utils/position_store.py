@@ -21,6 +21,8 @@ from typing import Optional, Dict, Any, Tuple
 import logging
 from dataclasses import dataclass, asdict
 
+from .market_hours import KST
+
 logger = logging.getLogger(__name__)
 
 # 데이터 저장 경로
@@ -70,9 +72,9 @@ class StoredPosition:
     
     def __post_init__(self):
         if not self.saved_at:
-            self.saved_at = datetime.now().isoformat()
+            self.saved_at = datetime.now(KST).isoformat()
         if not self.entry_time:
-            self.entry_time = datetime.now().strftime("%H:%M:%S")
+            self.entry_time = datetime.now(KST).strftime("%H:%M:%S")
         if self.highest_price == 0.0 and self.entry_price > 0:
             self.highest_price = self.entry_price
         if self.trailing_stop == 0.0 and self.stop_loss > 0:
@@ -151,7 +153,7 @@ class PositionStore:
             data = {
                 "position": asdict(position),
                 "version": "1.0",
-                "updated_at": datetime.now().isoformat()
+                "updated_at": datetime.now(KST).isoformat()
             }
             
             with open(self.file_path, 'w', encoding='utf-8') as f:
@@ -204,8 +206,8 @@ class PositionStore:
                 data = {
                     "position": None,
                     "version": "1.0",
-                    "updated_at": datetime.now().isoformat(),
-                    "cleared_at": datetime.now().isoformat()
+                    "updated_at": datetime.now(KST).isoformat(),
+                    "cleared_at": datetime.now(KST).isoformat()
                 }
                 
                 with open(self.file_path, 'w', encoding='utf-8') as f:
@@ -352,7 +354,7 @@ class DailyTradeStore:
     
     def _get_today_str(self) -> str:
         """오늘 날짜 문자열을 반환합니다."""
-        return datetime.now().strftime("%Y-%m-%d")
+        return datetime.now(KST).strftime("%Y-%m-%d")
     
     def save_trade(self, trade: Dict[str, Any]) -> bool:
         """

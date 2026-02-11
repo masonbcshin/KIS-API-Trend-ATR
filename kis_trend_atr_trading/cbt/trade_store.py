@@ -27,6 +27,7 @@ import threading
 
 from config import settings
 from utils.logger import get_logger
+from utils.market_hours import KST
 
 logger = get_logger("cbt_trade_store")
 
@@ -307,10 +308,10 @@ class TradeStore:
             return None
         
         trade = Trade(
-            trade_id=result.get("order_no", f"CBT{datetime.now().strftime('%Y%m%d%H%M%S')}"),
+            trade_id=result.get("order_no", f"CBT{datetime.now(KST).strftime('%Y%m%d%H%M%S')}"),
             stock_code=result.get("stock_code", ""),
             entry_date=result.get("entry_date", ""),
-            exit_date=result.get("exit_date", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+            exit_date=result.get("exit_date", datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")),
             entry_price=result.get("entry_price", 0),
             exit_price=result.get("exit_price", 0),
             quantity=result.get("quantity", 0),
@@ -376,7 +377,7 @@ class TradeStore:
             List[Trade]: 거래 목록
         """
         if end_date is None:
-            end_date = datetime.now().strftime("%Y-%m-%d")
+            end_date = datetime.now(KST).strftime("%Y-%m-%d")
         
         # 시간 범위 확장
         start_dt = f"{start_date} 00:00:00"
@@ -562,7 +563,7 @@ class TradeStore:
         import csv
         
         if filepath is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            timestamp = datetime.now(KST).strftime("%Y%m%d_%H%M%S")
             filepath = self.data_dir / f"cbt_trades_export_{timestamp}.csv"
         
         trades = self.get_all_trades()

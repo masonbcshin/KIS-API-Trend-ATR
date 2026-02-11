@@ -20,6 +20,8 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from typing import Optional, Dict, Any
 
+from utils.market_hours import KST
+
 
 class TradingState(Enum):
     """
@@ -90,9 +92,9 @@ class MultidayPosition:
     
     def __post_init__(self):
         if not self.entry_date:
-            self.entry_date = datetime.now().strftime("%Y-%m-%d")
+            self.entry_date = datetime.now(KST).strftime("%Y-%m-%d")
         if not self.entry_time:
-            self.entry_time = datetime.now().strftime("%H:%M:%S")
+            self.entry_time = datetime.now(KST).strftime("%H:%M:%S")
         if self.highest_price == 0.0 and self.entry_price > 0:
             self.highest_price = self.entry_price
     
@@ -316,7 +318,7 @@ class TradingStateMachine:
             "pnl": pnl,
             "pnl_pct": pnl_pct,
             "entry_date": self._position.entry_date,
-            "exit_date": datetime.now().strftime("%Y-%m-%d"),
+            "exit_date": datetime.now(KST).strftime("%Y-%m-%d"),
             "exit_reason": reason.value,
             "atr_at_entry": self._position.atr_at_entry,
             "holding_days": self._calculate_holding_days()
@@ -335,8 +337,8 @@ class TradingStateMachine:
         
         try:
             entry = datetime.strptime(self._position.entry_date, "%Y-%m-%d")
-            today = datetime.now()
-            return (today - entry).days + 1
+            today = datetime.now(KST)
+            return (today.date() - entry.date()).days + 1
         except ValueError:
             return 0
     

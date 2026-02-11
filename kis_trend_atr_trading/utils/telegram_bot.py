@@ -29,7 +29,8 @@ from dataclasses import dataclass
 import requests
 from requests.exceptions import RequestException
 
-from utils.logger import get_logger
+from .logger import get_logger
+from .market_hours import KST
 
 logger = get_logger("telegram_bot")
 
@@ -238,7 +239,7 @@ Kill Switch를 해제하려면 다음 명령을 입력하세요:
 • 주문 가능: {'✅ 가능' if status['can_place_orders'] else '❌ 불가'}
 • API URL: {status['api_url'][:30]}...
 
-⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+⏰ {datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')}
 """
         except Exception as e:
             logger.error(f"[BOT] /status 처리 오류: {e}")

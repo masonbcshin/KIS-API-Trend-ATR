@@ -17,6 +17,7 @@ import pandas as pd
 
 from config import settings
 from utils.logger import get_logger, TradeLogger
+from utils.market_hours import KST
 
 logger = get_logger("kis_api")
 trade_logger = TradeLogger("kis_api")
@@ -210,7 +211,7 @@ class KISApi:
         """
         # 토큰이 유효한 경우 재사용
         if self.access_token and self.token_expires_at:
-            if datetime.now() < self.token_expires_at - timedelta(minutes=10):
+            if datetime.now(KST) < self.token_expires_at - timedelta(minutes=10):
                 return self.access_token
         
         url = f"{self.base_url}/oauth2/tokenP"
@@ -233,7 +234,7 @@ class KISApi:
         
         # 토큰 만료 시간 설정 (KIS 토큰은 24시간 유효)
         expires_in = int(data.get("expires_in", 86400))
-        self.token_expires_at = datetime.now() + timedelta(seconds=expires_in)
+        self.token_expires_at = datetime.now(KST) + timedelta(seconds=expires_in)
         
         logger.info(f"액세스 토큰 발급 완료 (만료: {self.token_expires_at})")
         
@@ -324,9 +325,9 @@ class KISApi:
                 - volume: 거래량
         """
         if end_date is None:
-            end_date = datetime.now().strftime("%Y%m%d")
+            end_date = datetime.now(KST).strftime("%Y%m%d")
         if start_date is None:
-            start_date = (datetime.now() - timedelta(days=100)).strftime("%Y%m%d")
+            start_date = (datetime.now(KST) - timedelta(days=100)).strftime("%Y%m%d")
         
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
         
@@ -571,7 +572,7 @@ class KISApi:
         tr_id = "VTTC8001R"
         headers = self._get_auth_headers(tr_id)
         
-        today = datetime.now().strftime("%Y%m%d")
+        today = datetime.now(KST).strftime("%Y%m%d")
         
         params = {
             "CANO": self.account_no,

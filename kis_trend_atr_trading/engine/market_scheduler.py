@@ -31,7 +31,8 @@ from utils.market_hours import (
     get_time_to_market_open,
     get_next_trading_day,
     MARKET_OPEN,
-    MARKET_CLOSE
+    MARKET_CLOSE,
+    get_now
 )
 from utils.logger import get_logger
 from utils.telegram_notifier import get_telegram_notifier
@@ -308,7 +309,7 @@ class MarketScheduler:
     
     def _update_market_phase(self) -> None:
         """현재 시장 단계를 업데이트합니다."""
-        now = datetime.now()
+        now = get_now()
         today = now.date()
         current_time = now.time()
         
@@ -393,7 +394,7 @@ class MarketScheduler:
                 try:
                     logger.info(f"[SCHEDULER] Pre-market 작업 실행: {task.name}")
                     task.callback()
-                    task.last_run = datetime.now()
+                    task.last_run = get_now()
                     task.run_count += 1
                 except Exception as e:
                     logger.error(f"[SCHEDULER] Pre-market 작업 오류 ({task.name}): {e}")
@@ -410,7 +411,7 @@ class MarketScheduler:
             return
         
         # Market 작업 실행
-        now = datetime.now()
+        now = get_now()
         
         for task in self._market_tasks:
             if not task.enabled:
@@ -450,7 +451,7 @@ class MarketScheduler:
                 try:
                     logger.info(f"[SCHEDULER] Post-market 작업 실행: {task.name}")
                     task.callback()
-                    task.last_run = datetime.now()
+                    task.last_run = get_now()
                     task.run_count += 1
                 except Exception as e:
                     logger.error(f"[SCHEDULER] Post-market 작업 오류 ({task.name}): {e}")
@@ -504,7 +505,8 @@ class MarketScheduler:
         return self._current_phase
     
     def get_status(self) -> Dict[str, Any]:
-        """스케줄러 상태를 반환합니다."""
+        """
+        스케줄러 상태를 반환합니다."""
         is_open, status_msg = get_market_status()
         
         return {
@@ -515,7 +517,7 @@ class MarketScheduler:
             "pre_market_tasks": len(self._pre_market_tasks),
             "market_tasks": len(self._market_tasks),
             "post_market_tasks": len(self._post_market_tasks),
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "timestamp": get_now().strftime("%Y-%m-%d %H:%M:%S")
         }
     
     def print_status(self) -> None:

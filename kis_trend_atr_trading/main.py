@@ -28,7 +28,7 @@ from strategy.trend_atr import TrendATRStrategy
 from engine.executor import TradingExecutor
 from backtest.backtester import Backtester
 from utils.logger import setup_logger, get_logger
-
+from utils.market_hours import KST
 
 def print_banner():
     """프로그램 시작 배너를 출력합니다."""
@@ -127,7 +127,6 @@ def run_backtest(stock_code: str, days: int = 365):
         print(f"\n❌ 오류 발생: {e}")
         logger.error(f"백테스트 오류: {e}")
 
-
 def run_trade(stock_code: str, interval: int = 60, max_runs: int = None):
     """
     모의투자 거래를 실행합니다.
@@ -209,7 +208,6 @@ def run_trade(stock_code: str, interval: int = 60, max_runs: int = None):
         print(f"\n❌ 오류 발생: {e}")
         logger.error(f"거래 오류: {e}")
 
-
 def main():
     """메인 함수"""
     # 로거 초기화
@@ -277,7 +275,7 @@ def main():
     print_banner()
     
     # 시작 시간 기록
-    start_time = datetime.now()
+    start_time = datetime.now(KST)
     logger.info(f"프로그램 시작: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"실행 모드: {args.mode}, 종목: {args.stock}")
     
@@ -339,7 +337,7 @@ def main():
             logger.error(f"CBT 오류: {e}")
     
     # 종료 시간 기록
-    end_time = datetime.now()
+    end_time = datetime.now(KST)
     elapsed = (end_time - start_time).total_seconds()
     logger.info(f"프로그램 종료: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"총 실행 시간: {elapsed:.1f}초")

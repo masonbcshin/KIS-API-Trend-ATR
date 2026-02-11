@@ -29,7 +29,8 @@ from enum import Enum
 import requests
 from requests.exceptions import RequestException, Timeout
 
-from utils.logger import get_logger
+from .logger import get_logger
+from .market_hours import KST
 
 logger = get_logger("telegram_notifier")
 
@@ -1288,7 +1289,7 @@ class TelegramNotifier:
     @staticmethod
     def _get_timestamp() -> str:
         """현재 시간 문자열 반환"""
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
     
     @staticmethod
     def _escape_markdown(text: str) -> str:
