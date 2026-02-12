@@ -81,6 +81,15 @@ class KISApi:
         self._was_disconnected: bool = False
         
         logger.info(f"KIS API 클라이언트 초기화 완료 (모의투자: {self.is_paper_trading})")
+        logger.info(
+            "[KIS] api_mode=%s, order_tr_ids={buy:%s,sell:%s,status:%s,cancel:%s,balance:%s}",
+            "PAPER" if self.is_paper_trading else "REAL",
+            self._resolve_tr_id("order_buy"),
+            self._resolve_tr_id("order_sell"),
+            self._resolve_tr_id("order_status"),
+            self._resolve_tr_id("order_cancel"),
+            self._resolve_tr_id("balance"),
+        )
 
     def _resolve_tr_id(self, purpose: str) -> str:
         """
