@@ -620,18 +620,8 @@ class MySQLManager:
                         cursor.execute(statement)
 
                 # 기존 DB 호환을 위한 안전 마이그레이션
-                migration_sql = [
-                    "ALTER TABLE positions ADD COLUMN IF NOT EXISTS mode VARCHAR(16) NOT NULL DEFAULT 'PAPER'",
-                    "ALTER TABLE trades ADD COLUMN IF NOT EXISTS mode VARCHAR(16) NOT NULL DEFAULT 'PAPER'",
-                    "ALTER TABLE trades ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(128) NULL",
-                    "ALTER TABLE account_snapshots ADD COLUMN IF NOT EXISTS mode VARCHAR(16) NOT NULL DEFAULT 'PAPER'",
-                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_trades_idempotency_key ON trades(idempotency_key)",
-                ]
-                for stmt in migration_sql:
-                    try:
-                        cursor.execute(stmt)
-                    except MySQLError as e:
-                        logger.warning(f"[DB] 마이그레이션 건너뜀: {stmt} ({e})")
+                self._ensure_columns(cursor)
+                self._ensure_indexes(cursor)
                 conn.commit()
                 
             logger.info("[DB] 스키마 초기화 완료")
@@ -670,9 +660,6 @@ class MySQLManager:
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         
-        CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
-        CREATE INDEX IF NOT EXISTS idx_positions_mode_status ON positions(mode, status);
-        
         CREATE TABLE IF NOT EXISTS trades (
             id INT AUTO_INCREMENT PRIMARY KEY,
             symbol VARCHAR(20) NOT NULL,
@@ -691,12 +678,6 @@ class MySQLManager:
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         
-        CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol);
-        CREATE INDEX IF NOT EXISTS idx_trades_executed_at ON trades(executed_at);
-        CREATE INDEX IF NOT EXISTS idx_trades_side ON trades(side);
-        CREATE INDEX IF NOT EXISTS idx_trades_mode_executed_at ON trades(mode, executed_at);
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_trades_idempotency_key ON trades(idempotency_key);
-        
         CREATE TABLE IF NOT EXISTS account_snapshots (
             snapshot_time DATETIME NOT NULL PRIMARY KEY,
             total_equity DECIMAL(15, 2) NOT NULL,
@@ -707,9 +688,6 @@ class MySQLManager:
             position_count INT DEFAULT 0,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-        
-        CREATE INDEX IF NOT EXISTS idx_snapshots_time ON account_snapshots(snapshot_time);
-        CREATE INDEX IF NOT EXISTS idx_snapshots_mode_time ON account_snapshots(mode, snapshot_time);
 
         CREATE TABLE IF NOT EXISTS order_state (
             id INT AUTO_INCREMENT PRIMARY KEY,
@@ -727,11 +705,79 @@ class MySQLManager:
             requested_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             UNIQUE KEY uq_order_state_idem (idempotency_key)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
-        CREATE INDEX IF NOT EXISTS idx_order_state_mode_status ON order_state(mode, status);
-        CREATE INDEX IF NOT EXISTS idx_order_state_order_no ON order_state(order_no)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """
+
+    def _column_exists(self, table_name: str, column_name: str) -> bool:
+        """컬럼 존재 여부 확인 (구버전 MySQL 호환)."""
+        result = self.execute_query(
+            """
+            SELECT COUNT(*) as cnt
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s AND column_name = %s
+            """,
+            (self.config.database, table_name, column_name),
+            fetch_one=True
+        )
+        return bool(result and result.get("cnt", 0) > 0)
+
+    def _index_exists(self, table_name: str, index_name: str) -> bool:
+        """인덱스 존재 여부 확인 (구버전 MySQL 호환)."""
+        result = self.execute_query(
+            """
+            SELECT COUNT(*) as cnt
+            FROM information_schema.statistics
+            WHERE table_schema = %s AND table_name = %s AND index_name = %s
+            """,
+            (self.config.database, table_name, index_name),
+            fetch_one=True
+        )
+        return bool(result and result.get("cnt", 0) > 0)
+
+    def _ensure_columns(self, cursor) -> None:
+        """필수 컬럼을 존재할 때만 안전하게 추가합니다."""
+        column_specs = [
+            ("positions", "mode", "VARCHAR(16) NOT NULL DEFAULT 'PAPER'"),
+            ("trades", "mode", "VARCHAR(16) NOT NULL DEFAULT 'PAPER'"),
+            ("trades", "idempotency_key", "VARCHAR(128) NULL"),
+            ("account_snapshots", "mode", "VARCHAR(16) NOT NULL DEFAULT 'PAPER'"),
+        ]
+
+        for table_name, column_name, column_ddl in column_specs:
+            try:
+                if self._column_exists(table_name, column_name):
+                    continue
+                cursor.execute(
+                    f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_ddl}"
+                )
+            except MySQLError as e:
+                logger.warning(
+                    f"[DB] 컬럼 마이그레이션 건너뜀: {table_name}.{column_name} ({e})"
+                )
+
+    def _ensure_indexes(self, cursor) -> None:
+        """필수 인덱스를 존재할 때만 안전하게 생성합니다."""
+        index_specs = [
+            ("positions", "idx_positions_status", "CREATE INDEX idx_positions_status ON positions(status)"),
+            ("positions", "idx_positions_mode_status", "CREATE INDEX idx_positions_mode_status ON positions(mode, status)"),
+            ("trades", "idx_trades_symbol", "CREATE INDEX idx_trades_symbol ON trades(symbol)"),
+            ("trades", "idx_trades_executed_at", "CREATE INDEX idx_trades_executed_at ON trades(executed_at)"),
+            ("trades", "idx_trades_side", "CREATE INDEX idx_trades_side ON trades(side)"),
+            ("trades", "idx_trades_mode_executed_at", "CREATE INDEX idx_trades_mode_executed_at ON trades(mode, executed_at)"),
+            ("trades", "uq_trades_idempotency_key", "CREATE UNIQUE INDEX uq_trades_idempotency_key ON trades(idempotency_key)"),
+            ("account_snapshots", "idx_snapshots_time", "CREATE INDEX idx_snapshots_time ON account_snapshots(snapshot_time)"),
+            ("account_snapshots", "idx_snapshots_mode_time", "CREATE INDEX idx_snapshots_mode_time ON account_snapshots(mode, snapshot_time)"),
+            ("order_state", "idx_order_state_mode_status", "CREATE INDEX idx_order_state_mode_status ON order_state(mode, status)"),
+            ("order_state", "idx_order_state_order_no", "CREATE INDEX idx_order_state_order_no ON order_state(order_no)"),
+        ]
+
+        for table_name, index_name, ddl in index_specs:
+            try:
+                if self._index_exists(table_name, index_name):
+                    continue
+                cursor.execute(ddl)
+            except MySQLError as e:
+                logger.warning(f"[DB] 인덱스 생성 건너뜀: {index_name} ({e})")
     
     def table_exists(self, table_name: str) -> bool:
         """테이블 존재 여부 확인"""
