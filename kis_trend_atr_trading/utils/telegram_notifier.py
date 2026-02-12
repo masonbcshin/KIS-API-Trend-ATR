@@ -627,15 +627,25 @@ class TelegramNotifier:
         Returns:
             bool: 전송 성공 여부
         """
-        message = MESSAGE_TEMPLATES["buy_order"].format(
-            stock_code=stock_code,
-            price=int(price),
-            quantity=quantity,
-            stop_loss=int(stop_loss),
-            take_profit=int(take_profit),
-            timestamp=self._get_timestamp()
-        )
-        return self.send_message(message)
+        try:
+            message = MESSAGE_TEMPLATES["buy_order"].format(
+                stock_code=stock_code,
+                price=int(float(price)),
+                quantity=int(quantity),
+                stop_loss=int(float(stop_loss)),
+                take_profit=int(float(take_profit)),
+                timestamp=self._get_timestamp()
+            )
+            return self.send_message(message)
+        except Exception as e:
+            logger.error(f"[TELEGRAM] 매수 알림 포맷 실패: {e}")
+            # 포맷 실패 시 단순 텍스트로 폴백
+            fallback = (
+                f"[BUY] {stock_code} {quantity}주 체결 "
+                f"price={price}, stop={stop_loss}, take={take_profit}, "
+                f"time={self._get_timestamp()}"
+            )
+            return self.send_message(fallback, parse_mode=None)
     
     def notify_sell_order(
         self,

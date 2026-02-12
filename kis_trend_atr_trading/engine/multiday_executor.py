@@ -470,14 +470,17 @@ class MultidayExecutor:
                     "signal_price": signal.price  # 신호가도 기록
                 })
                 
-                # 텔레그램 알림 (실제 체결가)
-                self.telegram.notify_buy_order(
-                    stock_code=self.stock_code,
-                    price=actual_price,
-                    quantity=actual_qty,
-                    stop_loss=actual_stop_loss,
-                    take_profit=actual_take_profit
-                )
+                # 텔레그램 알림 실패가 주문 성공 흐름을 깨지 않도록 분리
+                try:
+                    self.telegram.notify_buy_order(
+                        stock_code=self.stock_code,
+                        price=actual_price,
+                        quantity=actual_qty,
+                        stop_loss=actual_stop_loss,
+                        take_profit=actual_take_profit
+                    )
+                except Exception as notify_err:
+                    logger.warning(f"매수 알림 전송 실패(주문은 성공): {notify_err}")
                 
                 logger.info(f"매수 체결 완료: {sync_result.order_no} @ {actual_price:,.0f}원")
                 
@@ -505,9 +508,12 @@ class MultidayExecutor:
                     
                     self._save_position_on_exit()
                     
-                    self.telegram.notify_warning(
-                        f"부분 체결: {self.stock_code} {sync_result.exec_qty}/{self.order_quantity}주 @ {actual_price:,.0f}원"
-                    )
+                    try:
+                        self.telegram.notify_warning(
+                            f"부분 체결: {self.stock_code} {sync_result.exec_qty}/{self.order_quantity}주 @ {actual_price:,.0f}원"
+                        )
+                    except Exception as notify_err:
+                        logger.warning(f"부분체결 알림 전송 실패: {notify_err}")
                     
                     logger.warning(f"부분 체결: {sync_result.exec_qty}/{self.order_quantity}주")
                 
@@ -528,7 +534,7 @@ class MultidayExecutor:
                 }
             
         except Exception as e:
-            logger.error(f"매수 주문 에러: {e}")
+            logger.exception(f"매수 주문 에러: {e}")
             self.telegram.notify_error("매수 주문 실패", str(e))
             return {"success": False, "message": str(e)}
     
