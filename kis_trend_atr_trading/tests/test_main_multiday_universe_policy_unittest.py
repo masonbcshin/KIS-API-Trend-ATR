@@ -90,15 +90,6 @@ class _DummyAPI:
         return "token"
 
 
-class _DummySelector:
-    def __init__(self):
-        self.config = types.SimpleNamespace(selection_method="combined")
-        self.cache_file = Path("/tmp/universe_cache.json")
-
-    def select(self):
-        return ["005930", "000660"]
-
-
 class _DummyLock:
     is_acquired = False
 
@@ -106,25 +97,51 @@ class _DummyLock:
         return None
 
 
+class _DummyUniverseService:
+    holdings = []
+    universe = []
+    max_positions = 10
+
+    def __init__(self, yaml_path, kis_client):
+        self.yaml_path = yaml_path
+        self.kis_client = kis_client
+        self.policy = types.SimpleNamespace(
+            selection_method="combined",
+            cache_file=Path("/tmp/universe_cache.json"),
+            max_positions=self.__class__.max_positions,
+        )
+
+    def load_holdings_symbols(self):
+        return list(self.__class__.holdings)
+
+    def get_or_create_todays_universe(self, trade_date):
+        return list(self.__class__.universe)
+
+    def compute_entry_candidates(self, holdings, todays_universe):
+        h = set(holdings)
+        return [s for s in todays_universe if s not in h]
+
+
 class _DummyExecutor:
     created_symbols = []
     run_once_calls = []
-    risk_manager_ids = []
+    entry_controls = []
+    holdings_symbols = set()
 
     def __init__(self, *args, **kwargs):
-        self.stock_code = kwargs["stock_code"]
-        self.strategy = types.SimpleNamespace(has_position=False)
-        _DummyExecutor.created_symbols.append(self.stock_code)
-        _DummyExecutor.risk_manager_ids.append(id(kwargs.get("risk_manager")))
+        symbol = kwargs["stock_code"]
+        self.stock_code = symbol
+        self.strategy = types.SimpleNamespace(has_position=symbol in self.__class__.holdings_symbols)
+        self.__class__.created_symbols.append(symbol)
 
     def set_entry_control(self, allow_entry, reason):
-        return None
+        self.__class__.entry_controls.append((self.stock_code, allow_entry, reason))
 
     def restore_position_on_start(self):
-        return False
+        return self.strategy.has_position
 
     def run_once(self):
-        _DummyExecutor.run_once_calls.append(self.stock_code)
+        self.__class__.run_once_calls.append(self.stock_code)
 
     def get_daily_summary(self):
         return {"total_trades": 0, "total_pnl": 0}
@@ -133,19 +150,26 @@ class _DummyExecutor:
         return None
 
 
-class TestMainMultidayMultiSymbols(unittest.TestCase):
-    def test_run_trade_executes_all_selected_symbols_once(self):
+class TestMainMultidayUniversePolicy(unittest.TestCase):
+    def setUp(self):
         _DummyExecutor.created_symbols = []
         _DummyExecutor.run_once_calls = []
-        _DummyExecutor.risk_manager_ids = []
-        selector = _DummySelector()
+        _DummyExecutor.entry_controls = []
+        _DummyExecutor.holdings_symbols = set()
+
+    def test_holdings_are_managed_even_if_not_in_todays_universe(self):
+        _DummyUniverseService.holdings = ["999999"]
+        _DummyUniverseService.universe = ["111111"]
+        _DummyUniverseService.max_positions = 10
+        _DummyExecutor.holdings_symbols = {"999999"}
 
         with patch.object(main_multiday, "KISApi", _DummyAPI), \
+             patch.object(main_multiday, "UniverseService", _DummyUniverseService), \
              patch.object(main_multiday, "MultidayExecutor", _DummyExecutor), \
              patch.object(main_multiday, "MultidayTrendATRStrategy", lambda: object()), \
-             patch.object(main_multiday.UniverseSelector, "from_yaml", return_value=selector), \
              patch.object(main_multiday, "get_trading_mode", return_value="PAPER"), \
              patch.object(main_multiday, "get_instance_lock", return_value=_DummyLock()), \
+             patch.object(main_multiday, "create_risk_manager_from_settings", return_value=object()), \
              patch.object(main_multiday.settings, "validate_settings", return_value=True), \
              patch.object(main_multiday.settings, "get_settings_summary", return_value=""):
             main_multiday.run_trade(
@@ -154,9 +178,34 @@ class TestMainMultidayMultiSymbols(unittest.TestCase):
                 max_runs=1,
             )
 
-        self.assertEqual(_DummyExecutor.created_symbols, ["005930", "000660"])
-        self.assertEqual(_DummyExecutor.run_once_calls, ["005930", "000660"])
-        self.assertEqual(len(set(_DummyExecutor.risk_manager_ids)), 1)
+        self.assertEqual(_DummyExecutor.created_symbols, ["999999", "111111"])
+        self.assertEqual(_DummyExecutor.run_once_calls, ["999999", "111111"])
+
+    def test_entry_is_blocked_when_max_positions_reached(self):
+        _DummyUniverseService.holdings = ["999999"]
+        _DummyUniverseService.universe = ["111111"]
+        _DummyUniverseService.max_positions = 1
+        _DummyExecutor.holdings_symbols = {"999999"}
+
+        with patch.object(main_multiday, "KISApi", _DummyAPI), \
+             patch.object(main_multiday, "UniverseService", _DummyUniverseService), \
+             patch.object(main_multiday, "MultidayExecutor", _DummyExecutor), \
+             patch.object(main_multiday, "MultidayTrendATRStrategy", lambda: object()), \
+             patch.object(main_multiday, "get_trading_mode", return_value="PAPER"), \
+             patch.object(main_multiday, "get_instance_lock", return_value=_DummyLock()), \
+             patch.object(main_multiday, "create_risk_manager_from_settings", return_value=object()), \
+             patch.object(main_multiday.settings, "validate_settings", return_value=True), \
+             patch.object(main_multiday.settings, "get_settings_summary", return_value=""):
+            main_multiday.run_trade(
+                stock_code=main_multiday.settings.DEFAULT_STOCK_CODE,
+                interval=0,
+                max_runs=1,
+            )
+
+        blocked = [x for x in _DummyExecutor.entry_controls if x[0] == "111111"]
+        self.assertTrue(blocked)
+        self.assertFalse(blocked[-1][1])
+        self.assertIn("max_positions reached", blocked[-1][2])
 
 
 if __name__ == "__main__":
