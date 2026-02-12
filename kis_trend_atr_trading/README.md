@@ -1,433 +1,441 @@
-# KIS Trend-ATR Trading System
+# KIS Trend-ATR Trading System 운영 매뉴얼
 
-한국투자증권(KIS) Open API를 활용한 **Trend + ATR 기반 자동매매 시스템**입니다.
+이 문서는 `kis_trend_atr_trading`의 **운영 기준 문서**입니다.
+목적은 다음 4가지입니다.
 
-> ⚠️ **주의: 이 시스템은 모의투자 전용입니다. 실계좌 사용을 절대 금지합니다.**
+- 신규 개발자가 구조를 빠르게 이해
+- 운영자가 장애 시 원인 추적
+- PAPER -> REAL 전환 체크리스트 제공
+- Universe 선정/재시작 정책을 코드 기준으로 명확화
 
----
-
-## 📋 목차
-
-- [개요](#개요)
-- [전략 설명](#전략-설명)
-- [프로젝트 구조](#프로젝트-구조)
-- [설치 방법](#설치-방법)
-- [설정](#설정)
-- [실행 방법](#실행-방법)
-- [주의사항](#주의사항)
+> 경고
+> - 이 문서는 2026-02-12 기준 `main_multiday.py` 실행 경로를 기준으로 작성됨
+> - 코드와 불일치하는 절차를 임의로 추가하지 마십시오
 
 ---
 
-## 개요
+## 1️⃣ 시스템 개요
 
-이 시스템은 **추세 추종(Trend Following)** 전략과 **ATR(Average True Range)** 기반의 변동성 손절/익절을 결합한 주식 자동매매 시스템입니다.
+### 전략 개요 (Trend + ATR)
 
-### 주요 특징
+- 전략 클래스: `strategy/multiday_trend_atr.py`
+- 진입: 추세 + 돌파 + 변동성 조건
+- 청산: ATR 손절/익절, 트레일링, 추세 붕괴, 갭 보호
+- 멀티데이 보유를 전제로 하며, 시간기반 EOD 강제청산 로직을 사용하지 않음
 
-- 🎯 **Trend + ATR 전략**: 추세와 변동성을 함께 고려
-- 📊 **백테스트 기능**: 과거 데이터로 전략 검증
-- 🔒 **모의투자 전용**: 실계좌 사용 차단
-- 🛡️ **리스크 관리**: ATR 기반 동적 손절/익절, 일일 손실 한도, 킬 스위치
-- 📱 **텔레그램 알림**: 실시간 거래/리스크 알림
-- 📈 **단일 종목 집중**: 확장 가능한 구조
+### 지원 모드 (PAPER / REAL)
 
----
+- 트레이딩 모드 판별: `env.py` (`get_trading_mode()`)
+- 허용값: `PAPER`, `REAL`
+- 기본값: `PAPER`
+- `TRADING_MODE`가 허용값 외 값이면 시작 실패
+- `.env`와 런타임 환경변수 `TRADING_MODE` 불일치 시 시작 실패
 
-## 전략 설명
+### 서버 환경 (GCP e2-micro 기준)
 
-### Trend-ATR 전략 개요
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Trend-ATR 전략                           │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  [추세 판단]                                                │
-│    • 종가 > 50일 이동평균 → 상승 추세 ✅                    │
-│    • 종가 < 50일 이동평균 → 하락 추세 ❌                    │
-│                                                             │
-│  [진입 조건]                                                │
-│    • 상승 추세 확인                                         │
-│    • 직전 캔들 고가 돌파                                    │
-│    • 포지션 미보유 상태                                     │
-│                                                             │
-│  [손절/익절]                                                │
-│    • 손절가 = 진입가 - (ATR × 2.0)                         │
-│    • 익절가 = 진입가 + (ATR × 3.0)                         │
-│                                                             │
-│  [포지션 관리]                                              │
-│    • 포지션 보유 중 추가 진입 금지                          │
-│    • 손절 또는 익절 도달 시 청산                            │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### ATR(Average True Range)이란?
-
-ATR은 변동성을 측정하는 기술적 지표입니다:
-
-```
-True Range = MAX(
-    고가 - 저가,
-    |고가 - 전일 종가|,
-    |저가 - 전일 종가|
-)
-
-ATR = True Range의 14일 이동평균
-```
-
-### 왜 ATR을 사용하는가?
-
-1. **변동성에 따른 동적 손절/익절**: 변동성이 큰 종목은 넓은 손절폭, 작은 종목은 좁은 손절폭
-2. **시장 적응력**: 변동성 변화에 자동으로 대응
-3. **리스크 표준화**: 다양한 종목에 일관된 리스크 관리 가능
+- 기준 사양: vCPU 2 / RAM 1GB
+- DB 커넥션 풀 상한: `pool_size <= 5` (`db/mysql.py`)
+- 로그 로테이션: 파일당 10MB, 백업 10개 (`utils/logger.py`)
+- 단일 인스턴스 락 사용: `data/instance.lock` + stale timeout 기본 3600초 (`engine/order_synchronizer.py`)
 
 ---
 
-## 프로젝트 구조
+## 2️⃣ 전체 아키텍처
 
+### 모듈 구조
+
+- `main_multiday.py`: 엔트리포인트, CLI 파싱, 모드 검증, Universe 선정, 실행 시작
+- `engine/multiday_executor.py`: 전략 실행 루프, 주문 실행, 재시작 복원, 네트워크 단절 대응
+- `engine/order_synchronizer.py`: 주문 동기화, idempotency, `order_state` 복구, 단일 인스턴스 락
+- `engine/risk_manager.py`: 손실 한도/킬스위치
+- `api/kis_api.py`: KIS API 호출, timeout/retry/backoff, 토큰 관리, 체결 대기
+- `universe/universe_selector.py`: 장전 Universe 1회 선정 + 장중 캐시 재사용
+- `db/mysql.py`, `db/repository.py`: 트랜잭션/스키마/레코드 저장
+- `utils/logger.py`, `utils/telegram_notifier.py`: 로그/알림
+
+### 주문 흐름 다이어그램
+
+```text
+[Signal 생성]
+   -> [RiskManager 주문 허용 검사]
+   -> [OrderSynchronizer idempotency key 생성]
+   -> [order_state=PENDING upsert]
+   -> [KIS 주문 전송]
+   -> [order_state=SUBMITTED upsert]
+   -> [wait_for_execution() 체결 대기]
+      -> FILLED  : order_state=FILLED, 포지션/거래 반영
+      -> PARTIAL : order_state=PARTIAL, 부분체결 수량 반영
+      -> TIMEOUT/CANCELLED: order_state=CANCELLED/실패 처리
 ```
-kis_trend_atr_trading/
-├── config/
-│   ├── __init__.py
-│   └── settings.py          # 시스템 설정 (API URL, 전략 파라미터)
-├── api/
-│   ├── __init__.py
-│   └── kis_api.py           # KIS Open API 클라이언트
-├── strategy/
-│   ├── __init__.py
-│   └── trend_atr.py         # Trend-ATR 전략 구현
-├── engine/
-│   ├── __init__.py
-│   ├── executor.py          # 거래 실행 엔진
-│   └── risk_manager.py      # 리스크 관리 모듈
-├── backtest/
-│   ├── __init__.py
-│   └── backtester.py        # 백테스트 모듈
-├── utils/
-│   ├── __init__.py
-│   ├── logger.py            # 로깅 유틸리티
-│   └── telegram_notifier.py # 텔레그램 알림 모듈
-├── logs/                    # 로그 파일 저장 디렉토리
-├── main.py                  # 메인 실행 파일
-├── requirements.txt         # 의존성 패키지 목록
-├── .env.example             # 환경변수 예시 파일
-└── README.md                # 이 파일
+
+### UniverseSelector 동작 흐름
+
+```text
+[select() 호출]
+   -> 장중(09:00~15:30 KST)?
+      -> Yes: 오늘 cache(date==today) 있으면 재사용
+             없으면 fallback 정책 수행
+      -> No : selection_method 기반 재선정 후 cache 저장
+
+selection_method:
+  fixed      -> stocks[:max_stocks]
+  volume_top -> 거래대금 상위 + 안전필터
+  atr_filter -> 후보풀(설정) + ATR% 필터
+  combined   -> volume_top(max*3) -> ATR 필터 -> max_stocks
 ```
 
 ---
 
-## 설치 방법
+## 3️⃣ 실행 흐름
 
-### 1. 저장소 클론
+### 장 시작 전
+
+1. `TRADING_MODE`/환경 검증 (`validate_environment()`)
+2. REAL이면 `--confirm-real-trading` 필수 + 10초 경고 대기
+3. API 토큰 발급
+4. Universe 선정 1회 (`UniverseSelector.select()`)
+5. `MultidayExecutor` 생성
+6. 포지션 복원 (`restore_position_on_start()`)
+
+### 장중
+
+- `run_once()` 주기 실행 (최소 60초, 손절 근접 시 15초)
+- 시세/일봉 조회 -> 시그널 계산 -> 주문 동기화 실행
+- 네트워크 단절이 60초 이상이면 해당 사이클에서 거래 중단
+- 장중 재시작 시 Universe 재계산 금지(캐시 재사용)
+
+### 장 종료 후
+
+- 강제청산 없음
+- 포지션이 있으면 `data/positions.json`에 저장 유지
+- 프로세스 종료 시 일일 요약 로그/알림
+
+### 재시작 시 동작
+
+- 단일 인스턴스 락 확인
+- `order_state`에서 `PENDING/SUBMITTED/PARTIAL` 조회
+- 포지션 복원:
+  - PAPER: 저장 파일(`positions.json`) 기준
+  - REAL: 실계좌 보유 조회 + 저장 데이터 대조 + DB 포지션 동기화
+
+---
+
+## 4️⃣ Universe 선정 로직
+
+설정 파일: `config/universe.yaml`
+
+### fixed
+
+- 구현 상태: 사용 중
+- 동작: `stocks` 목록에서 순서 유지, `max_stocks`까지만 사용
+- 회귀 테스트: `tests/test_universe_selector_unittest.py`
+
+### volume_top
+
+- 구현 상태: 사용 중
+- 1차 후보: `candidate_stocks` 또는 `stocks`, 없으면 KOSPI200 seed
+- 거래대금 기준 정렬
+- 필터:
+  - `min_volume`
+  - `min_market_cap` (시총값 존재 시만 적용)
+  - 거래정지 제외 (`is_suspended`)
+  - 관리종목 제외 (`is_management`, 설정값 반영)
+  - 시가 대비 변동률 절대값 28% 이상 제외
+- API 호출 최적화:
+  - `get_market_snapshot_bulk`가 있으면 bulk 우선
+  - 없으면 snapshot 반복 조회 + 주기적 sleep
+
+### atr_filter
+
+- 구현 상태: 사용 중
+- 후보풀(`candidate_pool_mode`): `kospi200 | yaml | volume_top`
+- ATR 비율 계산: `(ATR / 종가) * 100`
+- 필터: `min_atr_pct <= ratio <= max_atr_pct`
+- 제외 조건:
+  - 최근 데이터 20개 미만
+  - 종가 `<= 0`
+
+### combined
+
+- 구현 상태: 사용 중
+- 단계:
+  1. `volume_top(max_stocks * 3)`
+  2. ATR 필터 적용
+  3. `max_stocks`로 최종 제한
+
+### 캐싱 구조
+
+파일: `data/universe_cache.json`
+
+저장 필드:
+
+- `date`
+- `stocks`
+- `selection_method`
+
+정책:
+
+- 장전: 재계산 후 캐시 갱신
+- 장중 재시작: 캐시 재사용
+
+### fallback 정책
+
+- 자동선정 실패 시 `fixed`로 fallback 가능 (`fallback_to_fixed=true`)
+- REAL에서 fallback 발생 시 콘솔 경고 + 10초 대기
+- `halt_on_fallback_in_real=true`면 REAL에서 fallback 즉시 거래 중단
+
+### 강제 제약
+
+- 중복 종목 제거
+- 종목코드 6자리 숫자 검증
+- `max_stocks` 초과 금지
+- 최종 0종목이면 예외로 거래 중단
+
+---
+
+## 5️⃣ 안전 설계
+
+### PAPER 모드 이중 안전장치
+
+- `TRADING_MODE` 기본값은 PAPER (`env.py`)
+- PAPER 경로에서 `assert_not_real_mode()` 실행
+- REAL 실행은 `--confirm-real-trading` 없으면 즉시 종료
+- PAPER 모드에서 실계좌 전용 키(`REAL_KIS_*`)가 감지되면 시작 종료
+
+### idempotency key
+
+- 생성 위치: `engine/order_synchronizer.py`
+- 규칙: `mode|side|stock_code|quantity|signal_id` SHA-256
+- 저장: `order_state.idempotency_key` unique key
+- 거래 기록: `trades.idempotency_key` unique index
+
+### DB 트랜잭션
+
+- `autocommit=False`
+- 트랜잭션 컨텍스트에서 commit/rollback 명시
+- 세션 시작 시 `READ COMMITTED` 설정
+
+### Race condition 방지
+
+- 현재 적용:
+  - 단일 인스턴스 파일락
+  - idempotency unique 제약
+- 현재 미적용:
+  - `SELECT ... FOR UPDATE`
+  - optimistic locking version column
+- 운영 권고:
+  - 실계좌 전에는 단일 프로세스/단일 서비스로만 운용
+
+### API retry 정책
+
+- 일반 API: 최대 3회, exponential backoff (`RETRY_DELAY * 2^attempt`)
+- 주문 API: 중복 주문 위험 때문에 재시도 0회 강제
+
+---
+
+## 6️⃣ 예외 처리
+
+### API 타임아웃
+
+- HTTP timeout: `API_TIMEOUT=15`초
+- 일반 API는 최대 3회 재시도
+- 주문은 1회 호출 후 체결 대기로 상태 확인
+
+### 네트워크 단절
+
+- 요청 실패 시 단절 시작 시각 기록
+- 60초 이상 단절이면 실행 사이클에서 거래 중단 에러 반환
+- 네트워크 복구 감지 시 단절 시간 로그
+
+### 토큰 재발급
+
+- 토큰 락(`threading.Lock`)으로 동시 갱신 충돌 방지
+- 당일(KST 기준 date) 재사용/재발급 관리
+- 만료 10분 전 또는 날짜 변경 시 재발급
+- 재발급 실패 시 API 예외로 상위 로직에 전파
+
+### 데이터 이상
+
+- 현재가 `<= 0`이면 주문 로직 진행 안 함
+- Universe snapshot에서 `price==0`은 후보 제외
+- ATR 계산 시 종가 `<=0` 또는 데이터 부족이면 제외
+
+---
+
+## 7️⃣ 재시작 복구 전략
+
+### open_orders / pending / partial 복구
+
+- `order_state` 테이블에서 `PENDING/SUBMITTED/PARTIAL` 조회
+- 프로그램 시작 직후 복구 대상 건수 로그 출력
+
+### partial fill 복구
+
+- 체결 대기 타임아웃 후 부분체결이면 미체결 취소 시도
+- `order_state`에 `PARTIAL` 상태와 잔여수량 저장
+
+### 중복 주문 방지
+
+- 동일 signal_id 기반 idempotency key 재생성
+- 기존 상태가 `PENDING/SUBMITTED/PARTIAL/FILLED`면 신규 주문 차단
+
+### 포지션 정합성
+
+- 저장소: `data/positions.json`
+- REAL 모드: 실계좌 보유와 저장 포지션 비교
+  - 불일치 시 경고/정리/중단 액션 분기
+  - DB `positions`를 실계좌 기준으로 upsert/close 동기화
+
+---
+
+## 8️⃣ 로그 및 감사 추적
+
+### 필수 로그 항목
+
+- 전략 시그널 (`BUY/SELL/HOLD`, 사유)
+- 주문 시도/성공/실패
+- 체결 대기/부분체결/취소
+- Universe 단계별 후보 수와 최종 종목
+- 시작 시점 git commit hash
+
+### 로그 레벨 정책
+
+- PAPER: INFO
+- REAL: INFO
+- 파일 로그: `~/auto-trade/logs` (기본, `AUTO_TRADE_LOG_DIR`로 변경 가능)
+- 로테이션: 10MB x 10개
+
+### 에러 알림
+
+- ERROR 경로에서 Telegram 알림 전송 (`notify_error`)
+- Slack 연동은 현재 코드 경로에 없음
+
+### 감사 추적
+
+- `order_state`에 `order_no`, `fill_id`, `status` 저장
+- `trades`, `account_snapshots` 테이블 존재
+- 보조 감사 로그: `logs/audit/audit_YYYYMMDD.json`
+
+---
+
+## 9️⃣ 5거래일 검증 절차
+
+아래는 운영 전 리허설 기준입니다.
+
+### Day1 정상 매수/매도
+
+- 목표: 기본 주문 사이클 확인
+- 자동 테스트: 부분 가능
+  - `python -m pytest kis_trend_atr_trading/tests/test_integration.py -q`
+
+### Day2 손절 트리거
+
+- 목표: 손절 시그널과 청산 흐름 확인
+- 자동 테스트: 부분 가능
+  - `python -m pytest kis_trend_atr_trading/tests/test_integration.py::TestCompleteTradingCycle::test_stop_loss_cycle -q`
+
+### Day3 장중 재시작
+
+- 목표: 재시작 후 포지션/미종결 주문 정합성 확인
+- 자동 테스트: 부분 가능
+  - `python -m pytest kis_trend_atr_trading/tests/test_executor.py::TestPositionRecognitionAfterRestart::test_position_lost_after_restart_simulation -q`
+- 운영 점검(수동):
+  - 장중 프로세스 재시작 후 Universe가 캐시 재사용되는지
+  - `order_state` 복구 로그가 출력되는지
+
+### Day4 메모리 압박
+
+- 목표: e2-micro에서 장시간 실행 안정성 확인
+- 자동 테스트: 없음 (수동 필요)
+- 운영 점검(수동):
+  - RSS 메모리, 로그 파일 증가 속도, DB 커넥션 수
+  - 장중 6시간 연속 실행 후 재시작 복구
+
+### Day5 API timeout
+
+- 목표: timeout/retry/backoff 및 거래중단 플래그 확인
+- 자동 테스트: 가능
+  - `python -m pytest kis_trend_atr_trading/tests/test_api.py::TestRetryLogic::test_retry_on_timeout -q`
+
+---
+
+## 🔟 실계좌 전환 체크리스트
+
+아래 항목이 모두 충족되기 전에는 REAL 운용을 시작하지 마십시오.
+
+### 1) 환경변수 점검
+
+- `TRADING_MODE=REAL`
+- `.env`와 런타임 `TRADING_MODE` 일치
+- PAPER 전용/REAL 전용 키 혼재 없음
+
+### 2) 실행 인자 점검
+
+- `--confirm-real-trading` 필수
+- 첫 주문 제한 비율 확인 (`--real-first-order-percent`, 기본 10)
+- 첫날 종목수 제한 활성 확인 (`--real-limit-symbols-first-day`, 기본 활성)
+
+### 3) Universe 설정 점검
+
+- `config/universe.yaml`의 `selection_method` 확인
+- `fallback_to_fixed`, `halt_on_fallback_in_real` 의도대로 설정
+- `data/universe_cache.json` 권한/경로 확인
+
+### 4) DB 점검
+
+- `initialize_schema()` 수행 또는 테이블 존재 확인
+- 특히 `order_state` 존재 확인
+- MySQL 연결/권한/타임존(KST)/격리수준(READ COMMITTED) 확인
+
+### 5) 로그/알림 점검
+
+- `~/auto-trade/logs` 기록 확인
+- Telegram ERROR 알림 수신 확인
+- 시작 로그에 git commit hash 출력 확인
+
+### 6) 첫날 제한 운용 권장
+
+- 종목 1개만 운용
+- 주문 수량은 최대치의 10% 이내
+- 장중 재시작 1회 리허설 후 지속 운용
+
+---
+
+## 실행 명령 예시
+
+### 거래 실행 (PAPER)
 
 ```bash
-git clone <repository-url>
-cd kis_trend_atr_trading
+cd /home/user/KIS-API-Trend-ATR/kis_trend_atr_trading
+TRADING_MODE=PAPER python main_multiday.py --mode trade --interval 60
 ```
 
-### 2. 가상환경 생성 (권장)
+### 거래 실행 (REAL)
 
 ```bash
-python -m venv venv
-
-# Windows
-venv\Scripts\activate
-
-# macOS/Linux
-source venv/bin/activate
+cd /home/user/KIS-API-Trend-ATR/kis_trend_atr_trading
+TRADING_MODE=REAL python main_multiday.py --mode trade \
+  --confirm-real-trading \
+  --real-first-order-percent 10 \
+  --real-limit-symbols-first-day
 ```
 
-### 3. 의존성 설치
+### 핵심 테스트
 
 ```bash
-pip install -r requirements.txt
-```
-
-### 4. 환경변수 설정
-
-```bash
-# .env.example을 .env로 복사
-cp .env.example .env
-
-# .env 파일 수정
-nano .env  # 또는 선호하는 편집기 사용
+python -m unittest kis_trend_atr_trading.tests.test_universe_selector_unittest -v
+python -m pytest kis_trend_atr_trading/tests/test_api.py -q
+python -m pytest kis_trend_atr_trading/tests/test_executor.py::TestPositionRecognitionAfterRestart::test_position_lost_after_restart_simulation -q
 ```
 
 ---
 
-## 설정
+## 운영자가 먼저 확인할 파일
+
+- 실행/안전 가드: `main_multiday.py`, `env.py`
+- 주문 동기화/복구: `engine/order_synchronizer.py`
+- 멀티데이 루프: `engine/multiday_executor.py`
+- Universe 정책: `universe/universe_selector.py`, `config/universe.yaml`
+- DB/스키마: `db/mysql.py`, `db/schema_mysql.sql`
+- 로그/알림: `utils/logger.py`, `utils/telegram_notifier.py`
 
-### 환경변수 (.env)
-
-```env
-# 한국투자증권 모의투자 API 키
-KIS_APP_KEY=your_app_key_here
-KIS_APP_SECRET=your_app_secret_here
-
-# 모의투자 계좌 정보
-KIS_ACCOUNT_NO=12345678
-KIS_ACCOUNT_PRODUCT_CODE=01
-```
-
-### API 키 발급 방법
-
-1. [한국투자증권 Open API 포털](https://apiportal.koreainvestment.com/) 접속
-2. 회원가입 및 로그인
-3. **모의투자** 앱 키 발급 (실전투자 키 사용 금지!)
-4. 발급받은 키를 `.env` 파일에 입력
-
-### 전략 파라미터 (config/settings.py)
-
-```python
-# ATR(Average True Range) 계산 기간
-ATR_PERIOD = 14
-
-# 추세 판단용 이동평균 기간
-TREND_MA_PERIOD = 50
-
-# 손절 배수 (ATR 기준)
-ATR_MULTIPLIER_SL = 2.0
-
-# 익절 배수 (ATR 기준)
-ATR_MULTIPLIER_TP = 3.0
-```
-
----
-
-## 📱 텔레그램 알림 설정
-
-자동매매 시스템의 이벤트를 실시간으로 텔레그램 메시지로 받을 수 있습니다.
-
-### 지원 알림 유형
-
-| 이벤트 | 설명 |
-|--------|------|
-| 📈 매수 주문 | 신규 포지션 진입 시 |
-| 📉 매도 주문 | 포지션 청산 시 |
-| 🛑 손절 청산 | 손절가 도달로 청산 시 |
-| 🎯 익절 청산 | 익절가 도달로 청산 시 |
-| ⚠️ 일일 손실 한도 | 일일 손실 한도 도달 시 |
-| 🚨 킬 스위치 | 긴급 정지 발동 시 |
-| 🚀 시스템 시작 | 자동매매 시작 시 |
-| ⏹️ 시스템 종료 | 자동매매 종료 시 |
-| ❌ 오류 발생 | 시스템 오류 발생 시 |
-
-### 1. 텔레그램 봇 생성
-
-```
-1. 텔레그램에서 @BotFather 검색하여 대화 시작
-2. /newbot 명령어 입력
-3. 봇 이름 입력 (예: KIS Trading Alert)
-4. 봇 사용자명 입력 (예: kis_trading_alert_bot)
-   - 반드시 _bot으로 끝나야 합니다
-5. 발급된 토큰 복사 (예: 1234567890:ABCdefGHIjklMNOpqrsTUVwxyz)
-```
-
-⚠️ **주의: 토큰은 절대 공개하지 마세요!**
-
-### 2. Chat ID 확인
-
-**방법 1: 1:1 채팅**
-```
-1. 생성한 봇 검색하여 대화 시작
-2. /start 메시지 전송
-3. 브라우저에서 아래 URL 접속:
-   https://api.telegram.org/bot<토큰>/getUpdates
-4. 응답에서 "chat":{"id":XXXXXXXX} 부분의 숫자가 Chat ID
-```
-
-**방법 2: 그룹 채팅**
-```
-1. 봇을 그룹에 추가
-2. 그룹에서 아무 메시지 전송
-3. 위와 동일하게 getUpdates로 chat_id 확인
-   (그룹 ID는 음수입니다. 예: -1001234567890)
-```
-
-### 3. 환경변수 설정
-
-`.env` 파일에 아래 내용 추가:
-
-```env
-# 텔레그램 봇 토큰
-TELEGRAM_BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz
-
-# 텔레그램 채팅 ID (개인 또는 그룹)
-TELEGRAM_CHAT_ID=123456789
-
-# 텔레그램 알림 활성화 (true/false)
-TELEGRAM_ENABLED=true
-```
-
-### 4. 연결 테스트
-
-```python
-from utils.telegram_notifier import get_telegram_notifier
-
-notifier = get_telegram_notifier()
-notifier.test_connection()  # 테스트 메시지가 전송됩니다
-```
-
-### 5. 텔레그램 메시지 예시
-
-**매수 주문 체결**
-```
-📈 매수 주문 체결
-━━━━━━━━━━━━━━━━━━
-• 종목: 005930
-• 체결가: 70,000원
-• 수량: 10주
-• 손절가: 67,000원
-• 익절가: 79,000원
-━━━━━━━━━━━━━━━━━━
-⏰ 2024-01-15 14:30:25
-```
-
-**손절 청산**
-```
-🛑 손절 청산 완료
-━━━━━━━━━━━━━━━━━━
-• 종목: 005930
-• 진입가: 70,000원
-• 청산가: 67,000원
-• 손실: -30,000원 (-4.29%)
-━━━━━━━━━━━━━━━━━━
-💡 손절 기준에 따라 포지션이 청산되었습니다.
-⏰ 2024-01-16 10:15:42
-```
-
-**일일 손실 한도 도달**
-```
-⚠️ 일일 손실 한도 도달
-━━━━━━━━━━━━━━━━━━
-• 당일 누적 손실: 300,000원
-• 손실률: 3.00%
-• 한도: -3.0%
-━━━━━━━━━━━━━━━━━━
-🔒 신규 주문이 차단되었습니다.
-   기존 포지션 청산만 허용됩니다.
-⏰ 2024-01-17 11:20:33
-```
-
----
-
-## 실행 방법
-
-### 백테스트 실행
-
-과거 데이터를 기반으로 전략 성과를 검증합니다.
-
-```bash
-# 기본 실행 (삼성전자, 365일)
-python main.py --mode backtest
-
-# 종목 지정
-python main.py --mode backtest --stock 005930
-
-# 기간 지정
-python main.py --mode backtest --stock 005930 --days 500
-```
-
-### 모의투자 실행
-
-실시간 시세를 기반으로 모의투자 주문을 실행합니다.
-
-```bash
-# 기본 실행 (60초 간격)
-python main.py --mode trade
-
-# 종목 및 간격 지정
-python main.py --mode trade --stock 005930 --interval 120
-
-# 최대 실행 횟수 지정
-python main.py --mode trade --max-runs 100
-```
-
-### 명령행 옵션
-
-| 옵션 | 설명 | 기본값 |
-|------|------|--------|
-| `--mode` | 실행 모드 (backtest/trade) | 필수 |
-| `--stock` | 종목 코드 | 005930 |
-| `--interval` | 실행 간격 (초) | 60 |
-| `--max-runs` | 최대 실행 횟수 | 무제한 |
-| `--days` | 백테스트 기간 (일) | 365 |
-
----
-
-## 백테스트 결과 해석
-
-```
-═══════════════════════════════════════════════════════════════════
-                    백테스트 결과 요약
-═══════════════════════════════════════════════════════════════════
-📅 기간: 2024-01-01 ~ 2024-12-31
-
-💰 자본금 변화
-   - 초기 자본금:      10,000,000 원
-   - 최종 자본금:      11,234,567 원
-   - 총 수익률:             12.35 %
-
-📊 거래 통계
-   - 총 거래 횟수:          15 회
-   - 승리:                   9 회
-   - 패배:                   6 회
-   - 승률:               60.00 %
-
-📉 리스크 지표
-   - 최대 낙폭(MDD):       8.45 %
-   - 수익 팩터:            1.85
-
-⏱️ 보유 기간
-   - 평균 보유 기간:       12.3 일
-═══════════════════════════════════════════════════════════════════
-```
-
-### 지표 설명
-
-- **총 수익률**: (최종 자본금 - 초기 자본금) / 초기 자본금 × 100
-- **승률**: 수익 거래 / 전체 거래 × 100
-- **최대 낙폭(MDD)**: 고점 대비 최대 하락률
-- **수익 팩터**: 총 수익 / 총 손실 (1 이상이면 수익)
-
----
-
-## 주의사항
-
-### ⚠️ 필수 주의사항
-
-1. **실계좌 사용 절대 금지**
-   - 이 시스템은 모의투자 전용입니다
-   - 실계좌 API 키를 사용하지 마세요
-
-2. **투자 손실 주의**
-   - 백테스트 결과가 미래 수익을 보장하지 않습니다
-   - 모든 투자에는 손실 위험이 있습니다
-
-3. **API Rate Limit**
-   - KIS API는 초당 20회 호출 제한이 있습니다
-   - 시스템이 자동으로 관리하지만, 과도한 요청을 피하세요
-
-4. **초단타 금지**
-   - 1분 미만 간격의 거래는 지원하지 않습니다
-   - 최소 실행 간격은 60초입니다
-
-### 🔒 보안 주의사항
-
-1. `.env` 파일을 Git에 커밋하지 마세요
-2. API 키를 공개 저장소에 노출하지 마세요
-3. 정기적으로 API 키를 갱신하세요
-
----
-
-## 라이선스
-
-이 프로젝트는 교육 및 연구 목적으로 제공됩니다.
-실제 투자에 사용하여 발생하는 손실에 대해 개발자는 책임지지 않습니다.
-
----
-
-## 문의
-
-문제가 발생하거나 개선 사항이 있으면 Issue를 등록해 주세요.
