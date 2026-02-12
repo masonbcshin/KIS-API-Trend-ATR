@@ -2,12 +2,37 @@ import json
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
+import types
+import datetime as dt
+
+try:
+    import pytz  # noqa: F401
+except ModuleNotFoundError:
+    # 테스트 환경 최소 의존성 보강 (localize 지원)
+    class _FakeKST(dt.tzinfo):
+        def utcoffset(self, _dt):
+            return dt.timedelta(hours=9)
+
+        def dst(self, _dt):
+            return dt.timedelta(0)
+
+        def tzname(self, _dt):
+            return "KST"
+
+        def localize(self, value):
+            return value.replace(tzinfo=self)
+
+    fake_pytz = types.ModuleType("pytz")
+    fake_pytz.timezone = lambda _name: _FakeKST()
+    sys.modules["pytz"] = fake_pytz
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "universe"))
 from universe_selector import UniverseSelectionConfig, UniverseSelector  # type: ignore
+from utils.market_hours import KST
 
 
 class _DummyKIS:
@@ -61,6 +86,66 @@ class UniverseSelectorFixedTests(unittest.TestCase):
             self.assertIn("date", payload)
             self.assertEqual(payload["stocks"], ["005930"])
             self.assertIn("selection_method", payload)
+
+    def test_combined_refresh_on_restart_rebuilds_cached_single_symbol(self):
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = Path(td) / "universe_cache.json"
+            today = datetime.now(KST)
+            cache_path.write_text(
+                json.dumps(
+                    {
+                        "date": today.strftime("%Y-%m-%d"),
+                        "stocks": ["005930"],
+                        "selection_method": "combined",
+                        "saved_at": (today - timedelta(minutes=30)).isoformat(),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            cfg = UniverseSelectionConfig(
+                selection_method="combined",
+                max_stocks=3,
+                universe_cache_file=str(cache_path),
+                cache_refresh_enabled=True,
+                cache_refresh_on_restart=True,
+                cache_refresh_methods=["combined"],
+            )
+            selector = UniverseSelector(config=cfg, kis_client=_DummyKIS(), db=None)
+            selector._is_market_hours = lambda now: True  # type: ignore
+            selector._select_combined = lambda: ["005930", "000660", "035420"]  # type: ignore
+            selected = selector.select()
+            self.assertEqual(selected, ["005930", "000660", "035420"])
+
+    def test_combined_cache_can_stay_fixed_when_refresh_disabled(self):
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = Path(td) / "universe_cache.json"
+            today = datetime.now(KST)
+            cache_path.write_text(
+                json.dumps(
+                    {
+                        "date": today.strftime("%Y-%m-%d"),
+                        "stocks": ["005930"],
+                        "selection_method": "combined",
+                        "saved_at": today.isoformat(),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            cfg = UniverseSelectionConfig(
+                selection_method="combined",
+                max_stocks=3,
+                universe_cache_file=str(cache_path),
+                cache_refresh_enabled=False,
+            )
+            selector = UniverseSelector(config=cfg, kis_client=_DummyKIS(), db=None)
+            selector._is_market_hours = lambda now: True  # type: ignore
+            selector._select_combined = lambda: ["000660", "035420", "051910"]  # type: ignore
+            selected = selector.select()
+            self.assertEqual(selected, ["005930"])
 
 
 if __name__ == "__main__":

@@ -68,6 +68,16 @@ universe:
 
   # Universe 캐시 파일
   universe_cache_file: "data/universe_cache.json"
+
+  # 장중 캐시 리프레시 옵션 (fixed는 영향 없음)
+  cache_refresh_enabled: false
+  cache_refresh_on_restart: false
+  cache_refresh_on_market_open: false
+  cache_refresh_interval_minutes: 0
+  cache_refresh_methods:
+    - "combined"
+    - "volume_top"
+    - "atr_filter"
   
   # ────────────────────────────────────────────────────────────────
   # 고정 종목 리스트 (selection_method: fixed)

@@ -711,11 +711,22 @@ class MultidayTrendATRStrategy:
             take_profit=take_profit or 0,
             pnl_pct=0.0
         )
-        
+
+        def _fmt_num(value: Any) -> str:
+            """로그 포맷 안전화: 숫자 변환 실패 시 원본 문자열 반환."""
+            try:
+                return f"{float(value):,.0f}"
+            except (TypeError, ValueError):
+                return str(value)
+
+        tp_display = "Trailing Only"
+        if take_profit is not None:
+            tp_display = _fmt_num(take_profit)
+
         logger.info(
-            f"[MULTIDAY] 포지션 오픈: {symbol} @ {entry_price:,.0f}원, "
-            f"ATR={atr:,.0f} (고정), SL={stop_loss:,.0f}, "
-            f"TP={take_profit:,.0f if take_profit else 'Trailing Only'}"
+            f"[MULTIDAY] 포지션 오픈: {symbol} @ {_fmt_num(entry_price)}원, "
+            f"ATR={_fmt_num(atr)} (고정), SL={_fmt_num(stop_loss)}원, "
+            f"TP={tp_display}"
         )
         
         return position

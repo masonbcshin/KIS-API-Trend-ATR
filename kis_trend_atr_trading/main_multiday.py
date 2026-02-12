@@ -341,13 +341,25 @@ def run_trade(
 
         # 명시 종목이 기본값이 아닌 경우 해당 1종목만 실행
         run_symbols = list(selected_universe)
+        single_symbol_reason = ""
         if stock_code != settings.DEFAULT_STOCK_CODE:
             if stock_code in selected_universe:
                 run_symbols = [stock_code]
+                single_symbol_reason = f"CLI --stock 지정({stock_code})"
             else:
                 raise RuntimeError(
                     f"명시 종목({stock_code})이 금일 Universe({selected_universe})에 없습니다."
                 )
+        elif len(run_symbols) == 1:
+            single_symbol_reason = "Universe 선정 결과가 1개"
+
+        logger.info(
+            f"[UNIVERSE] executor_symbols={run_symbols}, "
+            f"selection_method={selector.config.selection_method}, "
+            f"cache_file={selector.cache_file}"
+        )
+        if len(run_symbols) == 1:
+            logger.info(f"[UNIVERSE] 단일 종목 실행 사유: {single_symbol_reason or '명시적 제한 없음'}")
 
         def _symbol_position_store(symbol: str) -> PositionStore:
             data_dir = Path(__file__).resolve().parent / "data"

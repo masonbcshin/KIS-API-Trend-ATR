@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -46,6 +46,13 @@ class UniverseSelectionConfig:
     candidate_pool_mode: str = "yaml"  # kospi200 | yaml | volume_top
     candidate_stocks: List[str] = field(default_factory=list)
     stocks: List[str] = field(default_factory=list)
+    cache_refresh_enabled: bool = False
+    cache_refresh_on_restart: bool = False
+    cache_refresh_on_market_open: bool = False
+    cache_refresh_interval_minutes: int = 0
+    cache_refresh_methods: List[str] = field(
+        default_factory=lambda: ["combined", "volume_top", "atr_filter"]
+    )
 
 
 class UniverseSelector:
@@ -85,15 +92,39 @@ class UniverseSelector:
             candidate_pool_mode=str(section.get("candidate_pool_mode", "yaml")).lower(),
             candidate_stocks=[str(x) for x in section.get("candidate_stocks", [])],
             stocks=[str(x) for x in section.get("stocks", [])],
+            cache_refresh_enabled=bool(section.get("cache_refresh_enabled", False)),
+            cache_refresh_on_restart=bool(section.get("cache_refresh_on_restart", False)),
+            cache_refresh_on_market_open=bool(section.get("cache_refresh_on_market_open", False)),
+            cache_refresh_interval_minutes=int(section.get("cache_refresh_interval_minutes", 0)),
+            cache_refresh_methods=[
+                str(x).lower()
+                for x in section.get(
+                    "cache_refresh_methods", ["combined", "volume_top", "atr_filter"]
+                )
+            ],
         )
         return cls(config=cfg, kis_client=kis_client, db=db)
 
     def select(self) -> List[str]:
         now = datetime.now(KST)
+        method = self.config.selection_method
+        logger.info(
+            f"[UNIVERSE] select start: method={method}, cache_file={self.cache_file}, "
+            f"market_hours={self._is_market_hours(now)}"
+        )
         if self._is_market_hours(now):
-            cached = self._load_cache_for_today(now)
-            if cached:
-                logger.info(f"[UNIVERSE] 장중 재시작: 캐시 재사용 {cached}")
+            payload = self._load_cache_payload_for_today(now)
+            if payload:
+                cached = self._finalize(payload.get("stocks") or [])
+                refresh_reason = self._cache_refresh_reason(now, payload)
+                if refresh_reason:
+                    logger.info(f"[UNIVERSE] 캐시 무효화: reason={refresh_reason}")
+                    return self._select_and_cache(now, method_suffix=f"refresh_{refresh_reason}")
+                logger.info(
+                    f"[UNIVERSE] 장중 재시작: 캐시 재사용 {cached} "
+                    f"(cache_key={payload.get('cache_key')}, "
+                    f"cache_date={payload.get('date')}, saved_at={payload.get('saved_at')})"
+                )
                 return cached
             logger.warning("[UNIVERSE] 장중 캐시 없음 - 금일 1회 bootstrap 선정 후 캐시 저장")
             return self._select_and_cache(now, method_suffix="intra_bootstrap")
@@ -119,7 +150,10 @@ class UniverseSelector:
             validated = self._finalize(selected)
             cache_method = method if not method_suffix else f"{method}_{method_suffix}"
             self._save_cache(now, validated, cache_method)
-            logger.info(f"[UNIVERSE] 최종 종목: {validated}")
+            logger.info(
+                f"[UNIVERSE] 최종 종목: {validated} "
+                f"(method={method}, cache_method={cache_method}, cache_file={self.cache_file})"
+            )
             return validated
         except Exception as e:
             logger.exception(f"[UNIVERSE] selection 실패: {e}")
@@ -311,23 +345,64 @@ class UniverseSelector:
             t.hour < 15 or (t.hour == 15 and t.minute < 30)
         )
 
-    def _load_cache_for_today(self, now: datetime) -> List[str]:
+    def _load_cache_payload_for_today(self, now: datetime) -> Dict[str, Any]:
         if not self.cache_file.exists():
-            return []
+            return {}
         try:
             payload = json.loads(self.cache_file.read_text(encoding="utf-8"))
             if payload.get("date") != now.strftime("%Y-%m-%d"):
-                return []
-            stocks = payload.get("stocks") or []
-            return self._finalize(stocks)
+                return {}
+            if not payload.get("saved_at"):
+                payload["saved_at"] = now.isoformat()
+            return payload
         except Exception:
-            return []
+            return {}
+
+    def _cache_refresh_reason(self, now: datetime, payload: Dict[str, Any]) -> str:
+        """
+        장중 캐시 강제 갱신 사유를 반환합니다.
+        빈 문자열이면 캐시 재사용.
+        """
+        method = self.config.selection_method
+        if not self.config.cache_refresh_enabled:
+            return ""
+        if method not in set(self.config.cache_refresh_methods):
+            return ""
+        if method == "fixed":
+            return ""
+
+        if self.config.cache_refresh_on_restart:
+            return "restart"
+
+        if self.config.cache_refresh_on_market_open:
+            if not bool(payload.get("market_open_refreshed", False)):
+                return "market_open"
+
+        interval_min = max(int(self.config.cache_refresh_interval_minutes), 0)
+        if interval_min > 0:
+            saved_at_raw = payload.get("saved_at")
+            saved_at = None
+            if isinstance(saved_at_raw, str):
+                try:
+                    saved_at = datetime.fromisoformat(saved_at_raw)
+                except ValueError:
+                    saved_at = None
+            if saved_at is None:
+                return "interval"
+            if now - saved_at >= timedelta(minutes=interval_min):
+                return "interval"
+
+        return ""
 
     def _save_cache(self, now: datetime, stocks: List[str], method: str) -> None:
+        market_open_refreshed = ("refresh_" in method) or ("intra_bootstrap" in method)
         payload = {
             "date": now.strftime("%Y-%m-%d"),
             "stocks": stocks,
             "selection_method": method,
+            "saved_at": now.isoformat(),
+            "cache_key": now.strftime("%Y-%m-%d"),
+            "market_open_refreshed": market_open_refreshed,
         }
         self.cache_file.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
