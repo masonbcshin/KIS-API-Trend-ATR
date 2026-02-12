@@ -108,6 +108,7 @@ class UniverseSelector:
     def select(self) -> List[str]:
         now = datetime.now(KST)
         method = self.config.selection_method
+        cache_key = now.strftime("%Y-%m-%d")
         logger.info(
             f"[UNIVERSE] select start: method={method}, cache_file={self.cache_file}, "
             f"market_hours={self._is_market_hours(now)}"
@@ -115,21 +116,43 @@ class UniverseSelector:
         if self._is_market_hours(now):
             payload = self._load_cache_payload_for_today(now)
             if payload:
+                cached_method = str(payload.get("selection_method", "")).lower()
+                cached_method_base = cached_method.split("_")[0] if cached_method else ""
+                if cached_method_base != method:
+                    logger.info(
+                        f"[UNIVERSE][CACHE] MISS reason=method_mismatch "
+                        f"(expected={method}, cached={cached_method}, "
+                        f"cache_key={payload.get('cache_key')}, cache_file={self.cache_file})"
+                    )
+                    return self._select_and_cache(now, method_suffix="refresh_method_mismatch")
                 cached = self._finalize(payload.get("stocks") or [])
                 refresh_reason = self._cache_refresh_reason(now, payload)
                 if refresh_reason:
-                    logger.info(f"[UNIVERSE] 캐시 무효화: reason={refresh_reason}")
+                    logger.info(
+                        f"[UNIVERSE][CACHE] MISS reason={refresh_reason} "
+                        f"(method={method}, cache_key={payload.get('cache_key')}, "
+                        f"cache_file={self.cache_file})"
+                    )
                     return self._select_and_cache(now, method_suffix=f"refresh_{refresh_reason}")
                 logger.info(
-                    f"[UNIVERSE] 장중 재시작: 캐시 재사용 {cached} "
-                    f"(cache_key={payload.get('cache_key')}, "
-                    f"cache_date={payload.get('date')}, saved_at={payload.get('saved_at')})"
+                    f"[UNIVERSE][CACHE] HIT stocks={cached} "
+                    f"(method={method}, cached_method={cached_method}, "
+                    f"cache_key={payload.get('cache_key')}, cache_date={payload.get('date')}, "
+                    f"saved_at={payload.get('saved_at')}, cache_file={self.cache_file})"
                 )
                 return cached
+            logger.info(
+                f"[UNIVERSE][CACHE] MISS reason=no_cache "
+                f"(method={method}, cache_key={cache_key}, cache_file={self.cache_file})"
+            )
             logger.warning("[UNIVERSE] 장중 캐시 없음 - 금일 1회 bootstrap 선정 후 캐시 저장")
             return self._select_and_cache(now, method_suffix="intra_bootstrap")
 
         # Pre-market: always reselect once for today
+        logger.info(
+            f"[UNIVERSE][CACHE] MISS reason=premarket_reselect "
+            f"(method={method}, cache_key={cache_key}, cache_file={self.cache_file})"
+        )
         return self._select_and_cache(now)
 
     def _select_and_cache(self, now: datetime, method_suffix: str = "") -> List[str]:

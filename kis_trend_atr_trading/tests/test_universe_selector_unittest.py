@@ -147,6 +147,36 @@ class UniverseSelectorFixedTests(unittest.TestCase):
             selected = selector.select()
             self.assertEqual(selected, ["005930"])
 
+    def test_cache_method_mismatch_forces_reselect(self):
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = Path(td) / "universe_cache.json"
+            today = datetime.now(KST)
+            cache_path.write_text(
+                json.dumps(
+                    {
+                        "date": today.strftime("%Y-%m-%d"),
+                        "stocks": ["005930"],
+                        "selection_method": "fixed",
+                        "saved_at": today.isoformat(),
+                        "cache_key": today.strftime("%Y-%m-%d"),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            cfg = UniverseSelectionConfig(
+                selection_method="combined",
+                max_stocks=3,
+                universe_cache_file=str(cache_path),
+                cache_refresh_enabled=False,
+            )
+            selector = UniverseSelector(config=cfg, kis_client=_DummyKIS(), db=None)
+            selector._is_market_hours = lambda now: True  # type: ignore
+            selector._select_combined = lambda: ["000660", "035420", "051910"]  # type: ignore
+            selected = selector.select()
+            self.assertEqual(selected, ["000660", "035420", "051910"])
+
 
 if __name__ == "__main__":
     unittest.main()

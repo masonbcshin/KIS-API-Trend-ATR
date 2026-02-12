@@ -314,7 +314,7 @@ MESSAGE_TEMPLATES = {
 • 손절가: {stop_loss:,}원
 • 갭(raw): {raw_gap_pct:.6f}%
 • 갭(표시): {gap_loss_pct:.3f}%
-• reason: {reason_code}
+• reason: `{reason_code}`
 ━━━━━━━━━━━━━━━━━━
 • 진입가: {entry_price:,}원
 • 예상 손익: {pnl:+,}원 ({pnl_pct:+.2f}%)

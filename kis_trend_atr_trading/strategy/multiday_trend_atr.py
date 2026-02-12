@@ -89,6 +89,7 @@ class TradingSignal:
     near_take_profit_pct: float = 0.0
     gap_raw_pct: Optional[float] = None
     gap_display_pct: Optional[float] = None
+    gap_open_price: Optional[float] = None
     gap_reference: str = ""
     gap_reference_price: Optional[float] = None
     reason_code: str = ""
@@ -437,6 +438,12 @@ class MultidayTrendATRStrategy:
                     epsilon_pct=self.gap_epsilon_pct,
                 )
                 formatted_gap_pct = round(raw_gap_pct, 3)
+                logger.info(
+                    f"[GAP_CHECK] symbol={pos.symbol}, open={float(open_price):.6f}, "
+                    f"base_label={reference_kind}, base_price={float(reference_price):.6f}, "
+                    f"gap_pct={raw_gap_pct:.6f}, threshold={float(self.gap_threshold_pct):.6f}, "
+                    f"triggered={triggered}, reason={reason_code}"
+                )
                 if reason_code == GAP_REASON_DISABLED:
                     logger.info(
                         f"[{GAP_REASON_DISABLED}] 기준={reference_kind}, ref={reference_price}, "
@@ -709,6 +716,7 @@ class MultidayTrendATRStrategy:
                     near_take_profit_pct=pos.get_distance_to_take_profit(current_price),
                     gap_raw_pct=gap_raw,
                     gap_display_pct=gap_display,
+                    gap_open_price=float(open_price) if open_price is not None else None,
                     gap_reference=gap_ref_kind,
                     gap_reference_price=gap_ref_price,
                     reason_code=reason_code,

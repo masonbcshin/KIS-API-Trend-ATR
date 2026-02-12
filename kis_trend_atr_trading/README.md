@@ -177,6 +177,8 @@ selection_method:
 
 - 장전: 재계산 후 캐시 갱신
 - 장중 재시작: 캐시 재사용
+- 장중이라도 `selection_method`가 캐시 메서드와 다르면 캐시 즉시 무효화 후 재선정
+- 로그에 `CACHE HIT/MISS`, 사유(reason), `cache_key`, `cache_file` 출력
 
 ### fallback 정책
 
@@ -241,6 +243,9 @@ selection_method:
   - `gap_threshold_pct` 누락 또는 `<= 0` (정책상 비활성화)
 - `abs()` 비교는 사용하지 않음
 - 로그/텔레그램에 `raw_gap_pct`와 표시값(`display`)을 함께 출력
+- 텔레그램 `시가(open_price)`와 `기준가(reference_price)`는 갭 계산에 실제 사용된 값과 동일하게 출력
+- 갭 청산 주문 직전 로그:
+  - `symbol, open, base_label, base_price, gap_pct, threshold, triggered, reason`
 
 ---
 
@@ -436,6 +441,8 @@ TRADING_MODE=REAL python main_multiday.py --mode trade \
 ```bash
 python -m unittest kis_trend_atr_trading.tests.test_universe_selector_unittest -v
 python -m unittest kis_trend_atr_trading.tests.test_gap_protection_unittest -v
+python -m unittest kis_trend_atr_trading.tests.test_gap_notification_alignment_unittest -v
+python -m unittest kis_trend_atr_trading.tests.test_main_multiday_multi_symbols_unittest -v
 python -m pytest kis_trend_atr_trading/tests/test_api.py -q
 python -m pytest kis_trend_atr_trading/tests/test_executor.py::TestPositionRecognitionAfterRestart::test_position_lost_after_restart_simulation -q
 ```

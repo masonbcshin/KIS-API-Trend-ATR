@@ -761,16 +761,33 @@ class MultidayExecutor:
         elif exit_reason == ExitReason.GAP_PROTECTION:
             gap_raw_pct = signal.gap_raw_pct if signal.gap_raw_pct is not None else 0.0
             gap_display_pct = signal.gap_display_pct if signal.gap_display_pct is not None else round(gap_raw_pct, 3)
+            gap_open_price = (
+                signal.gap_open_price
+                if signal.gap_open_price is not None
+                else exit_price
+            )
+            gap_reference_price = (
+                signal.gap_reference_price
+                if signal.gap_reference_price is not None
+                else position.entry_price
+            )
+            gap_reference_type = signal.gap_reference or "entry"
             reason_code = signal.reason_code or GAP_REASON_OTHER
+            logger.info(
+                f"[GAP_EXIT] symbol={position.symbol}, open={float(gap_open_price):.6f}, "
+                f"base_label={gap_reference_type}, base_price={float(gap_reference_price):.6f}, "
+                f"gap_pct={gap_raw_pct:.6f}, threshold={self.strategy.gap_threshold_pct}, "
+                f"triggered=True, reason={reason_code}"
+            )
             self.telegram.notify_gap_protection(
                 stock_code=position.symbol,
-                open_price=exit_price,
+                open_price=gap_open_price,
                 stop_loss=position.stop_loss,
                 entry_price=position.entry_price,
                 gap_loss_pct=gap_display_pct,
                 raw_gap_pct=gap_raw_pct,
-                reference_price=signal.gap_reference_price if signal.gap_reference_price is not None else position.entry_price,
-                reference_type=signal.gap_reference or "entry",
+                reference_price=gap_reference_price,
+                reference_type=gap_reference_type,
                 reason_code=reason_code,
                 pnl=close_result["pnl"],
                 pnl_pct=close_result["pnl_pct"]
