@@ -446,6 +446,31 @@ class OrderSynchronizer:
         self.execution_timeout = execution_timeout
         self.mode = get_trading_mode()
         self._db = get_db_manager() if get_db_manager else None
+        self._schema_checked = False
+
+    def _ensure_order_state_table(self) -> bool:
+        """
+        order_state 테이블 존재를 보장합니다.
+        multiday 경로에서는 initialize_schema가 선행되지 않을 수 있으므로
+        최초 접근 시 여기서 안전하게 보정합니다.
+        """
+        if not self._db:
+            return False
+        if self._schema_checked:
+            return True
+
+        try:
+            if hasattr(self._db, "is_connected") and not self._db.is_connected():
+                self._db.connect()
+            exists = self._db.table_exists("order_state")
+            if not exists:
+                logger.warning("[SYNC] order_state 테이블 없음 - 스키마 초기화 시도")
+                self._db.initialize_schema()
+            self._schema_checked = True
+            return True
+        except Exception as e:
+            logger.warning(f"[SYNC] order_state 스키마 확인/생성 실패: {e}")
+            return False
 
     def _build_idempotency_key(
         self,
@@ -474,6 +499,7 @@ class OrderSynchronizer:
     ) -> None:
         if not self._db:
             return
+        self._ensure_order_state_table()
         try:
             with self._db.transaction() as cursor:
                 cursor.execute(
@@ -503,6 +529,7 @@ class OrderSynchronizer:
     def _get_order_state(self, idempotency_key: str) -> Optional[Dict[str, Any]]:
         if not self._db:
             return None
+        self._ensure_order_state_table()
         try:
             return self._db.execute_query(
                 "SELECT * FROM order_state WHERE idempotency_key = %s",
@@ -519,6 +546,7 @@ class OrderSynchronizer:
         """
         if not self._db:
             return []
+        self._ensure_order_state_table()
         try:
             rows = self._db.execute_query(
                 """
