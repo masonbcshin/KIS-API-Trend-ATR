@@ -62,6 +62,8 @@ class UniverseSelector:
         self.kis_client = kis_client
         self.db = db
         self.trading_mode = get_trading_mode()
+        self._last_market_codes_source = "not_used"
+        self._last_volume_data_source = "not_used"
         root = Path(__file__).resolve().parent.parent
         self.cache_file = root / self.config.universe_cache_file
         self.cache_file.parent.mkdir(parents=True, exist_ok=True)
@@ -197,12 +199,15 @@ class UniverseSelector:
         candidates = self._candidate_pool_for_volume_scan()
         pool_size = len(candidates)
         volume_source = "market_scan" if mode == "market" else "restricted_pool"
+        candidate_source = self._last_market_codes_source if mode == "market" else "configured_pool"
         logger.info(
             f"[UNIVERSE] volume_top scope={volume_source}, pool_mode={mode}, "
-            f"pool_size={pool_size}, limit={effective_limit}"
+            f"pool_size={pool_size}, limit={effective_limit}, "
+            f"candidate_source={candidate_source}"
         )
         rows: List[Tuple[str, float]] = []
         bulk_ok = False
+        data_source = "none"
         if mode == "market" and hasattr(self.kis_client, "get_market_top_by_trade_value"):
             try:
                 top_n = min(
@@ -214,6 +219,7 @@ class UniverseSelector:
                     if self._passes_safety_filters(snap):
                         rows.append((str(snap["code"]), float(snap["trade_value"])))
                 bulk_ok = True
+                data_source = "volume_rank_api"
             except Exception:
                 bulk_ok = False
 
@@ -224,6 +230,7 @@ class UniverseSelector:
                     if self._passes_safety_filters(snap):
                         rows.append((str(snap["code"]), float(snap["trade_value"])))
                 bulk_ok = True
+                data_source = "bulk_snapshot"
             except Exception:
                 bulk_ok = False
 
@@ -249,8 +256,11 @@ class UniverseSelector:
                         time.sleep(0.05)
                 except Exception:
                     continue
+            data_source = "single_snapshot"
         rows.sort(key=lambda x: x[1], reverse=True)
         selected = [c for c, _ in rows[:effective_limit]]
+        self._last_volume_data_source = data_source
+        logger.info(f"[UNIVERSE] volume_top data_source={data_source}")
         logger.info(f"[UNIVERSE] volume_top 통과={len(selected)}")
         return selected
 
@@ -331,14 +341,28 @@ class UniverseSelector:
         return self._dedupe(self.config.candidate_stocks or self.config.stocks)
 
     def _load_market_codes(self) -> List[str]:
+        self._last_market_codes_source = "unknown"
         if hasattr(self.kis_client, "get_market_universe_codes"):
             try:
                 codes = self.kis_client.get_market_universe_codes(limit=self.config.market_scan_size)
                 if codes:
-                    return self._dedupe([str(c) for c in codes])
-            except Exception:
-                pass
-        return self._load_kospi200_codes()
+                    deduped = self._dedupe([str(c) for c in codes])
+                    self._last_market_codes_source = "market_api"
+                    logger.info(
+                        f"[UNIVERSE] market code source=market_api, requested={self.config.market_scan_size}, "
+                        f"received={len(deduped)}"
+                    )
+                    return deduped
+                self._last_market_codes_source = "market_api_empty"
+            except Exception as e:
+                self._last_market_codes_source = "market_api_error"
+                logger.warning(f"[UNIVERSE] market code source=market_api_error: {e}")
+        fallback = self._load_kospi200_codes()
+        self._last_market_codes_source = "fallback_kospi_seed"
+        logger.info(
+            f"[UNIVERSE] market code source=fallback_kospi_seed, fallback_count={len(fallback)}"
+        )
+        return fallback
 
     def _load_kospi200_codes(self) -> List[str]:
         # Optional local list file

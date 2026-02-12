@@ -79,6 +79,11 @@ class _DummyKIS:
         return snaps
 
 
+class _DummyKISNoMarketCodes(_DummyKIS):
+    def get_market_universe_codes(self, limit=200):
+        return []
+
+
 class UniverseSelectorFixedTests(unittest.TestCase):
     def test_fixed_mode_preserves_order_and_max(self):
         with tempfile.TemporaryDirectory() as td:
@@ -225,6 +230,19 @@ class UniverseSelectorFixedTests(unittest.TestCase):
             selector = UniverseSelector(config=cfg, kis_client=_DummyKIS(), db=None)
             selected = selector._select_volume_top(limit=10)
             self.assertEqual(len(selected), 10)
+            self.assertEqual(selector._last_market_codes_source, "market_api")
+
+    def test_market_mode_falls_back_to_seed_codes_when_market_codes_empty(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = UniverseSelectionConfig(
+                selection_method="volume_top",
+                candidate_pool_mode="market",
+                max_stocks=5,
+                universe_cache_file=str(Path(td) / "universe_cache.json"),
+            )
+            selector = UniverseSelector(config=cfg, kis_client=_DummyKISNoMarketCodes(), db=None)
+            _ = selector._candidate_pool_for_volume_scan()
+            self.assertEqual(selector._last_market_codes_source, "fallback_kospi_seed")
 
     def test_fallback_seed_codes_are_extended_to_50(self):
         with tempfile.TemporaryDirectory() as td:
