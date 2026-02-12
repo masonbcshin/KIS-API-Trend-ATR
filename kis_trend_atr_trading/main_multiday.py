@@ -35,6 +35,7 @@ import os
 import sys
 import time
 import subprocess
+from pathlib import Path
 from datetime import datetime
 
 # 프로젝트 모듈 임포트
@@ -314,8 +315,9 @@ def run_trade(
         print("✅ 토큰 발급 완료\n")
         
         # Universe 선정 (장 시작 전 1회 / 장중 재시작은 캐시 재사용)
+        universe_yaml = Path(__file__).resolve().parent / "config" / "universe.yaml"
         selector = UniverseSelector.from_yaml(
-            yaml_path="config/universe.yaml",
+            yaml_path=str(universe_yaml),
             kis_client=api,
             db=None
         )
@@ -338,6 +340,11 @@ def run_trade(
             )
 
         # 현재 멀티데이 엔진은 단일 종목 실행 구조이므로 선정 결과 첫 종목 사용
+        if len(selected_universe) > 1:
+            logger.warning(
+                f"[UNIVERSE] max_stocks={len(selected_universe)}이지만 현재 실행 엔진은 단일 종목만 처리합니다. "
+                f"첫 종목({selected_universe[0]})만 실행됩니다."
+            )
         selected_stock = selected_universe[0]
         if stock_code != settings.DEFAULT_STOCK_CODE:
             # 명시 입력이 있으면 우선하되 universe 필터를 통과한 종목만 허용

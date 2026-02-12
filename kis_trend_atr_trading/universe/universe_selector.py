@@ -63,6 +63,9 @@ class UniverseSelector:
         if yaml is None:
             raise RuntimeError("PyYAML이 설치되어 있지 않아 universe.yaml 로딩이 불가합니다.")
         path = Path(yaml_path)
+        if not path.is_absolute():
+            # 실행 cwd와 무관하게 프로젝트 루트 기준으로 해석
+            path = Path(__file__).resolve().parent.parent / path
         with path.open("r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
         section = data.get("universe", {})
@@ -92,13 +95,16 @@ class UniverseSelector:
             if cached:
                 logger.info(f"[UNIVERSE] 장중 재시작: 캐시 재사용 {cached}")
                 return cached
-            logger.error("[UNIVERSE] 장중 캐시 없음 - fallback 고정 목록 사용")
-            return self._fallback_fixed_or_raise("장중 캐시 미존재")
+            logger.warning("[UNIVERSE] 장중 캐시 없음 - 금일 1회 bootstrap 선정 후 캐시 저장")
+            return self._select_and_cache(now, method_suffix="intra_bootstrap")
 
         # Pre-market: always reselect once for today
+        return self._select_and_cache(now)
+
+    def _select_and_cache(self, now: datetime, method_suffix: str = "") -> List[str]:
         try:
             method = self.config.selection_method
-            logger.info(f"[UNIVERSE] pre-market 재선정 시작: method={method}")
+            logger.info(f"[UNIVERSE] 재선정 시작: method={method}")
             if method == "fixed":
                 selected = self._select_fixed()
             elif method == "volume_top":
@@ -111,7 +117,8 @@ class UniverseSelector:
                 raise ValueError(f"지원하지 않는 selection_method: {method}")
 
             validated = self._finalize(selected)
-            self._save_cache(now, validated, method)
+            cache_method = method if not method_suffix else f"{method}_{method_suffix}"
+            self._save_cache(now, validated, cache_method)
             logger.info(f"[UNIVERSE] 최종 종목: {validated}")
             return validated
         except Exception as e:
