@@ -43,10 +43,12 @@ from config import settings
 from api.kis_api import KISApi, KISApiError
 from strategy.multiday_trend_atr import MultidayTrendATRStrategy
 from engine.multiday_executor import MultidayExecutor
+from engine.order_synchronizer import get_instance_lock
 from backtest.backtester import Backtester
 from universe import UniverseSelector
 from utils.logger import setup_logger, get_logger
 from utils.market_hours import KST
+from utils.position_store import PositionStore
 from env import get_trading_mode, validate_environment, assert_not_real_mode
 
 
@@ -294,7 +296,8 @@ def run_trade(
     
     # 설정 요약 출력
     print(settings.get_settings_summary())
-    
+    executors = []
+
     try:
         # REAL 첫날 종목수 제한 (세이프가드)
         trading_mode = get_trading_mode()
@@ -326,10 +329,7 @@ def run_trade(
             raise RuntimeError("Universe 종목 수가 0개입니다. 거래를 중단합니다.")
         logger.info(f"[UNIVERSE] selected={selected_universe}")
 
-        # 멀티데이 전략 생성
-        strategy = MultidayTrendATRStrategy()
-        
-        # 멀티데이 실행 엔진 생성
+        # 주문 수량 계산
         order_quantity = settings.ORDER_QUANTITY
         if trading_mode == "REAL":
             capped_qty = max(1, int(order_quantity * (real_first_order_percent / 100.0)))
@@ -339,59 +339,89 @@ def run_trade(
                 f"({real_first_order_percent}% of max_position_size)"
             )
 
-        # 현재 멀티데이 엔진은 단일 종목 실행 구조이므로 선정 결과 첫 종목 사용
-        if len(selected_universe) > 1:
-            logger.warning(
-                f"[UNIVERSE] max_stocks={len(selected_universe)}이지만 현재 실행 엔진은 단일 종목만 처리합니다. "
-                f"첫 종목({selected_universe[0]})만 실행됩니다."
-            )
-        selected_stock = selected_universe[0]
+        # 명시 종목이 기본값이 아닌 경우 해당 1종목만 실행
+        run_symbols = list(selected_universe)
         if stock_code != settings.DEFAULT_STOCK_CODE:
-            # 명시 입력이 있으면 우선하되 universe 필터를 통과한 종목만 허용
             if stock_code in selected_universe:
-                selected_stock = stock_code
+                run_symbols = [stock_code]
             else:
                 raise RuntimeError(
                     f"명시 종목({stock_code})이 금일 Universe({selected_universe})에 없습니다."
                 )
 
-        executor = MultidayExecutor(
-            api=api,
-            strategy=strategy,
-            stock_code=selected_stock,
-            order_quantity=order_quantity
-        )
-        
-        # 포지션 복원 시도
+        def _symbol_position_store(symbol: str) -> PositionStore:
+            data_dir = Path(__file__).resolve().parent / "data"
+            return PositionStore(file_path=data_dir / f"positions_{symbol}.json")
+
         print("🔄 저장된 포지션 확인 중...")
-        restored = executor.restore_position_on_start()
-        
-        if restored:
-            print("✅ 포지션 복원 완료 - Exit 조건 감시 모드\n")
-        else:
-            print("ℹ️ 복원할 포지션 없음 - Entry 조건 감시 모드\n")
-        
+        for symbol in run_symbols:
+            executor = MultidayExecutor(
+                api=api,
+                strategy=MultidayTrendATRStrategy(),
+                stock_code=symbol,
+                order_quantity=order_quantity,
+                position_store=_symbol_position_store(symbol),
+            )
+            restored = executor.restore_position_on_start()
+            state_msg = "복원 완료 - Exit 조건 감시" if restored else "복원 포지션 없음 - Entry 조건 감시"
+            print(f"  - {symbol}: {state_msg}")
+            executors.append(executor)
+        print("")
+
         # 거래 시작
         print("🚀 멀티데이 거래 시작...")
+        print(f"   대상 종목: {run_symbols}")
         print("   종료하려면 Ctrl+C를 누르세요.\n")
         print("   ★ 포지션은 프로그램 종료 시에도 유지됩니다.")
         print("   ★ Exit는 오직 가격 조건으로만 발생합니다.\n")
-        
-        executor.run(
-            interval_seconds=interval,
-            max_iterations=max_runs
-        )
-        
-        # 거래 요약
-        summary = executor.get_daily_summary()
-        print("\n" + "=" * 50)
-        print("                  거래 요약")
-        print("=" * 50)
-        print(f"총 거래: {summary['total_trades']}회")
-        print(f"  - 매수: {summary['buy_count']}회")
-        print(f"  - 매도: {summary['sell_count']}회")
-        print(f"총 손익: {summary['total_pnl']:,.0f}원")
-        print("=" * 50)
+
+        # 단일 종목은 기존 엔진 루프 사용
+        if len(executors) == 1:
+            executors[0].run(
+                interval_seconds=interval,
+                max_iterations=max_runs
+            )
+            summary = executors[0].get_daily_summary()
+            print("\n" + "=" * 50)
+            print("                  거래 요약")
+            print("=" * 50)
+            print(f"총 거래: {summary['total_trades']}회")
+            print(f"  - 매수: {summary['buy_count']}회")
+            print(f"  - 매도: {summary['sell_count']}회")
+            print(f"총 손익: {summary['total_pnl']:,.0f}원")
+            print("=" * 50)
+        else:
+            iteration = 0
+            while True:
+                iteration += 1
+                logger.info(f"[MULTI] 반복 #{iteration} / symbols={len(executors)}")
+                for executor in executors:
+                    executor.run_once()
+
+                if max_runs and iteration >= max_runs:
+                    logger.info(f"[MULTI] 최대 반복 도달: {max_runs}")
+                    break
+
+                logger.info(f"[MULTI] 다음 실행까지 {interval}초 대기")
+                time.sleep(interval)
+
+            print("\n" + "=" * 50)
+            print("              멀티종목 거래 요약")
+            print("=" * 50)
+            total_trades = 0
+            total_pnl = 0
+            for executor in executors:
+                summary = executor.get_daily_summary()
+                total_trades += summary.get("total_trades", 0)
+                total_pnl += summary.get("total_pnl", 0)
+                print(
+                    f"{executor.stock_code}: 거래 {summary.get('total_trades', 0)}회, "
+                    f"손익 {summary.get('total_pnl', 0):,.0f}원"
+                )
+            print("-" * 50)
+            print(f"총 거래: {total_trades}회")
+            print(f"총 손익: {total_pnl:,.0f}원")
+            print("=" * 50)
         
     except KISApiError as e:
         print(f"\n❌ API 오류: {e}")
@@ -403,6 +433,19 @@ def run_trade(
     except Exception as e:
         print(f"\n❌ 오류 발생: {e}")
         logger.error(f"거래 오류: {e}")
+    finally:
+        # 멀티심볼 사용자 루프에서는 executor.run()의 finally가 호출되지 않으므로 정리 보장
+        for executor in executors:
+            try:
+                executor._save_position_on_exit()
+            except Exception:
+                pass
+        try:
+            lock = get_instance_lock()
+            if lock.is_acquired:
+                lock.release()
+        except Exception:
+            pass
 
 
 def main():

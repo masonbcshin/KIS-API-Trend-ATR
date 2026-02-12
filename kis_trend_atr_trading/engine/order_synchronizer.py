@@ -121,6 +121,10 @@ class SingleInstanceLock:
         Returns:
             bool: 락 획득 성공 여부
         """
+        if self._acquired:
+            # 동일 프로세스 내 재호출은 성공으로 간주 (멀티 심볼 실행 지원)
+            return True
+
         try:
             self._cleanup_stale_lock_file()
             self._lock_fd = open(self.lock_file, 'w')
