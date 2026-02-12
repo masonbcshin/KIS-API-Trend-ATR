@@ -360,3 +360,50 @@ JSON과 DB 사이 불일치 발생 시 어느 것이 진실인지 판단 불가.
 ---
 
 > **문서 작성 완료: 2026-01-29**
+
+---
+
+## 6️⃣ Daily Universe + Holdings 운영 정책 (2026-02-12)
+
+### 핵심 운영 원칙
+
+- `holdings_symbols`: 현재 OPEN 포지션 종목 전체 (항상 관리/청산 대상)
+- `todays_universe`: 당일 신규 진입 후보 리스트
+- `entry_candidates = todays_universe - holdings_symbols`
+- `max_positions`: 동시 보유 상한 (신규 진입에만 적용)
+- `universe_size`: 당일 유니버스 크기
+
+### 실행 흐름
+
+1. 시작 시 `UniverseService.load_holdings_symbols()`로 보유종목 로드
+2. `UniverseService.get_or_create_todays_universe(trade_date)` 실행
+3. 오늘 레코드가 있으면 재생성 없이 재사용
+4. `compute_entry_candidates()`로 신규 진입 후보 계산
+5. 루프마다:
+   - 보유 종목 전체는 무조건 실행(Exit/Stop/Trailing 유지)
+   - 신규 진입은 `entry_candidates`만 허용
+   - `holdings_count >= max_positions`면 신규 진입 차단
+
+### 장애/폴백 정책
+
+- 유니버스 갱신 실패 시:
+  1. 오늘 캐시 사용
+  2. 없으면 `fixed.stocks` 사용
+  3. 없으면 빈 유니버스(신규 진입 중단)
+- 어떤 경우에도 보유 종목 관리/청산은 중단하지 않음
+
+### 운영 시나리오
+
+#### 시나리오 A: 보유 종목이 TopN에서 제외됨
+- 상태: `holdings_symbols=["005930"]`, `todays_universe=["000660","035720",...]`
+- 동작: `005930`은 계속 Exit/Stop/Trailing 감시
+- 신규 진입은 `["000660","035720",...]`에서만 탐색
+
+#### 시나리오 B: 보유 수가 상한 도달
+- 상태: `holdings_count=10`, `max_positions=10`
+- 동작: 신규 진입 전부 차단
+- 보유 포지션의 청산/손절 처리는 계속 수행
+
+#### 시나리오 C: 재시작
+- 같은 거래일 재시작: 오늘 유니버스 재사용(재생성 금지)
+- 다음 거래일 진입: 신규 거래일 유니버스 1회 생성 후 저장
