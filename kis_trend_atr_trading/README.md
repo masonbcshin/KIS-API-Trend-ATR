@@ -210,6 +210,12 @@ selection_method:
 - REAL 실행은 `--confirm-real-trading` 없으면 즉시 종료
 - PAPER 모드에서 실계좌 전용 키(`REAL_KIS_*`)가 감지되면 시작 종료
 
+### RISK MANAGER STATUS 해석
+
+- `당일 실현 손익`: 당일 청산된 거래의 누적 손익(리스크 한도 판정 기준)
+- `계좌 평가손익`: KIS 잔고조회(`get_account_balance`) 기준 평가손익
+- 두 값은 목적이 다르므로 동일하지 않을 수 있음
+
 ### idempotency key
 
 - 생성 위치: `engine/order_synchronizer.py`

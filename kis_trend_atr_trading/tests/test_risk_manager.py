@@ -207,6 +207,36 @@ class TestDailyLossLimit:
         assert result.passed is False
         assert result.should_exit is False
         assert "Daily loss limit reached" in result.reason
+
+
+class TestAccountSnapshot:
+    """계좌 평가 스냅샷 반영 테스트"""
+
+    def test_계좌_스냅샷_업데이트_및_상태반영(self):
+        rm = RiskManager(
+            enable_kill_switch=False,
+            daily_max_loss_percent=3.0,
+            starting_capital=10_000_000
+        )
+
+        snapshot = {
+            "success": True,
+            "holdings": [
+                {"stock_code": "005930", "quantity": 3},
+                {"stock_code": "000660", "quantity": 1},
+            ],
+            "total_eval": 10_245_000,
+            "cash_balance": 8_000_000,
+            "total_pnl": 1_451,
+        }
+        rm.update_account_snapshot(snapshot)
+
+        status = rm.get_status()
+        account = status["account_snapshot"]
+        assert account is not None
+        assert account["holdings_count"] == 2
+        assert account["total_pnl"] == pytest.approx(1451.0)
+        assert account["total_eval"] == pytest.approx(10_245_000.0)
     
     def test_손실한도_초과시_청산주문허용(self):
         """손실 한도 초과해도 청산 주문은 허용되어야 함"""

@@ -148,6 +148,7 @@ class RiskManager:
         self._daily_pnl = DailyPnL(
             starting_capital=starting_capital
         )
+        self._account_snapshot: Optional[Dict] = None
         
         # 일일 손실 한도 도달 플래그
         self._daily_limit_reached = False
@@ -587,6 +588,32 @@ class RiskManager:
             "daily_limit_reached": self._daily_limit_reached,
             "max_loss_percent": self._daily_max_loss_percent
         }
+
+    def update_account_snapshot(self, snapshot: Dict) -> None:
+        """
+        계좌 평가 스냅샷을 업데이트합니다.
+
+        Args:
+            snapshot: KIS get_account_balance() 결과
+        """
+        if not snapshot:
+            return
+
+        try:
+            holdings = snapshot.get("holdings") or []
+            self._account_snapshot = {
+                "total_eval": float(snapshot.get("total_eval", 0.0)),
+                "cash_balance": float(snapshot.get("cash_balance", 0.0)),
+                "total_pnl": float(snapshot.get("total_pnl", 0.0)),
+                "holdings_count": len(holdings),
+                "updated_at": datetime.now(KST).isoformat(),
+            }
+        except Exception as e:
+            logger.warning(f"[RISK] 계좌 스냅샷 파싱 실패: {e}")
+
+    def get_account_snapshot(self) -> Optional[Dict]:
+        """최근 계좌 평가 스냅샷 반환"""
+        return self._account_snapshot
     
     def get_status(self) -> Dict:
         """
@@ -602,6 +629,7 @@ class RiskManager:
             "daily_max_loss_percent": self._daily_max_loss_percent,
             "daily_limit_reached": self._daily_limit_reached,
             "daily_pnl": pnl_summary,
+            "account_snapshot": self._account_snapshot,
             "trading_allowed": not self._enable_kill_switch and not self._daily_limit_reached
         }
     
@@ -611,6 +639,7 @@ class RiskManager:
         """
         status = self.get_status()
         pnl = status["daily_pnl"]
+        account = status.get("account_snapshot")
         
         print("\n" + "═" * 60)
         print("             [RISK MANAGER STATUS]")
@@ -625,6 +654,13 @@ class RiskManager:
         print(f"  당일 실현 손익     : {pnl['realized_pnl']:+,.0f}원")
         print(f"  손익률             : {pnl['loss_percent']:+.2f}%")
         print(f"  거래 횟수          : {pnl['trades_count']}회")
+        if account:
+            print("-" * 60)
+            print(f"  계좌 평가손익      : {account['total_pnl']:+,.0f}원")
+            print(f"  계좌 평가금액      : {account['total_eval']:,.0f}원")
+            print(f"  예수금             : {account['cash_balance']:,.0f}원")
+            print(f"  보유 종목 수       : {account['holdings_count']}개")
+            print(f"  스냅샷 시각        : {account['updated_at']}")
         print("═" * 60 + "\n")
 
 

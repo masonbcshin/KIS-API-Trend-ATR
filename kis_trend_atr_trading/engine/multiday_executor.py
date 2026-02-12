@@ -74,6 +74,8 @@ class MultidayExecutor:
         4. 프로그램 종료 시 포지션 상태 저장
         5. 프로그램 시작 시 포지션 복원
     """
+    _shared_account_snapshot: Optional[Dict[str, Any]] = None
+    _shared_account_snapshot_ts: Optional[datetime] = None
     
     def __init__(
         self,
@@ -183,7 +185,10 @@ class MultidayExecutor:
             f"모드={self.trading_mode}, 종목={self.stock_code}, "
             f"수량={self.order_quantity}"
         )
-        
+
+        # 리스크 상태 출력 전 계좌 평가 스냅샷 동기화
+        self._sync_risk_account_snapshot()
+
         # 리스크 매니저 상태 출력
         self.risk_manager.print_status()
     
@@ -192,6 +197,43 @@ class MultidayExecutor:
         logger.info(f"종료 시그널 수신: {signum}")
         self._save_position_on_exit()
         sys.exit(0)
+
+    def _sync_risk_account_snapshot(self) -> None:
+        """리스크 패널용 계좌 스냅샷 동기화 (짧은 TTL 캐시 적용)."""
+        ttl_sec = int(getattr(settings, "RISK_ACCOUNT_SNAPSHOT_TTL_SEC", 60))
+        now = datetime.now(KST)
+
+        cached_snapshot = self.__class__._shared_account_snapshot
+        cached_ts = self.__class__._shared_account_snapshot_ts
+        if (
+            cached_snapshot is not None
+            and cached_ts is not None
+            and (now - cached_ts).total_seconds() < ttl_sec
+        ):
+            self.risk_manager.update_account_snapshot(cached_snapshot)
+            logger.info(
+                f"[RISK] 계좌 스냅샷 캐시 사용: age={(now - cached_ts).total_seconds():.1f}s"
+            )
+            return
+
+        try:
+            snapshot = self.api.get_account_balance()
+        except Exception as e:
+            logger.warning(f"[RISK] 계좌 스냅샷 조회 실패: {e}")
+            return
+
+        if not snapshot or not snapshot.get("success"):
+            logger.warning("[RISK] 계좌 스냅샷 조회 결과가 비어있어 상태 반영을 건너뜁니다.")
+            return
+
+        self.__class__._shared_account_snapshot = snapshot
+        self.__class__._shared_account_snapshot_ts = now
+        self.risk_manager.update_account_snapshot(snapshot)
+        total_pnl = float(snapshot.get("total_pnl", 0.0))
+        logger.info(
+            "[RISK] 계좌 스냅샷 반영: "
+            f"holdings={len(snapshot.get('holdings', []))}, total_pnl={total_pnl:+,.0f}원"
+        )
     
     # ════════════════════════════════════════════════════════════════
     # 포지션 영속화
