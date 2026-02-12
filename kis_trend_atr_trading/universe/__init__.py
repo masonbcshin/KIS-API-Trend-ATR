@@ -12,6 +12,7 @@ from .universe_manager import (
     get_universe_manager,
     create_universe_from_config
 )
+from .universe_selector import UniverseSelector, UniverseSelectionConfig
 
 __all__ = [
     "UniverseManager",
@@ -19,5 +20,7 @@ __all__ = [
     "StockInfo",
     "SelectionMethod",
     "get_universe_manager",
-    "create_universe_from_config"
+    "create_universe_from_config",
+    "UniverseSelector",
+    "UniverseSelectionConfig",
 ]

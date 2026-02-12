@@ -42,6 +42,32 @@ universe:
   
   # 거래대금 상위 후보 (volume_top 방식)
   volume_top_n: 50
+
+  # ATR 계산 기간
+  atr_period: 14
+
+  # ATR 후보 풀 모드
+  # - kospi200: KOSPI200 후보 풀
+  # - yaml: candidate_stocks 또는 stocks 사용
+  # - volume_top: volume_top 결과를 ATR 후보로 사용
+  candidate_pool_mode: "yaml"
+
+  # candidate_pool_mode=yaml일 때 사용할 후보군
+  candidate_stocks:
+    - "005930"
+    - "000660"
+    - "035420"
+    - "035720"
+    - "051910"
+
+  # 자동선정 실패 시 고정목록 fallback 여부
+  fallback_to_fixed: true
+
+  # REAL 모드에서 fallback 발생 시 거래 중단 옵션
+  halt_on_fallback_in_real: false
+
+  # Universe 캐시 파일
+  universe_cache_file: "data/universe_cache.json"
   
   # ────────────────────────────────────────────────────────────────
   # 고정 종목 리스트 (selection_method: fixed)

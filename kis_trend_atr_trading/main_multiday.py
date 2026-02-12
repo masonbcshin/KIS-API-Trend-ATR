@@ -43,6 +43,7 @@ from api.kis_api import KISApi, KISApiError
 from strategy.multiday_trend_atr import MultidayTrendATRStrategy
 from engine.multiday_executor import MultidayExecutor
 from backtest.backtester import Backtester
+from universe import UniverseSelector
 from utils.logger import setup_logger, get_logger
 from utils.market_hours import KST
 from env import get_trading_mode, validate_environment, assert_not_real_mode
@@ -312,6 +313,17 @@ def run_trade(
         api.get_access_token()
         print("✅ 토큰 발급 완료\n")
         
+        # Universe 선정 (장 시작 전 1회 / 장중 재시작은 캐시 재사용)
+        selector = UniverseSelector.from_yaml(
+            yaml_path="config/universe.yaml",
+            kis_client=api,
+            db=None
+        )
+        selected_universe = selector.select()
+        if not selected_universe:
+            raise RuntimeError("Universe 종목 수가 0개입니다. 거래를 중단합니다.")
+        logger.info(f"[UNIVERSE] selected={selected_universe}")
+
         # 멀티데이 전략 생성
         strategy = MultidayTrendATRStrategy()
         
@@ -325,10 +337,21 @@ def run_trade(
                 f"({real_first_order_percent}% of max_position_size)"
             )
 
+        # 현재 멀티데이 엔진은 단일 종목 실행 구조이므로 선정 결과 첫 종목 사용
+        selected_stock = selected_universe[0]
+        if stock_code != settings.DEFAULT_STOCK_CODE:
+            # 명시 입력이 있으면 우선하되 universe 필터를 통과한 종목만 허용
+            if stock_code in selected_universe:
+                selected_stock = stock_code
+            else:
+                raise RuntimeError(
+                    f"명시 종목({stock_code})이 금일 Universe({selected_universe})에 없습니다."
+                )
+
         executor = MultidayExecutor(
             api=api,
             strategy=strategy,
-            stock_code=stock_code,
+            stock_code=selected_stock,
             order_quantity=order_quantity
         )
         
