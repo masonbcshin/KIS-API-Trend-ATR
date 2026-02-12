@@ -30,8 +30,9 @@ from strategy.multiday_trend_atr import (
     MultidayTrendATRStrategy,
     TradingSignal,
     SignalType,
-    ExitReason
+    ExitReason,
 )
+from utils.gap_protection import GAP_REASON_FALLBACK, GAP_REASON_OTHER
 from engine.trading_state import TradingState, MultidayPosition
 from engine.risk_manager import (
     RiskManager,
@@ -639,7 +640,8 @@ class MultidayExecutor:
                         exit_reason,
                         pos,
                         actual_price,
-                        close_result
+                        close_result,
+                        signal,
                     )
                 
                 # 포지션 저장 파일 클리어
@@ -698,6 +700,11 @@ class MultidayExecutor:
                 
                 # 긴급 손절 실패 시 킬 스위치 발동
                 if is_emergency:
+                    if exit_reason == ExitReason.GAP_PROTECTION:
+                        logger.error(
+                            f"[{GAP_REASON_FALLBACK}] 갭 보호 청산 주문 실패: "
+                            f"order_no={sync_result.order_no}, reason={sync_result.message}"
+                        )
                     self.telegram.notify_error(
                         "긴급 청산 실패",
                         f"종목: {self.stock_code}\n"
@@ -722,7 +729,8 @@ class MultidayExecutor:
         exit_reason: ExitReason,
         position: MultidayPosition,
         exit_price: float,
-        close_result: Dict
+        close_result: Dict,
+        signal: TradingSignal,
     ) -> None:
         """청산 유형별 텔레그램 알림"""
         if exit_reason == ExitReason.ATR_STOP_LOSS:
@@ -751,12 +759,19 @@ class MultidayExecutor:
                 pnl_pct=close_result["pnl_pct"]
             )
         elif exit_reason == ExitReason.GAP_PROTECTION:
+            gap_raw_pct = signal.gap_raw_pct if signal.gap_raw_pct is not None else 0.0
+            gap_display_pct = signal.gap_display_pct if signal.gap_display_pct is not None else round(gap_raw_pct, 3)
+            reason_code = signal.reason_code or GAP_REASON_OTHER
             self.telegram.notify_gap_protection(
                 stock_code=position.symbol,
                 open_price=exit_price,
                 stop_loss=position.stop_loss,
                 entry_price=position.entry_price,
-                gap_loss_pct=abs(close_result["pnl_pct"]),
+                gap_loss_pct=gap_display_pct,
+                raw_gap_pct=gap_raw_pct,
+                reference_price=signal.gap_reference_price if signal.gap_reference_price is not None else position.entry_price,
+                reference_type=signal.gap_reference or "entry",
+                reason_code=reason_code,
                 pnl=close_result["pnl"],
                 pnl_pct=close_result["pnl_pct"]
             )

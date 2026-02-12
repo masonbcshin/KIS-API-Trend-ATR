@@ -84,6 +84,9 @@ ENABLE_GAP_PROTECTION = True
 
 # ★ 최대 갭 손실 허용 비율 (%) - 실계좌는 1.5% 이하 유지
 MAX_GAP_LOSS_PCT = 1.5
+GAP_THRESHOLD_PCT = 1.5
+GAP_EPSILON_PCT = 0.001
+GAP_REFERENCE = "entry"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

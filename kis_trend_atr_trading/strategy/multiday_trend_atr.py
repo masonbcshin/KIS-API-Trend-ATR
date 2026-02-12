@@ -27,6 +27,13 @@ import numpy as np
 from config import settings
 from utils.logger import get_logger, TradeLogger
 from utils.market_hours import KST
+from utils.gap_protection import (
+    GAP_REASON_DISABLED,
+    GAP_REASON_FALLBACK,
+    GAP_REASON_OTHER,
+    GAP_REASON_TRIGGERED,
+    should_trigger_gap_protection,
+)
 from engine.trading_state import (
     TradingState, 
     TradingStateMachine, 
@@ -36,7 +43,6 @@ from engine.trading_state import (
 
 logger = get_logger("multiday_strategy")
 trade_logger = TradeLogger("multiday_strategy")
-
 
 class SignalType(Enum):
     """매매 시그널 타입"""
@@ -81,6 +87,11 @@ class TradingSignal:
     trend: TrendType = TrendType.SIDEWAYS
     near_stop_loss_pct: float = 0.0
     near_take_profit_pct: float = 0.0
+    gap_raw_pct: Optional[float] = None
+    gap_display_pct: Optional[float] = None
+    gap_reference: str = ""
+    gap_reference_price: Optional[float] = None
+    reason_code: str = ""
 
 
 class MultidayTrendATRStrategy:
@@ -110,6 +121,9 @@ class MultidayTrendATRStrategy:
         trailing_activation_pct: float = None,
         enable_gap_protection: bool = None,
         max_gap_loss_pct: float = None,
+        gap_threshold_pct: float = None,
+        gap_epsilon_pct: float = None,
+        gap_reference: str = None,
         alert_near_sl_pct: float = None,
         alert_near_tp_pct: float = None
     ):
@@ -126,6 +140,9 @@ class MultidayTrendATRStrategy:
             trailing_activation_pct: 트레일링 스탑 활성화 수익률
             enable_gap_protection: 갭 보호 활성화
             max_gap_loss_pct: 최대 갭 손실 허용률
+            gap_threshold_pct: 갭 손실 임계값(%)
+            gap_epsilon_pct: 비교 노이즈 epsilon(%)
+            gap_reference: 갭 비교 기준가(entry|stop|prev_close)
             alert_near_sl_pct: 손절선 근접 알림 비율
             alert_near_tp_pct: 익절선 근접 알림 비율
         """
@@ -142,7 +159,21 @@ class MultidayTrendATRStrategy:
         
         # 갭 보호 설정
         self.enable_gap_protection = enable_gap_protection if enable_gap_protection is not None else settings.ENABLE_GAP_PROTECTION
-        self.max_gap_loss_pct = max_gap_loss_pct or settings.MAX_GAP_LOSS_PCT
+        # 운영 정책: threshold 누락/0 이하면 갭 보호 비활성화 (암묵 기본값 금지)
+        self.gap_threshold_pct = (
+            gap_threshold_pct
+            if gap_threshold_pct is not None
+            else getattr(settings, "GAP_THRESHOLD_PCT", None)
+        )
+        if self.gap_threshold_pct is None and max_gap_loss_pct is not None:
+            # 구버전 인자 호환: 명시적으로 전달된 경우에만 사용
+            self.gap_threshold_pct = max_gap_loss_pct
+        self.gap_epsilon_pct = (
+            gap_epsilon_pct if gap_epsilon_pct is not None else getattr(settings, "GAP_EPSILON_PCT", 0.001)
+        )
+        self.gap_reference = (
+            str(gap_reference if gap_reference is not None else getattr(settings, "GAP_REFERENCE", "entry")).lower()
+        )
         
         # 알림 설정
         self.alert_near_sl_pct = alert_near_sl_pct or settings.ALERT_NEAR_STOPLOSS_PCT
@@ -155,7 +186,8 @@ class MultidayTrendATRStrategy:
             f"멀티데이 전략 초기화: "
             f"ATR({self.atr_period}), MA({self.ma_period}), "
             f"SL({self.atr_multiplier_sl}x), TP({self.atr_multiplier_tp}x), "
-            f"Trailing({'ON' if self.enable_trailing_stop else 'OFF'})"
+            f"Trailing({'ON' if self.enable_trailing_stop else 'OFF'}), "
+            f"GAP(ref={self.gap_reference}, threshold={self.gap_threshold_pct}, eps={self.gap_epsilon_pct})"
         )
     
     # ════════════════════════════════════════════════════════════════
@@ -390,12 +422,34 @@ class MultidayTrendATRStrategy:
         
         # 1. 갭 보호 체크 (옵션)
         if self.enable_gap_protection and open_price:
-            gap_loss_pct = (pos.entry_price - open_price) / pos.entry_price * 100
-            if gap_loss_pct >= self.max_gap_loss_pct:
-                return True, ExitReason.GAP_PROTECTION, (
-                    f"갭 하락 보호 발동: 시가 {open_price:,.0f}원 "
-                    f"(손실 {gap_loss_pct:.1f}% >= {self.max_gap_loss_pct}%)"
+            reference_kind, reference_price = self._resolve_gap_reference_price(pos, df)
+            if reference_price is None or reference_price <= 0:
+                logger.info(
+                    f"[{GAP_REASON_DISABLED}] invalid gap reference: "
+                    f"kind={reference_kind}, ref={reference_price}"
                 )
+            else:
+                triggered, reason_code, raw_gap_pct = should_trigger_gap_protection(
+                    position=pos,
+                    open_price=open_price,
+                    reference_price=reference_price,
+                    threshold_pct=self.gap_threshold_pct,
+                    epsilon_pct=self.gap_epsilon_pct,
+                )
+                formatted_gap_pct = round(raw_gap_pct, 3)
+                if reason_code == GAP_REASON_DISABLED:
+                    logger.info(
+                        f"[{GAP_REASON_DISABLED}] 기준={reference_kind}, ref={reference_price}, "
+                        f"threshold={self.gap_threshold_pct}, epsilon={self.gap_epsilon_pct}"
+                    )
+                if triggered:
+                    return True, ExitReason.GAP_PROTECTION, (
+                        f"[{GAP_REASON_TRIGGERED}] 시가 {open_price:,.0f}원, "
+                        f"기준({reference_kind}) {float(reference_price):,.0f}원, "
+                        f"raw_gap_pct={raw_gap_pct:.6f}%, display_gap_pct={formatted_gap_pct:.3f}%, "
+                        f"threshold={float(self.gap_threshold_pct):.3f}%, "
+                        f"epsilon={float(self.gap_epsilon_pct):.6f}%"
+                    )
         
         # 2. ATR 손절 체크
         if current_price <= pos.stop_loss:
@@ -446,6 +500,27 @@ class MultidayTrendATRStrategy:
                 )
         
         return False, None, "Exit 조건 미충족"
+
+    def _resolve_gap_reference_price(
+        self,
+        pos: MultidayPosition,
+        df: Optional[pd.DataFrame],
+    ) -> Tuple[str, Optional[float]]:
+        """갭 비교 기준가를 반환합니다."""
+        kind = self.gap_reference
+        if kind == "entry":
+            return kind, pos.entry_price
+        if kind == "stop":
+            return kind, pos.stop_loss
+        if kind == "prev_close":
+            if df is not None and len(df) > 0:
+                try:
+                    prev_idx = -2 if len(df) >= 2 else -1
+                    return kind, float(df.iloc[prev_idx].get("close", 0))
+                except (TypeError, ValueError):
+                    return kind, None
+            return kind, None
+        return kind, None
     
     # ════════════════════════════════════════════════════════════════
     # 진입 조건 체크
@@ -597,6 +672,22 @@ class MultidayTrendATRStrategy:
             )
             
             if should_exit:
+                gap_raw = None
+                gap_display = None
+                gap_ref_kind = ""
+                gap_ref_price = None
+                reason_code = GAP_REASON_OTHER
+                if exit_reason == ExitReason.GAP_PROTECTION:
+                    gap_ref_kind, gap_ref_price = self._resolve_gap_reference_price(pos, df_with_indicators)
+                    _, reason_code, gap_raw = should_trigger_gap_protection(
+                        position=pos,
+                        open_price=open_price,
+                        reference_price=gap_ref_price,
+                        threshold_pct=self.gap_threshold_pct,
+                        epsilon_pct=self.gap_epsilon_pct,
+                    )
+                    gap_display = round(gap_raw, 3) if gap_raw is not None else None
+
                 trade_logger.log_signal(
                     signal_type="SELL",
                     stock_code=stock_code,
@@ -615,7 +706,12 @@ class MultidayTrendATRStrategy:
                     atr=pos.atr_at_entry,
                     trend=trend,
                     near_stop_loss_pct=pos.get_distance_to_stop_loss(current_price),
-                    near_take_profit_pct=pos.get_distance_to_take_profit(current_price)
+                    near_take_profit_pct=pos.get_distance_to_take_profit(current_price),
+                    gap_raw_pct=gap_raw,
+                    gap_display_pct=gap_display,
+                    gap_reference=gap_ref_kind,
+                    gap_reference_price=gap_ref_price,
+                    reason_code=reason_code,
                 )
             
             # Exit 조건 미충족 → HOLD

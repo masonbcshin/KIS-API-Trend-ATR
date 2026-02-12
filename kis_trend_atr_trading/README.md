@@ -231,6 +231,17 @@ selection_method:
 - 일반 API: 최대 3회, exponential backoff (`RETRY_DELAY * 2^attempt`)
 - 주문 API: 중복 주문 위험 때문에 재시도 0회 강제
 
+### Gap Protection 발동 정책
+
+- 기준 수식: `raw_gap_pct = ((open_price - reference_price) / reference_price) * 100`
+- 발동 조건(롱 전용): `raw_gap_pct <= -(gap_threshold_pct + gap_epsilon_pct)`
+- 비발동 조건:
+  - 이익 갭 (`raw_gap_pct > 0`)
+  - 본전/미세 노이즈 (`0%` 근처)
+  - `gap_threshold_pct` 누락 또는 `<= 0` (정책상 비활성화)
+- `abs()` 비교는 사용하지 않음
+- 로그/텔레그램에 `raw_gap_pct`와 표시값(`display`)을 함께 출력
+
 ---
 
 ## 6️⃣ 예외 처리
@@ -424,6 +435,7 @@ TRADING_MODE=REAL python main_multiday.py --mode trade \
 
 ```bash
 python -m unittest kis_trend_atr_trading.tests.test_universe_selector_unittest -v
+python -m unittest kis_trend_atr_trading.tests.test_gap_protection_unittest -v
 python -m pytest kis_trend_atr_trading/tests/test_api.py -q
 python -m pytest kis_trend_atr_trading/tests/test_executor.py::TestPositionRecognitionAfterRestart::test_position_lost_after_restart_simulation -q
 ```
@@ -438,4 +450,3 @@ python -m pytest kis_trend_atr_trading/tests/test_executor.py::TestPositionRecog
 - Universe 정책: `universe/universe_selector.py`, `config/universe.yaml`
 - DB/스키마: `db/mysql.py`, `db/schema_mysql.sql`
 - 로그/알림: `utils/logger.py`, `utils/telegram_notifier.py`
-

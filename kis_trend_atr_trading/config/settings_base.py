@@ -154,6 +154,15 @@ ENABLE_GAP_PROTECTION: bool = True
 # ★ 최대 갭 손실 허용 비율 (%) - 보수적 2.0%
 MAX_GAP_LOSS_PCT: float = 2.0
 
+# 갭 보호 발동 임계값(%) - 누락/0 이하이면 비활성화 정책
+GAP_THRESHOLD_PCT: float = 2.0
+
+# 갭 보호 비교 epsilon(%) - 0% 근처 노이즈 오판 방지
+GAP_EPSILON_PCT: float = 0.001
+
+# 갭 보호 기준가: entry | stop | prev_close
+GAP_REFERENCE: str = "entry"
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 일일 리스크 한도 (계좌 보호)

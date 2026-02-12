@@ -310,8 +310,11 @@ MESSAGE_TEMPLATES = {
 ━━━━━━━━━━━━━━━━━━
 • 종목: `{stock_code}`
 • 시가: {open_price:,}원
+• 기준가({reference_type}): {reference_price:,}원
 • 손절가: {stop_loss:,}원
-• 갭 손실: {gap_loss_pct:.1f}%
+• 갭(raw): {raw_gap_pct:.6f}%
+• 갭(표시): {gap_loss_pct:.3f}%
+• reason: {reason_code}
 ━━━━━━━━━━━━━━━━━━
 • 진입가: {entry_price:,}원
 • 예상 손익: {pnl:+,}원 ({pnl_pct:+.2f}%)
@@ -1157,6 +1160,10 @@ class TelegramNotifier:
         stop_loss: float,
         entry_price: float,
         gap_loss_pct: float,
+        raw_gap_pct: float,
+        reference_price: float,
+        reference_type: str,
+        reason_code: str,
         pnl: float,
         pnl_pct: float
     ) -> bool:
@@ -1168,7 +1175,11 @@ class TelegramNotifier:
             open_price: 시가
             stop_loss: 손절가
             entry_price: 진입가
-            gap_loss_pct: 갭 손실률
+            gap_loss_pct: 표시용 갭 손실률
+            raw_gap_pct: 내부 계산 raw 갭 손실률
+            reference_price: 갭 판단 기준가
+            reference_type: 갭 판단 기준 종류
+            reason_code: 갭 보호 판단 코드
             pnl: 예상 손익
             pnl_pct: 예상 손익률
         
@@ -1178,9 +1189,13 @@ class TelegramNotifier:
         message = MESSAGE_TEMPLATES["gap_protection"].format(
             stock_code=stock_code,
             open_price=int(open_price),
+            reference_price=int(reference_price),
+            reference_type=str(reference_type),
             stop_loss=int(stop_loss),
             entry_price=int(entry_price),
             gap_loss_pct=gap_loss_pct,
+            raw_gap_pct=raw_gap_pct,
+            reason_code=str(reason_code),
             pnl=int(pnl),
             pnl_pct=pnl_pct,
             timestamp=self._get_timestamp()

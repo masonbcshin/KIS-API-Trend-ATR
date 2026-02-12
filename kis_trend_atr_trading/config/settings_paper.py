@@ -73,6 +73,9 @@ MAX_CUMULATIVE_DRAWDOWN_PCT = 20.0
 
 # ★ 갭 보호는 모의투자에서도 반드시 활성화
 ENABLE_GAP_PROTECTION = True
+GAP_THRESHOLD_PCT = 2.0
+GAP_EPSILON_PCT = 0.001
+GAP_REFERENCE = "entry"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
