@@ -28,6 +28,7 @@ KIS Trend-ATR Trading System - MySQL 연동 트레이더
 """
 
 import os
+import hashlib
 from datetime import datetime, date
 from typing import Optional, Dict, List, Any, Tuple
 from dataclasses import dataclass
@@ -228,6 +229,15 @@ class DatabaseTrader:
         """초기화 확인"""
         if not self._initialized:
             self.initialize()
+
+    def _namespace_mode(self) -> str:
+        """DB 네임스페이스 모드(PAPER/REAL)로 변환합니다."""
+        return "REAL" if self.mode == TradingMode.LIVE else "PAPER"
+
+    @staticmethod
+    def _make_idempotency_key(parts: Tuple[Any, ...]) -> str:
+        raw = "|".join(str(p) for p in parts)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
     
     # ═══════════════════════════════════════════════════════════════════════════
     # 매수 로직
@@ -290,6 +300,10 @@ class DatabaseTrader:
         
         # 2. 모드별 처리
         order_no = ""
+        namespace_mode = self._namespace_mode()
+        idempotency_key = self._make_idempotency_key(
+            ("BUY", symbol, quantity, f"{price:.4f}", executed_at.strftime("%Y%m%d%H%M"), namespace_mode)
+        )
         
         if self.mode == TradingMode.SIGNAL_ONLY:
             # 신호만 기록 (체결 없음)
@@ -382,13 +396,13 @@ class DatabaseTrader:
                     INSERT INTO positions (
                         symbol, entry_price, quantity, entry_time,
                         atr_at_entry, stop_price, take_profit_price,
-                        trailing_stop, highest_price, status
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN')
+                        trailing_stop, highest_price, mode, status
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN')
                     """,
                     (
                         symbol, price, quantity, executed_at,
                         atr, stop_loss, take_profit,
-                        trailing_stop, price
+                        trailing_stop, price, namespace_mode
                     )
                 )
                 
@@ -396,10 +410,10 @@ class DatabaseTrader:
                 cursor.execute(
                     """
                     INSERT INTO trades (
-                        symbol, side, price, quantity, executed_at, order_no
-                    ) VALUES (%s, 'BUY', %s, %s, %s, %s)
+                        symbol, side, price, quantity, executed_at, order_no, mode, idempotency_key
+                    ) VALUES (%s, 'BUY', %s, %s, %s, %s, %s, %s)
                     """,
-                    (symbol, price, quantity, executed_at, order_no)
+                    (symbol, price, quantity, executed_at, order_no, namespace_mode, idempotency_key)
                 )
             
             logger.info(
@@ -517,6 +531,13 @@ class DatabaseTrader:
         
         # 3. 모드별 처리
         order_no = ""
+        namespace_mode = self._namespace_mode()
+        idempotency_key = self._make_idempotency_key(
+            (
+                "SELL", symbol, quantity, f"{price:.4f}", reason or "",
+                executed_at.strftime("%Y%m%d%H%M"), namespace_mode
+            )
+        )
         
         if self.mode == TradingMode.SIGNAL_ONLY:
             # 신호만 기록 (체결 없음)
@@ -610,9 +631,9 @@ class DatabaseTrader:
                     """
                     UPDATE positions 
                     SET status = 'CLOSED'
-                    WHERE symbol = %s AND status = 'OPEN'
+                    WHERE symbol = %s AND status = 'OPEN' AND mode = %s
                     """,
-                    (symbol,)
+                    (symbol, namespace_mode)
                 )
                 
                 # trades에 SELL 기록
@@ -620,12 +641,12 @@ class DatabaseTrader:
                     """
                     INSERT INTO trades (
                         symbol, side, price, quantity, executed_at,
-                        reason, pnl, pnl_percent, entry_price, holding_days, order_no
-                    ) VALUES (%s, 'SELL', %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        reason, pnl, pnl_percent, entry_price, holding_days, order_no, mode, idempotency_key
+                    ) VALUES (%s, 'SELL', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         symbol, price, quantity, executed_at,
-                        reason, pnl, pnl_percent, entry_price, holding_days, order_no
+                        reason, pnl, pnl_percent, entry_price, holding_days, order_no, namespace_mode, idempotency_key
                     )
                 )
             

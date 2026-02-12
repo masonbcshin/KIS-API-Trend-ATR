@@ -10,6 +10,7 @@ API 문서 참고: https://apiportal.koreainvestment.com/
 """
 
 import time
+import threading
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Tuple, Any
 import requests
@@ -72,9 +73,15 @@ class KISApi:
         # 토큰 관리
         self.access_token: Optional[str] = None
         self.token_expires_at: Optional[datetime] = None
-        
+        self._last_token_refresh_date = None
+        self._token_lock = threading.Lock()
+
         # Rate Limit 관리
         self._last_api_call_time: float = 0.0
+        
+        # 네트워크 상태 관리 (1분 이상 단절 시 거래 중단 판단)
+        self._network_down_since: Optional[float] = None
+        self._was_disconnected: bool = False
         
         logger.info(f"KIS API 클라이언트 초기화 완료 (모의투자: {is_paper_trading})")
     
@@ -115,7 +122,9 @@ class KISApi:
             KISApiError: API 호출 실패 시
         """
         if max_retries is None:
-            max_retries = settings.MAX_RETRIES
+            max_retries = min(int(settings.MAX_RETRIES), 3)
+        else:
+            max_retries = min(int(max_retries), 3)
         
         last_exception = None
         
@@ -147,6 +156,13 @@ class KISApi:
                 
                 # 성공적인 응답 확인
                 if response.status_code == 200:
+                    if self._network_down_since is not None:
+                        down_seconds = time.time() - self._network_down_since
+                        logger.warning(
+                            f"네트워크 복구 감지: 단절 {down_seconds:.1f}초 후 정상화"
+                        )
+                    self._network_down_since = None
+                    self._was_disconnected = False
                     return response
                 
                 # 에러 응답 처리
@@ -157,10 +173,12 @@ class KISApi:
             except requests.exceptions.Timeout as e:
                 logger.warning(f"API 타임아웃 (시도 {attempt + 1}/{max_retries + 1}): {e}")
                 last_exception = KISApiError(f"API 타임아웃: {e}")
+                self._mark_network_disconnected()
                 
             except requests.exceptions.RequestException as e:
                 logger.warning(f"API 요청 실패 (시도 {attempt + 1}/{max_retries + 1}): {e}")
                 last_exception = KISApiError(f"API 요청 실패: {e}")
+                self._mark_network_disconnected()
             
             # 재시도 전 대기
             if attempt < max_retries:
@@ -169,6 +187,18 @@ class KISApi:
                 time.sleep(wait_time)
         
         raise last_exception
+
+    def _mark_network_disconnected(self) -> None:
+        """네트워크 단절 상태를 기록합니다."""
+        if self._network_down_since is None:
+            self._network_down_since = time.time()
+            self._was_disconnected = True
+
+    def is_network_disconnected_for(self, seconds: int = 60) -> bool:
+        """지정 시간 이상 네트워크 단절 상태인지 확인합니다."""
+        if self._network_down_since is None:
+            return False
+        return (time.time() - self._network_down_since) >= seconds
     
     def _get_auth_headers(self, tr_id: str) -> Dict:
         """
@@ -209,36 +239,44 @@ class KISApi:
         Raises:
             KISApiError: 토큰 발급 실패 시
         """
-        # 토큰이 유효한 경우 재사용
-        if self.access_token and self.token_expires_at:
-            if datetime.now(KST) < self.token_expires_at - timedelta(minutes=10):
-                return self.access_token
-        
-        url = f"{self.base_url}/oauth2/tokenP"
-        headers = {"content-type": "application/json"}
-        body = {
-            "grant_type": "client_credentials",
-            "appkey": self.app_key,
-            "appsecret": self.app_secret
-        }
-        
-        logger.info("액세스 토큰 발급 요청...")
-        
-        response = self._request_with_retry("POST", url, headers, json_data=body)
-        data = response.json()
-        
-        if "access_token" not in data:
-            raise KISApiError(f"토큰 발급 실패: {data}")
-        
-        self.access_token = data["access_token"]
-        
-        # 토큰 만료 시간 설정 (KIS 토큰은 24시간 유효)
-        expires_in = int(data.get("expires_in", 86400))
-        self.token_expires_at = datetime.now(KST) + timedelta(seconds=expires_in)
-        
-        logger.info(f"액세스 토큰 발급 완료 (만료: {self.token_expires_at})")
-        
-        return self.access_token
+        with self._token_lock:
+            now_kst = datetime.now(KST)
+            today_kst = now_kst.date()
+
+            # 토큰이 유효하고 당일 갱신 이력이 있으면 재사용
+            if self.access_token and self.token_expires_at:
+                if (
+                    now_kst < self.token_expires_at - timedelta(minutes=10)
+                    and self._last_token_refresh_date == today_kst
+                ):
+                    return self.access_token
+
+            url = f"{self.base_url}/oauth2/tokenP"
+            headers = {"content-type": "application/json"}
+            body = {
+                "grant_type": "client_credentials",
+                "appkey": self.app_key,
+                "appsecret": self.app_secret
+            }
+            
+            logger.info("액세스 토큰 발급 요청...")
+            
+            response = self._request_with_retry("POST", url, headers, json_data=body)
+            data = response.json()
+            
+            if "access_token" not in data:
+                raise KISApiError(f"토큰 발급 실패: {data}")
+            
+            self.access_token = data["access_token"]
+            
+            # 토큰 만료 시간 설정 (KIS 토큰은 24시간 유효)
+            expires_in = int(data.get("expires_in", 86400))
+            self.token_expires_at = datetime.now(KST) + timedelta(seconds=expires_in)
+            self._last_token_refresh_date = today_kst
+            
+            logger.info(f"액세스 토큰 발급 완료 (만료: {self.token_expires_at})")
+            
+            return self.access_token
     
     # ════════════════════════════════════════════════════════════════
     # 시세 조회 API
@@ -516,7 +554,10 @@ class KISApi:
         logger.info(f"{order_side} 주문 요청: {stock_code}, {quantity}주, 가격: {price}")
         
         try:
-            response = self._request_with_retry("POST", url, headers, json_data=body)
+            # 주문 API는 재시도 시 중복 주문 위험이 있어 무조건 1회 호출
+            response = self._request_with_retry(
+                "POST", url, headers, json_data=body, max_retries=0
+            )
             data = response.json()
             
             success = data.get("rt_cd") == "0"

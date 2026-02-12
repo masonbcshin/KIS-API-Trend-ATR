@@ -33,6 +33,7 @@ KIS Trend-ATR Trading System - 환경 판별 모듈
 
 import os
 import sys
+from pathlib import Path
 from enum import Enum
 from typing import Optional
 
@@ -54,8 +55,20 @@ class Environment(Enum):
 # 환경 변수 이름
 TRADING_MODE_ENV_VAR = "TRADING_MODE"
 
-# 기본값: DEV (모의투자)
-# ★ 안전장치: 환경 변수가 설정되지 않으면 항상 DEV로 동작합니다.
+# 허용 모드 (정식)
+ALLOWED_TRADING_MODES = {"PAPER", "REAL"}
+
+# 하위 호환 모드 매핑
+LEGACY_MODE_MAP = {
+    "DEV": "PAPER",
+    "PROD": "REAL",
+    "LIVE": "REAL",
+    "CBT": "PAPER",
+    "SIGNAL_ONLY": "PAPER",
+}
+
+# 기본값: PAPER(모의투자)
+DEFAULT_TRADING_MODE = "PAPER"
 DEFAULT_ENVIRONMENT = Environment.DEV
 
 
@@ -93,12 +106,9 @@ def get_environment() -> Environment:
     if _cached_environment is not None:
         return _cached_environment
     
-    # 환경 변수 읽기
-    mode = os.getenv(TRADING_MODE_ENV_VAR, "").strip().upper()
-    
-    # ★ 핵심 안전장치: "PROD"가 아니면 모두 DEV로 처리
-    # 이로써 환경 변수 오타, 잘못된 값, 미설정 등 모든 상황에서 안전합니다.
-    if mode == "PROD":
+    mode = get_trading_mode()
+
+    if mode == "REAL":
         _cached_environment = Environment.PROD
     else:
         _cached_environment = Environment.DEV
@@ -151,6 +161,37 @@ def get_environment_name() -> str:
     return get_environment().value
 
 
+def get_trading_mode() -> str:
+    """
+    현재 트레이딩 모드를 PAPER/REAL로 반환합니다.
+
+    Raises:
+        ValueError: 허용값 외 TRADING_MODE가 설정된 경우
+    """
+    raw_mode = os.getenv(TRADING_MODE_ENV_VAR, DEFAULT_TRADING_MODE).strip().upper()
+    normalized = normalize_trading_mode(raw_mode)
+
+    if normalized not in ALLOWED_TRADING_MODES:
+        raise ValueError(
+            f"유효하지 않은 TRADING_MODE='{raw_mode}'. 허용값: {sorted(ALLOWED_TRADING_MODES)}"
+        )
+    return normalized
+
+
+def normalize_trading_mode(raw_mode: str) -> str:
+    """레거시 모드명을 PAPER/REAL 표준 모드명으로 정규화합니다."""
+    normalized = LEGACY_MODE_MAP.get(raw_mode, raw_mode)
+    return normalized
+
+
+def assert_not_real_mode(trading_mode: str) -> None:
+    """
+    PAPER 실행 경로에서 REAL 모드가 감지되면 즉시 예외를 발생시킵니다.
+    """
+    if trading_mode == "REAL":
+        raise AssertionError("PAPER 실행 경로에서 REAL 모드가 감지되었습니다.")
+
+
 def get_environment_description() -> str:
     """
     현재 환경에 대한 설명을 반환합니다.
@@ -177,6 +218,33 @@ def validate_environment() -> bool:
         bool: 검증 성공 여부
     """
     env = get_environment()
+    mode = get_trading_mode()
+
+    # .env와 런타임 환경 변수 불일치 확인
+    dotenv_mode = _read_dotenv_trading_mode()
+    runtime_mode_raw = os.getenv(TRADING_MODE_ENV_VAR, DEFAULT_TRADING_MODE).strip().upper()
+    runtime_mode = normalize_trading_mode(runtime_mode_raw)
+    if dotenv_mode and runtime_mode and dotenv_mode != runtime_mode:
+        print(
+            f"⚠️ TRADING_MODE 불일치: .env={dotenv_mode}, runtime={runtime_mode_raw}({runtime_mode}). "
+            "프로그램을 종료합니다."
+        )
+        return False
+
+    # PAPER 모드에서 실계좌 전용 키 존재 차단 (2중 방어)
+    if mode == "PAPER":
+        real_key_vars = [
+            "REAL_KIS_APP_KEY",
+            "REAL_KIS_APP_SECRET",
+            "REAL_KIS_ACCOUNT_NO",
+        ]
+        configured = [k for k in real_key_vars if os.getenv(k)]
+        if configured:
+            print(
+                f"⚠️ PAPER 모드에서 실계좌 키가 감지되었습니다: {configured}. "
+                "프로그램을 종료합니다."
+            )
+            return False
     
     # DEV 환경은 항상 유효
     if env == Environment.DEV:
@@ -272,6 +340,34 @@ def _log_environment_status(env: Environment) -> None:
         print("║  🔴 모든 주문은 실제 주문으로 처리됩니다!                  ║")
         print("╚═══════════════════════════════════════════════════════════╝")
         print("")
+
+
+def _read_dotenv_trading_mode() -> Optional[str]:
+    """
+    .env 파일의 TRADING_MODE 값을 읽어 정규화합니다.
+    파일/값이 없으면 None을 반환합니다.
+    """
+    env_file = Path(__file__).parent / ".env"
+    if not env_file.exists():
+        return None
+
+    try:
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, value = stripped.split("=", 1)
+            if key.strip() != TRADING_MODE_ENV_VAR:
+                continue
+            raw_mode = value.strip().strip('"').strip("'").upper()
+            normalized = LEGACY_MODE_MAP.get(raw_mode, raw_mode)
+            if normalized in ALLOWED_TRADING_MODES:
+                return normalized
+            return raw_mode
+    except Exception:
+        return None
+
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

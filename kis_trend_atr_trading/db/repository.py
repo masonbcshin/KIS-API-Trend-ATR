@@ -39,12 +39,28 @@ from datetime import datetime, date, timedelta
 from typing import Optional, Dict, List, Any, Tuple
 from dataclasses import dataclass
 from decimal import Decimal
+import hashlib
 
 from db.mysql import MySQLManager, get_db_manager, QueryError
 from utils.logger import get_logger
 from utils.market_hours import KST, get_today
+from env import get_trading_mode
 
 logger = get_logger("repository")
+
+
+def _get_namespace_mode() -> str:
+    """DB 네임스페이스용 모드를 반환합니다 (PAPER/REAL)."""
+    try:
+        return get_trading_mode()
+    except Exception:
+        return "PAPER"
+
+
+def _build_idempotency_key(parts: Tuple[Any, ...]) -> str:
+    """결정적 idempotency key를 생성합니다."""
+    raw = "|".join(str(p) for p in parts)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -67,6 +83,7 @@ class PositionRecord:
     take_profit_price: Optional[float]
     trailing_stop: Optional[float]
     highest_price: Optional[float]
+    mode: str = "PAPER"
     status: str = "OPEN"
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -83,6 +100,7 @@ class PositionRecord:
             "take_profit_price": float(self.take_profit_price) if self.take_profit_price else None,
             "trailing_stop": float(self.trailing_stop) if self.trailing_stop else None,
             "highest_price": float(self.highest_price) if self.highest_price else None,
+            "mode": self.mode,
             "status": self.status
         }
     
@@ -99,6 +117,7 @@ class PositionRecord:
             take_profit_price=float(data["take_profit_price"]) if data.get("take_profit_price") else None,
             trailing_stop=float(data["trailing_stop"]) if data.get("trailing_stop") else None,
             highest_price=float(data["highest_price"]) if data.get("highest_price") else None,
+            mode=data.get("mode", "PAPER"),
             status=data.get("status", "OPEN"),
             created_at=data.get("created_at"),
             updated_at=data.get("updated_at")
@@ -123,6 +142,8 @@ class TradeRecord:
     entry_price: Optional[float] = None
     holding_days: Optional[int] = None
     order_no: Optional[str] = None
+    idempotency_key: Optional[str] = None
+    mode: str = "PAPER"
     id: Optional[int] = None
     created_at: Optional[datetime] = None
     
@@ -140,7 +161,9 @@ class TradeRecord:
             "pnl_percent": float(self.pnl_percent) if self.pnl_percent is not None else None,
             "entry_price": float(self.entry_price) if self.entry_price else None,
             "holding_days": self.holding_days,
-            "order_no": self.order_no
+            "order_no": self.order_no,
+            "idempotency_key": self.idempotency_key,
+            "mode": self.mode
         }
 
 
@@ -156,6 +179,7 @@ class AccountSnapshotRecord:
     cash: float
     unrealized_pnl: float = 0.0
     realized_pnl: float = 0.0
+    mode: str = "PAPER"
     position_count: int = 0
     created_at: Optional[datetime] = None
     
@@ -167,6 +191,7 @@ class AccountSnapshotRecord:
             "cash": float(self.cash),
             "unrealized_pnl": float(self.unrealized_pnl),
             "realized_pnl": float(self.realized_pnl),
+            "mode": self.mode,
             "position_count": self.position_count
         }
 
@@ -211,6 +236,7 @@ class PositionRepository:
             db: MySQLManager 인스턴스 (미입력 시 싱글톤 사용)
         """
         self.db = db or get_db_manager()
+        self.mode = _get_namespace_mode()
     
     def save(
         self,
@@ -262,8 +288,8 @@ class PositionRepository:
                 INSERT INTO positions (
                     symbol, entry_price, quantity, entry_time,
                     atr_at_entry, stop_price, take_profit_price,
-                    trailing_stop, highest_price, status
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN')
+                    trailing_stop, highest_price, mode, status
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN')
                 ON DUPLICATE KEY UPDATE
                     entry_price = VALUES(entry_price),
                     quantity = VALUES(quantity),
@@ -273,12 +299,13 @@ class PositionRepository:
                     take_profit_price = VALUES(take_profit_price),
                     trailing_stop = VALUES(trailing_stop),
                     highest_price = VALUES(highest_price),
+                    mode = VALUES(mode),
                     status = 'OPEN'
                 """,
                 (
                     symbol, entry_price, quantity, entry_time,
                     atr_at_entry, stop_price, take_profit_price,
-                    trailing_stop, highest_price
+                    trailing_stop, highest_price, self.mode
                 )
             )
             
@@ -323,8 +350,8 @@ class PositionRepository:
                 INSERT INTO positions (
                     symbol, entry_price, quantity, entry_time,
                     atr_at_entry, stop_price, take_profit_price,
-                    trailing_stop, highest_price, status
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN')
+                    trailing_stop, highest_price, mode, status
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN')
                 ON DUPLICATE KEY UPDATE
                     entry_price = VALUES(entry_price),
                     quantity = VALUES(quantity),
@@ -334,12 +361,13 @@ class PositionRepository:
                     take_profit_price = VALUES(take_profit_price),
                     trailing_stop = VALUES(trailing_stop),
                     highest_price = VALUES(highest_price),
+                    mode = VALUES(mode),
                     status = 'OPEN'
                 """,
                 (
                     symbol, entry_price, quantity, entry_time,
                     atr_at_entry, stop_price, take_profit_price,
-                    trailing_stop, highest_price
+                    trailing_stop, highest_price, self.mode
                 )
             )
             return self.get_by_symbol(symbol)
@@ -358,8 +386,8 @@ class PositionRepository:
             PositionRecord: 포지션 (없으면 None)
         """
         result = self.db.execute_query(
-            "SELECT * FROM positions WHERE symbol = %s",
-            (symbol,),
+            "SELECT * FROM positions WHERE symbol = %s AND mode = %s",
+            (symbol, self.mode),
             fetch_one=True
         )
         
@@ -375,7 +403,8 @@ class PositionRepository:
             List[PositionRecord]: 열린 포지션 목록
         """
         results = self.db.execute_query(
-            "SELECT * FROM positions WHERE status = 'OPEN' ORDER BY entry_time"
+            "SELECT * FROM positions WHERE status = 'OPEN' AND mode = %s ORDER BY entry_time",
+            (self.mode,)
         )
         
         return [PositionRecord.from_dict(r) for r in results]
@@ -383,7 +412,8 @@ class PositionRepository:
     def get_all_positions(self) -> List[PositionRecord]:
         """모든 포지션(OPEN + CLOSED) 조회"""
         results = self.db.execute_query(
-            "SELECT * FROM positions ORDER BY entry_time DESC"
+            "SELECT * FROM positions WHERE mode = %s ORDER BY entry_time DESC",
+            (self.mode,)
         )
         return [PositionRecord.from_dict(r) for r in results]
     
@@ -399,13 +429,14 @@ class PositionRepository:
         """
         if symbol:
             result = self.db.execute_query(
-                "SELECT COUNT(*) as cnt FROM positions WHERE symbol = %s AND status = 'OPEN'",
-                (symbol,),
+                "SELECT COUNT(*) as cnt FROM positions WHERE symbol = %s AND status = 'OPEN' AND mode = %s",
+                (symbol, self.mode),
                 fetch_one=True
             )
         else:
             result = self.db.execute_query(
-                "SELECT COUNT(*) as cnt FROM positions WHERE status = 'OPEN'",
+                "SELECT COUNT(*) as cnt FROM positions WHERE status = 'OPEN' AND mode = %s",
+                (self.mode,),
                 fetch_one=True
             )
         
@@ -433,9 +464,9 @@ class PositionRepository:
                 """
                 UPDATE positions 
                 SET trailing_stop = %s, highest_price = %s
-                WHERE symbol = %s AND status = 'OPEN'
+                WHERE symbol = %s AND status = 'OPEN' AND mode = %s
                 """,
-                (trailing_stop, highest_price, symbol)
+                (trailing_stop, highest_price, symbol, self.mode)
             )
             
             if affected > 0:
@@ -465,9 +496,9 @@ class PositionRepository:
                 """
                 UPDATE positions 
                 SET status = 'CLOSED'
-                WHERE symbol = %s AND status = 'OPEN'
+                WHERE symbol = %s AND status = 'OPEN' AND mode = %s
                 """,
-                (symbol,)
+                (symbol, self.mode)
             )
             
             if affected > 0:
@@ -493,8 +524,8 @@ class PositionRepository:
         """
         try:
             affected = self.db.execute_command(
-                "DELETE FROM positions WHERE symbol = %s",
-                (symbol,)
+                "DELETE FROM positions WHERE symbol = %s AND mode = %s",
+                (symbol, self.mode)
             )
             return affected > 0
         except QueryError as e:
@@ -529,6 +560,7 @@ class TradeRepository:
     
     def __init__(self, db: MySQLManager = None):
         self.db = db or get_db_manager()
+        self.mode = _get_namespace_mode()
     
     def save_buy(
         self,
@@ -536,7 +568,8 @@ class TradeRepository:
         price: float,
         quantity: int,
         executed_at: datetime = None,
-        order_no: str = None
+        order_no: str = None,
+        idempotency_key: str = None
     ) -> Optional[TradeRecord]:
         """
         매수 기록을 저장합니다.
@@ -552,15 +585,18 @@ class TradeRepository:
             TradeRecord: 저장된 거래 기록
         """
         executed_at = executed_at or datetime.now(KST)
+        idempotency_key = idempotency_key or _build_idempotency_key(
+            ("BUY", symbol, quantity, f"{price:.4f}", order_no or "", executed_at.isoformat(), self.mode)
+        )
         
         try:
             # INSERT 실행 후 LAST_INSERT_ID 반환
             trade_id = self.db.execute_insert(
                 """
-                INSERT INTO trades (symbol, side, price, quantity, executed_at, order_no)
-                VALUES (%s, 'BUY', %s, %s, %s, %s)
+                INSERT INTO trades (symbol, side, price, quantity, executed_at, order_no, mode, idempotency_key)
+                VALUES (%s, 'BUY', %s, %s, %s, %s, %s, %s)
                 """,
-                (symbol, price, quantity, executed_at, order_no)
+                (symbol, price, quantity, executed_at, order_no, self.mode, idempotency_key)
             )
             
             if trade_id:
@@ -572,7 +608,9 @@ class TradeRepository:
                     price=price,
                     quantity=quantity,
                     executed_at=executed_at,
-                    order_no=order_no
+                    order_no=order_no,
+                    idempotency_key=idempotency_key,
+                    mode=self.mode
                 )
             return None
             
@@ -589,7 +627,8 @@ class TradeRepository:
         reason: str = None,
         holding_days: int = None,
         executed_at: datetime = None,
-        order_no: str = None
+        order_no: str = None,
+        idempotency_key: str = None
     ) -> Optional[TradeRecord]:
         """
         매도 기록을 저장합니다.
@@ -617,19 +656,22 @@ class TradeRepository:
         if entry_price and entry_price > 0:
             pnl = (price - entry_price) * quantity
             pnl_percent = ((price - entry_price) / entry_price) * 100
+        idempotency_key = idempotency_key or _build_idempotency_key(
+            ("SELL", symbol, quantity, f"{price:.4f}", order_no or "", reason or "", executed_at.isoformat(), self.mode)
+        )
         
         try:
             trade_id = self.db.execute_insert(
                 """
                 INSERT INTO trades (
                     symbol, side, price, quantity, executed_at,
-                    reason, pnl, pnl_percent, entry_price, holding_days, order_no
+                    reason, pnl, pnl_percent, entry_price, holding_days, order_no, mode, idempotency_key
                 )
-                VALUES (%s, 'SELL', %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, 'SELL', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     symbol, price, quantity, executed_at,
-                    reason, pnl, pnl_percent, entry_price, holding_days, order_no
+                    reason, pnl, pnl_percent, entry_price, holding_days, order_no, self.mode, idempotency_key
                 )
             )
             
@@ -649,7 +691,9 @@ class TradeRepository:
                     pnl_percent=pnl_percent,
                     entry_price=entry_price,
                     holding_days=holding_days,
-                    order_no=order_no
+                    order_no=order_no,
+                    idempotency_key=idempotency_key,
+                    mode=self.mode
                 )
             return None
             
@@ -665,7 +709,8 @@ class TradeRepository:
         quantity: int,
         reason: str = None,
         entry_price: float = None,
-        executed_at: datetime = None
+        executed_at: datetime = None,
+        idempotency_key: str = None
     ) -> Optional[TradeRecord]:
         """
         신호만 기록합니다 (실매매 없음).
@@ -692,17 +737,20 @@ class TradeRepository:
         if side == "SELL" and entry_price and entry_price > 0:
             pnl = (price - entry_price) * quantity
             pnl_percent = ((price - entry_price) / entry_price) * 100
+        idempotency_key = idempotency_key or _build_idempotency_key(
+            ("SIGNAL_ONLY", side, symbol, quantity, f"{price:.4f}", executed_at.isoformat(), self.mode)
+        )
         
         try:
             trade_id = self.db.execute_insert(
                 """
                 INSERT INTO trades (
                     symbol, side, price, quantity, executed_at,
-                    reason, pnl, pnl_percent, entry_price
+                    reason, pnl, pnl_percent, entry_price, mode, idempotency_key
                 )
-                VALUES (%s, %s, %s, %s, %s, 'SIGNAL_ONLY', %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, 'SIGNAL_ONLY', %s, %s, %s, %s, %s)
                 """,
-                (symbol, side, price, quantity, executed_at, pnl, pnl_percent, entry_price)
+                (symbol, side, price, quantity, executed_at, pnl, pnl_percent, entry_price, self.mode, idempotency_key)
             )
             
             if trade_id:
@@ -717,7 +765,9 @@ class TradeRepository:
                     reason="SIGNAL_ONLY",
                     pnl=pnl,
                     pnl_percent=pnl_percent,
-                    entry_price=entry_price
+                    entry_price=entry_price,
+                    idempotency_key=idempotency_key,
+                    mode=self.mode
                 )
             return None
             
@@ -744,19 +794,19 @@ class TradeRepository:
             results = self.db.execute_query(
                 """
                 SELECT * FROM trades 
-                WHERE DATE(executed_at) = %s AND symbol = %s
+                WHERE DATE(executed_at) = %s AND symbol = %s AND mode = %s
                 ORDER BY executed_at
                 """,
-                (trade_date, symbol)
+                (trade_date, symbol, self.mode)
             )
         else:
             results = self.db.execute_query(
                 """
                 SELECT * FROM trades 
-                WHERE DATE(executed_at) = %s
+                WHERE DATE(executed_at) = %s AND mode = %s
                 ORDER BY executed_at
                 """,
-                (trade_date,)
+                (trade_date, self.mode)
             )
         
         return [self._to_record(r) for r in results]
@@ -779,11 +829,11 @@ class TradeRepository:
         results = self.db.execute_query(
             """
             SELECT * FROM trades 
-            WHERE symbol = %s
+            WHERE symbol = %s AND mode = %s
             ORDER BY executed_at DESC
             LIMIT %s
             """,
-            (symbol, limit)
+            (symbol, self.mode, limit)
         )
         
         return [self._to_record(r) for r in results]
@@ -791,8 +841,8 @@ class TradeRepository:
     def get_recent_trades(self, limit: int = 50) -> List[TradeRecord]:
         """최근 거래 기록 조회"""
         results = self.db.execute_query(
-            "SELECT * FROM trades ORDER BY executed_at DESC LIMIT %s",
-            (limit,)
+            "SELECT * FROM trades WHERE mode = %s ORDER BY executed_at DESC LIMIT %s",
+            (self.mode, limit)
         )
         return [self._to_record(r) for r in results]
     
@@ -820,9 +870,9 @@ class TradeRepository:
                 MAX(pnl) as max_profit,
                 MIN(pnl) as max_loss
             FROM trades
-            WHERE DATE(executed_at) = %s
+            WHERE DATE(executed_at) = %s AND mode = %s
             """,
-            (trade_date,),
+            (trade_date, self.mode),
             fetch_one=True
         )
         
@@ -878,8 +928,9 @@ class TradeRepository:
                 MIN(pnl) as max_loss,
                 AVG(holding_days) as avg_holding_days
             FROM trades
-            WHERE side = 'SELL' AND reason != 'SIGNAL_ONLY'
+            WHERE side = 'SELL' AND reason != 'SIGNAL_ONLY' AND mode = %s
             """,
+            (self.mode,),
             fetch_one=True
         )
         
@@ -943,10 +994,11 @@ class TradeRepository:
                 AVG(pnl) as avg_pnl,
                 SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins
             FROM trades
-            WHERE side = 'SELL' AND reason IS NOT NULL
+            WHERE side = 'SELL' AND reason IS NOT NULL AND mode = %s
             GROUP BY reason
             ORDER BY count DESC
-            """
+            """,
+            (self.mode,)
         )
         
         return [
@@ -975,6 +1027,8 @@ class TradeRepository:
             entry_price=float(row["entry_price"]) if row.get("entry_price") else None,
             holding_days=row.get("holding_days"),
             order_no=row.get("order_no"),
+            idempotency_key=row.get("idempotency_key"),
+            mode=row.get("mode", "PAPER"),
             created_at=row.get("created_at")
         )
 
@@ -995,6 +1049,7 @@ class AccountSnapshotRepository:
     
     def __init__(self, db: MySQLManager = None):
         self.db = db or get_db_manager()
+        self.mode = _get_namespace_mode()
     
     def save(
         self,
@@ -1027,19 +1082,20 @@ class AccountSnapshotRepository:
                 """
                 INSERT INTO account_snapshots (
                     snapshot_time, total_equity, cash, 
-                    unrealized_pnl, realized_pnl, position_count
+                    unrealized_pnl, realized_pnl, mode, position_count
                 )
-                VALUES (%s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
                     total_equity = VALUES(total_equity),
                     cash = VALUES(cash),
                     unrealized_pnl = VALUES(unrealized_pnl),
                     realized_pnl = VALUES(realized_pnl),
+                    mode = VALUES(mode),
                     position_count = VALUES(position_count)
                 """,
                 (
                     snapshot_time, total_equity, cash,
-                    unrealized_pnl, realized_pnl, position_count
+                    unrealized_pnl, realized_pnl, self.mode, position_count
                 )
             )
             
@@ -1050,6 +1106,7 @@ class AccountSnapshotRepository:
                 cash=cash,
                 unrealized_pnl=unrealized_pnl,
                 realized_pnl=realized_pnl,
+                mode=self.mode,
                 position_count=position_count
             )
             
@@ -1060,7 +1117,8 @@ class AccountSnapshotRepository:
     def get_latest(self) -> Optional[AccountSnapshotRecord]:
         """최신 스냅샷 조회"""
         result = self.db.execute_query(
-            "SELECT * FROM account_snapshots ORDER BY snapshot_time DESC LIMIT 1",
+            "SELECT * FROM account_snapshots WHERE mode = %s ORDER BY snapshot_time DESC LIMIT 1",
+            (self.mode,),
             fetch_one=True
         )
         
@@ -1073,10 +1131,10 @@ class AccountSnapshotRepository:
         results = self.db.execute_query(
             """
             SELECT * FROM account_snapshots 
-            WHERE DATE(snapshot_time) = %s
+            WHERE DATE(snapshot_time) = %s AND mode = %s
             ORDER BY snapshot_time
             """,
-            (snapshot_date,)
+            (snapshot_date, self.mode)
         )
         
         return [self._to_record(r) for r in results]
@@ -1106,11 +1164,11 @@ class AccountSnapshotRepository:
                  WHERE DATE(a2.snapshot_time) = DATE(a1.snapshot_time)
                  ORDER BY a2.snapshot_time DESC LIMIT 1) as end_equity
             FROM account_snapshots a1
-            WHERE snapshot_time >= %s
+            WHERE snapshot_time >= %s AND mode = %s
             GROUP BY DATE(snapshot_time)
             ORDER BY trade_date
             """,
-            (cutoff,)
+            (cutoff, self.mode)
         )
         
         return [
@@ -1191,6 +1249,7 @@ class AccountSnapshotRepository:
             cash=float(row["cash"]),
             unrealized_pnl=float(row.get("unrealized_pnl") or 0),
             realized_pnl=float(row.get("realized_pnl") or 0),
+            mode=row.get("mode", "PAPER"),
             position_count=row.get("position_count", 0),
             created_at=row.get("created_at")
         )

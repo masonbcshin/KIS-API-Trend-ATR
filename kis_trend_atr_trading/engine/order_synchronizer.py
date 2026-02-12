@@ -20,6 +20,7 @@ import sys
 import time
 import fcntl
 import atexit
+import hashlib
 from pathlib import Path
 from datetime import datetime, time as dt_time
 from typing import List, Tuple, Optional, Dict, Set, Any
@@ -28,6 +29,12 @@ from enum import Enum
 
 from utils.logger import get_logger
 from utils.market_hours import KST
+from env import get_trading_mode
+
+try:
+    from db.mysql import get_db_manager
+except Exception:  # pragma: no cover - DB 미사용 환경
+    get_db_manager = None
 
 logger = get_logger("order_synchronizer")
 
@@ -37,6 +44,7 @@ logger = get_logger("order_synchronizer")
 # ════════════════════════════════════════════════════════════════
 
 LOCK_FILE_PATH = Path(__file__).parent.parent / "data" / "instance.lock"
+LOCK_STALE_TIMEOUT_SECONDS = int(os.getenv("INSTANCE_LOCK_STALE_TIMEOUT", "3600"))
 
 # 한국 주식시장 시간
 MARKET_OPEN = dt_time(9, 0, 0)
@@ -114,6 +122,7 @@ class SingleInstanceLock:
             bool: 락 획득 성공 여부
         """
         try:
+            self._cleanup_stale_lock_file()
             self._lock_fd = open(self.lock_file, 'w')
             fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             
@@ -142,6 +151,42 @@ class SingleInstanceLock:
         except Exception as e:
             logger.error(f"[LOCK] 락 획득 중 오류: {e}")
             return False
+
+    def _cleanup_stale_lock_file(self) -> None:
+        """stale lock 파일을 정리합니다. (프로세스 비존재 + 타임아웃 경과)"""
+        if not self.lock_file.exists():
+            return
+
+        try:
+            info = self.get_running_instance_info() or {}
+            pid_raw = info.get("PID")
+            started_raw = info.get("Started")
+
+            process_alive = False
+            if pid_raw and pid_raw.isdigit():
+                pid = int(pid_raw)
+                try:
+                    os.kill(pid, 0)
+                    process_alive = True
+                except OSError:
+                    process_alive = False
+
+            if process_alive:
+                return
+
+            if started_raw:
+                try:
+                    started_at = datetime.fromisoformat(started_raw)
+                    age = (datetime.now(KST) - started_at).total_seconds()
+                    if age < LOCK_STALE_TIMEOUT_SECONDS:
+                        return
+                except Exception:
+                    pass
+
+            self.lock_file.unlink(missing_ok=True)
+            logger.warning("[LOCK] stale lock 파일을 정리했습니다.")
+        except Exception as e:
+            logger.debug(f"[LOCK] stale lock 정리 스킵: {e}")
     
     def release(self) -> None:
         """락을 해제합니다."""
@@ -399,11 +444,100 @@ class OrderSynchronizer:
         self.api = api
         self.market_checker = market_checker or MarketHoursChecker()
         self.execution_timeout = execution_timeout
+        self.mode = get_trading_mode()
+        self._db = get_db_manager() if get_db_manager else None
+
+    def _build_idempotency_key(
+        self,
+        side: str,
+        stock_code: str,
+        quantity: int,
+        signal_id: str
+    ) -> str:
+        if not signal_id:
+            signal_id = datetime.now(KST).strftime("%Y%m%d%H%M")
+        raw = f"{self.mode}|{side}|{stock_code}|{quantity}|{signal_id}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _upsert_order_state(
+        self,
+        idempotency_key: str,
+        signal_id: str,
+        stock_code: str,
+        side: str,
+        quantity: int,
+        status: str,
+        order_no: str = "",
+        fill_id: str = "",
+        filled_qty: int = 0,
+        remaining_qty: int = 0
+    ) -> None:
+        if not self._db:
+            return
+        try:
+            with self._db.transaction() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO order_state (
+                        idempotency_key, signal_id, symbol, side,
+                        requested_qty, filled_qty, remaining_qty, order_no,
+                        fill_id, status, mode
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        filled_qty = VALUES(filled_qty),
+                        remaining_qty = VALUES(remaining_qty),
+                        order_no = VALUES(order_no),
+                        fill_id = VALUES(fill_id),
+                        status = VALUES(status),
+                        mode = VALUES(mode)
+                    """,
+                    (
+                        idempotency_key, signal_id, stock_code, side,
+                        quantity, filled_qty, remaining_qty, order_no or None,
+                        fill_id or None, status, self.mode
+                    )
+                )
+        except Exception as e:
+            logger.warning(f"[SYNC] order_state 저장 실패: {e}")
+
+    def _get_order_state(self, idempotency_key: str) -> Optional[Dict[str, Any]]:
+        if not self._db:
+            return None
+        try:
+            return self._db.execute_query(
+                "SELECT * FROM order_state WHERE idempotency_key = %s",
+                (idempotency_key,),
+                fetch_one=True
+            )
+        except Exception as e:
+            logger.warning(f"[SYNC] order_state 조회 실패: {e}")
+            return None
+
+    def recover_pending_orders(self) -> List[Dict[str, Any]]:
+        """
+        재시작 시 DB의 pending/submitted/partial 주문을 재구성합니다.
+        """
+        if not self._db:
+            return []
+        try:
+            rows = self._db.execute_query(
+                """
+                SELECT * FROM order_state
+                WHERE mode = %s AND status IN ('PENDING','SUBMITTED','PARTIAL')
+                ORDER BY updated_at ASC
+                """,
+                (self.mode,)
+            ) or []
+            return rows
+        except Exception as e:
+            logger.warning(f"[SYNC] pending 주문 복구 조회 실패: {e}")
+            return []
     
     def execute_buy_order(
         self,
         stock_code: str,
         quantity: int,
+        signal_id: str = "",
         skip_market_check: bool = False
     ) -> SynchronizedOrderResult:
         """
@@ -434,6 +568,32 @@ class OrderSynchronizer:
                     message=reason
                 )
         
+        idempotency_key = self._build_idempotency_key("BUY", stock_code, quantity, signal_id)
+        existing = self._get_order_state(idempotency_key)
+        if existing and existing.get("status") in ("PENDING", "SUBMITTED", "PARTIAL", "FILLED"):
+            logger.warning(
+                f"[SYNC] 중복 매수 주문 차단: {stock_code}, idem={idempotency_key[:12]}..., "
+                f"status={existing.get('status')}"
+            )
+            return SynchronizedOrderResult(
+                success=False,
+                result_type=OrderExecutionResult.FAILED,
+                order_no=existing.get("order_no", "") or "",
+                exec_qty=int(existing.get("filled_qty") or 0),
+                message=f"중복 주문 차단(status={existing.get('status')})"
+            )
+
+        self._upsert_order_state(
+            idempotency_key=idempotency_key,
+            signal_id=signal_id,
+            stock_code=stock_code,
+            side="BUY",
+            quantity=quantity,
+            status="PENDING",
+            filled_qty=0,
+            remaining_qty=quantity
+        )
+
         # 2. 매수 주문 전송
         logger.info(f"[SYNC] 매수 주문 시작: {stock_code} {quantity}주")
         
@@ -453,6 +613,17 @@ class OrderSynchronizer:
                 )
             
             order_no = order_result.get("order_no", "")
+            self._upsert_order_state(
+                idempotency_key=idempotency_key,
+                signal_id=signal_id,
+                stock_code=stock_code,
+                side="BUY",
+                quantity=quantity,
+                status="SUBMITTED",
+                order_no=order_no,
+                filled_qty=0,
+                remaining_qty=quantity
+            )
             
         except Exception as e:
             logger.error(f"[SYNC] 매수 주문 전송 오류: {e}")
@@ -473,6 +644,17 @@ class OrderSynchronizer:
         
         # 4. 결과 반환
         if exec_result.get("status") == "FILLED":
+            self._upsert_order_state(
+                idempotency_key=idempotency_key,
+                signal_id=signal_id,
+                stock_code=stock_code,
+                side="BUY",
+                quantity=quantity,
+                status="FILLED",
+                order_no=order_no,
+                filled_qty=exec_result.get("exec_qty", 0),
+                remaining_qty=0
+            )
             return SynchronizedOrderResult(
                 success=True,
                 result_type=OrderExecutionResult.SUCCESS,
@@ -483,6 +665,18 @@ class OrderSynchronizer:
             )
         
         elif exec_result.get("status") == "PARTIAL":
+            filled_qty = exec_result.get("exec_qty", 0)
+            self._upsert_order_state(
+                idempotency_key=idempotency_key,
+                signal_id=signal_id,
+                stock_code=stock_code,
+                side="BUY",
+                quantity=quantity,
+                status="PARTIAL",
+                order_no=order_no,
+                filled_qty=filled_qty,
+                remaining_qty=max(quantity - filled_qty, 0)
+            )
             return SynchronizedOrderResult(
                 success=False,
                 result_type=OrderExecutionResult.PARTIAL,
@@ -493,6 +687,17 @@ class OrderSynchronizer:
             )
         
         else:
+            self._upsert_order_state(
+                idempotency_key=idempotency_key,
+                signal_id=signal_id,
+                stock_code=stock_code,
+                side="BUY",
+                quantity=quantity,
+                status="CANCELLED",
+                order_no=order_no,
+                filled_qty=exec_result.get("exec_qty", 0),
+                remaining_qty=max(quantity - exec_result.get("exec_qty", 0), 0)
+            )
             return SynchronizedOrderResult(
                 success=False,
                 result_type=OrderExecutionResult.CANCELLED,
@@ -506,6 +711,7 @@ class OrderSynchronizer:
         self,
         stock_code: str,
         quantity: int,
+        signal_id: str = "",
         skip_market_check: bool = False,
         is_emergency: bool = False
     ) -> SynchronizedOrderResult:
@@ -543,6 +749,32 @@ class OrderSynchronizer:
                 else:
                     logger.warning(f"[SYNC] 동시호가 중 매도 시도: {reason}")
         
+        idempotency_key = self._build_idempotency_key("SELL", stock_code, quantity, signal_id)
+        existing = self._get_order_state(idempotency_key)
+        if existing and existing.get("status") in ("PENDING", "SUBMITTED", "PARTIAL", "FILLED"):
+            logger.warning(
+                f"[SYNC] 중복 매도 주문 차단: {stock_code}, idem={idempotency_key[:12]}..., "
+                f"status={existing.get('status')}"
+            )
+            return SynchronizedOrderResult(
+                success=False,
+                result_type=OrderExecutionResult.FAILED,
+                order_no=existing.get("order_no", "") or "",
+                exec_qty=int(existing.get("filled_qty") or 0),
+                message=f"중복 주문 차단(status={existing.get('status')})"
+            )
+
+        self._upsert_order_state(
+            idempotency_key=idempotency_key,
+            signal_id=signal_id,
+            stock_code=stock_code,
+            side="SELL",
+            quantity=quantity,
+            status="PENDING",
+            filled_qty=0,
+            remaining_qty=quantity
+        )
+
         # 2. 매도 주문 전송
         timeout = self.execution_timeout * 3 if is_emergency else self.execution_timeout
         logger.info(f"[SYNC] 매도 주문 시작: {stock_code} {quantity}주 (긴급={is_emergency})")
@@ -563,6 +795,17 @@ class OrderSynchronizer:
                 )
             
             order_no = order_result.get("order_no", "")
+            self._upsert_order_state(
+                idempotency_key=idempotency_key,
+                signal_id=signal_id,
+                stock_code=stock_code,
+                side="SELL",
+                quantity=quantity,
+                status="SUBMITTED",
+                order_no=order_no,
+                filled_qty=0,
+                remaining_qty=quantity
+            )
             
         except Exception as e:
             logger.error(f"[SYNC] 매도 주문 전송 오류: {e}")
@@ -583,6 +826,17 @@ class OrderSynchronizer:
         
         # 4. 결과 반환
         if exec_result.get("status") == "FILLED":
+            self._upsert_order_state(
+                idempotency_key=idempotency_key,
+                signal_id=signal_id,
+                stock_code=stock_code,
+                side="SELL",
+                quantity=quantity,
+                status="FILLED",
+                order_no=order_no,
+                filled_qty=exec_result.get("exec_qty", 0),
+                remaining_qty=0
+            )
             return SynchronizedOrderResult(
                 success=True,
                 result_type=OrderExecutionResult.SUCCESS,
@@ -593,6 +847,18 @@ class OrderSynchronizer:
             )
         
         elif exec_result.get("status") == "PARTIAL":
+            filled_qty = exec_result.get("exec_qty", 0)
+            self._upsert_order_state(
+                idempotency_key=idempotency_key,
+                signal_id=signal_id,
+                stock_code=stock_code,
+                side="SELL",
+                quantity=quantity,
+                status="PARTIAL",
+                order_no=order_no,
+                filled_qty=filled_qty,
+                remaining_qty=max(quantity - filled_qty, 0)
+            )
             # 부분 체결 시 - 미체결분은 이미 취소 시도됨
             return SynchronizedOrderResult(
                 success=False,
@@ -604,6 +870,17 @@ class OrderSynchronizer:
             )
         
         else:
+            self._upsert_order_state(
+                idempotency_key=idempotency_key,
+                signal_id=signal_id,
+                stock_code=stock_code,
+                side="SELL",
+                quantity=quantity,
+                status="CANCELLED",
+                order_no=order_no,
+                filled_qty=exec_result.get("exec_qty", 0),
+                remaining_qty=max(quantity - exec_result.get("exec_qty", 0), 0)
+            )
             return SynchronizedOrderResult(
                 success=False,
                 result_type=OrderExecutionResult.CANCELLED,
@@ -631,7 +908,7 @@ class PositionResynchronizer:
         - "DB vs 실제 계좌 vs 메모리 상태 불일치" 해결
     """
     
-    def __init__(self, api, position_store, db_repository=None):
+    def __init__(self, api, position_store, db_repository=None, trading_mode: str = None):
         """
         Args:
             api: KIS API 클라이언트
@@ -641,6 +918,7 @@ class PositionResynchronizer:
         self.api = api
         self.position_store = position_store
         self.db_repository = db_repository
+        self.trading_mode = trading_mode or get_trading_mode()
 
     @staticmethod
     def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -757,28 +1035,42 @@ class PositionResynchronizer:
             "warnings": []
         }
         
-        # 1. API로 실제 보유 조회
-        try:
-            self.api.get_access_token()
-            balance = self.api.get_account_balance()
-            
-            if not balance.get("success"):
-                result["warnings"].append("계좌 잔고 조회 실패")
+        api_holdings: Dict[str, Dict[str, Any]] = {}
+        if self.trading_mode == "REAL":
+            # 1. API로 실제 보유 조회 (REAL 모드에서만)
+            try:
+                self.api.get_access_token()
+                balance = self.api.get_account_balance()
+                
+                if not balance.get("success"):
+                    result["warnings"].append("계좌 잔고 조회 실패")
+                    return result
+                
+                holdings = balance.get("holdings", [])
+                api_holdings = {h["stock_code"]: h for h in holdings if h.get("quantity", 0) > 0}
+
+                # ★ DB는 항상 실계좌 보유를 기준으로 선반영
+                self._sync_db_positions_from_api(api_holdings, result)
+
+            except Exception as e:
+                result["warnings"].append(f"API 오류: {str(e)}")
                 return result
-            
-            holdings = balance.get("holdings", [])
-            api_holdings = {h["stock_code"]: h for h in holdings if h.get("quantity", 0) > 0}
-
-            # ★ DB는 항상 실계좌 보유를 기준으로 선반영
-            self._sync_db_positions_from_api(api_holdings, result)
-
-        except Exception as e:
-            result["warnings"].append(f"API 오류: {str(e)}")
-            return result
         
         # 2. 저장된 포지션 로드
         stored_position = self.position_store.load_position()
-        
+
+        # PAPER 모드는 API 계좌 동기화를 하지 않고 저장 상태만 사용
+        if self.trading_mode != "REAL":
+            if stored_position is None:
+                result["success"] = True
+                result["position"] = None
+                result["action"] = "NO_POSITION"
+            else:
+                result["success"] = True
+                result["position"] = stored_position
+                result["action"] = "MATCHED"
+            return result
+
         # 3. 불일치 해결
         if stored_position is None and not api_holdings:
             # 케이스 1: 저장 없음 + 보유 없음 → 정상
@@ -862,6 +1154,11 @@ class PositionResynchronizer:
             "holdings": [],
             "action": ""
         }
+
+        if self.trading_mode != "REAL":
+            result["success"] = True
+            result["action"] = "SKIPPED_NON_REAL_MODE"
+            return result
         
         try:
             self.api.get_access_token()

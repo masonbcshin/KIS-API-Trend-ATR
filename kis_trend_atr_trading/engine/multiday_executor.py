@@ -140,7 +140,8 @@ class MultidayExecutor:
         self.position_resync = PositionResynchronizer(
             api=self.api,
             position_store=self.position_store,
-            db_repository=self.db_position_repo
+            db_repository=self.db_position_repo,
+            trading_mode="REAL" if self.trading_mode == "LIVE" else self.trading_mode
         )
         
         # 실행 상태
@@ -220,6 +221,13 @@ class MultidayExecutor:
         logger.info("=" * 50)
         logger.info("포지션 재동기화 프로세스 시작")
         logger.info("=" * 50)
+
+        pending_orders = self.order_synchronizer.recover_pending_orders()
+        if pending_orders:
+            logger.warning(
+                f"[RESYNC] DB 기준 미종결 주문 {len(pending_orders)}건 발견 "
+                "(open_orders/pending_orders/partial_fills 복구 필요)"
+            )
         
         # ★ API 기준 재동기화 (감사 보고서 지적 해결)
         sync_result = self.position_resync.synchronize_on_startup()
@@ -424,6 +432,10 @@ class MultidayExecutor:
             sync_result = self.order_synchronizer.execute_buy_order(
                 stock_code=self.stock_code,
                 quantity=self.order_quantity,
+                signal_id=(
+                    f"{self.stock_code}:BUY:{signal.price:.2f}:"
+                    f"{datetime.now(KST).strftime('%Y%m%d%H%M')}"
+                ),
                 skip_market_check=True  # 위에서 이미 체크함
             )
             
@@ -585,6 +597,10 @@ class MultidayExecutor:
             sync_result = self.order_synchronizer.execute_sell_order(
                 stock_code=self.stock_code,
                 quantity=pos.quantity,
+                signal_id=(
+                    f"{self.stock_code}:SELL:{signal.price:.2f}:"
+                    f"{datetime.now(KST).strftime('%Y%m%d%H%M')}"
+                ),
                 is_emergency=is_emergency
             )
             
@@ -851,6 +867,11 @@ class MultidayExecutor:
             current_price, open_price = self.fetch_current_price()
             if current_price <= 0:
                 result["error"] = "현재가 조회 실패"
+                return result
+
+            if hasattr(self.api, "is_network_disconnected_for") and self.api.is_network_disconnected_for(60):
+                result["error"] = "네트워크 단절 60초 이상 지속 - 안전모드로 거래 중단"
+                logger.error(result["error"])
                 return result
             
             # 3. 시그널 생성

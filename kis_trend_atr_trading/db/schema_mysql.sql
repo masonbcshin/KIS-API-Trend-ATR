@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS positions (
     take_profit_price DECIMAL(15, 2) NULL COMMENT '익절가 (이 가격 이상이면 익절, NULL 가능)',
     trailing_stop DECIMAL(15, 2) NULL COMMENT '트레일링 스탑 (최고가 기준으로 움직임)',
     highest_price DECIMAL(15, 2) NULL COMMENT '보유 중 최고가 (트레일링 계산용)',
+    mode VARCHAR(16) NOT NULL DEFAULT 'PAPER' COMMENT '실행 모드 네임스페이스 (PAPER/REAL)',
     
     -- 상태 ─────────────────────────────────────────────
     -- OPEN: 현재 보유 중
@@ -76,6 +77,7 @@ CREATE TABLE IF NOT EXISTS positions (
 
 -- 상태별 조회를 빠르게 하기 위한 인덱스
 CREATE INDEX idx_positions_status ON positions(status);
+CREATE INDEX idx_positions_mode_status ON positions(mode, status);
 
 
 -- ───────────────────────────────────────────────────────────────────────────────
@@ -124,6 +126,8 @@ CREATE TABLE IF NOT EXISTS trades (
     
     -- 메타 정보 ─────────────────────────────────────────
     order_no VARCHAR(50) NULL COMMENT '주문번호 (KIS API 응답값)',
+    mode VARCHAR(16) NOT NULL DEFAULT 'PAPER' COMMENT '실행 모드 네임스페이스 (PAPER/REAL)',
+    idempotency_key VARCHAR(128) NOT NULL COMMENT '중복 주문 방지 키',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '생성 시간'
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='모든 매수/매도 거래 기록. 성과 분석 및 히스토리 추적용.';
 
@@ -132,6 +136,8 @@ CREATE INDEX idx_trades_symbol ON trades(symbol);
 CREATE INDEX idx_trades_executed_at ON trades(executed_at);
 CREATE INDEX idx_trades_side ON trades(side);
 CREATE INDEX idx_trades_reason ON trades(reason);
+CREATE UNIQUE INDEX uq_trades_idempotency_key ON trades(idempotency_key);
+CREATE INDEX idx_trades_mode_executed_at ON trades(mode, executed_at);
 
 -- 일별 집계용 인덱스
 CREATE INDEX idx_trades_date ON trades((DATE(executed_at)));
@@ -161,6 +167,7 @@ CREATE TABLE IF NOT EXISTS account_snapshots (
     cash DECIMAL(15, 2) NOT NULL COMMENT '현금',
     unrealized_pnl DECIMAL(15, 2) DEFAULT 0 COMMENT '미실현 손익',
     realized_pnl DECIMAL(15, 2) DEFAULT 0 COMMENT '실현 손익 (누적)',
+    mode VARCHAR(16) NOT NULL DEFAULT 'PAPER' COMMENT '실행 모드 네임스페이스 (PAPER/REAL)',
     
     -- 포지션 정보 ───────────────────────────────────────
     position_count INT DEFAULT 0 COMMENT '보유 포지션 수',
@@ -171,10 +178,36 @@ CREATE TABLE IF NOT EXISTS account_snapshots (
 
 -- 날짜별 조회를 위한 인덱스
 CREATE INDEX idx_snapshots_date ON account_snapshots((DATE(snapshot_time)));
+CREATE INDEX idx_snapshots_mode_time ON account_snapshots(mode, snapshot_time);
 
 
 -- ───────────────────────────────────────────────────────────────────────────────
--- 4. daily_summary 테이블: 일별 요약
+-- 4-1. 주문 상태 테이블: 재시작 복원용
+-- ───────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS order_state (
+    id INT AUTO_INCREMENT PRIMARY KEY COMMENT '주문 상태 고유 ID',
+    idempotency_key VARCHAR(128) NOT NULL COMMENT '중복 주문 방지 키',
+    signal_id VARCHAR(64) NULL COMMENT '전략 신호 ID',
+    symbol VARCHAR(20) NOT NULL COMMENT '종목 코드',
+    side VARCHAR(10) NOT NULL COMMENT 'BUY/SELL',
+    requested_qty INT NOT NULL COMMENT '요청 수량',
+    filled_qty INT NOT NULL DEFAULT 0 COMMENT '체결 수량',
+    remaining_qty INT NOT NULL DEFAULT 0 COMMENT '미체결 수량',
+    order_no VARCHAR(50) NULL COMMENT '브로커 주문번호',
+    fill_id VARCHAR(64) NULL COMMENT '체결 이벤트 ID',
+    status VARCHAR(20) NOT NULL COMMENT 'PENDING/SUBMITTED/PARTIAL/FILLED/CANCELLED/FAILED',
+    mode VARCHAR(16) NOT NULL DEFAULT 'PAPER' COMMENT '실행 모드 네임스페이스',
+    requested_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '요청 시각',
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '갱신 시각',
+    UNIQUE KEY uq_order_state_idem (idempotency_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='재시작 복원과 중복방지용 주문 상태';
+
+CREATE INDEX idx_order_state_mode_status ON order_state(mode, status);
+CREATE INDEX idx_order_state_order_no ON order_state(order_no);
+
+
+-- ───────────────────────────────────────────────────────────────────────────────
+-- 5. daily_summary 테이블: 일별 요약
 -- ───────────────────────────────────────────────────────────────────────────────
 --
 -- ★ 왜 필요한가?

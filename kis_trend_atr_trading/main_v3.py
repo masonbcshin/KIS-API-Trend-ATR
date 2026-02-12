@@ -37,8 +37,10 @@ KIS Trend-ATR Trading System v3.0 - 완전 자동 무인 운용 버전
 """
 
 import argparse
+import subprocess
 import sys
 import signal
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -48,6 +50,8 @@ from typing import Optional
 
 from env import (
     get_environment, 
+    get_trading_mode,
+    assert_not_real_mode,
     is_dev, 
     is_prod, 
     Environment,
@@ -155,6 +159,16 @@ BANNER = """
 ║                                                                               ║
 ╚═══════════════════════════════════════════════════════════════════════════════╝
 """
+
+
+def _get_git_commit_hash() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            text=True
+        ).strip()
+    except Exception:
+        return "unknown"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -845,17 +859,42 @@ def main():
         default=None,
         help="최대 실행 횟수 (기본: 무제한)"
     )
+
+    parser.add_argument(
+        "--confirm-real-trading",
+        action="store_true",
+        help="REAL 모드 실행 확인 플래그 (REAL 모드 필수)"
+    )
     
     args = parser.parse_args()
     
     # 배너 출력
     print(BANNER)
     print(f"버전: {VERSION}")
+    print(f"git commit: {_get_git_commit_hash()}")
     print(f"시작 시간: {datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')}")
     
     # 환경 정보
     env = get_environment()
+    trading_mode = get_trading_mode()
     print(f"환경: {env.value}")
+
+    if not validate_environment():
+        print("❌ 환경 검증 실패로 프로그램을 종료합니다.")
+        raise SystemExit(1)
+
+    if trading_mode == "REAL":
+        if not args.confirm_real_trading:
+            print("❌ REAL 모드에서는 --confirm-real-trading 인자가 필수입니다.")
+            raise SystemExit(1)
+
+        print("\n" + "═" * 72)
+        print("⚠️ REAL 모드 진입: 10초 후 실계좌 거래를 시작합니다.")
+        print("⚠️ 취소하려면 지금 Ctrl+C를 누르세요.")
+        print("═" * 72 + "\n")
+        time.sleep(10)
+    else:
+        assert_not_real_mode(trading_mode)
     
     # 설정 요약
     print_config_summary()

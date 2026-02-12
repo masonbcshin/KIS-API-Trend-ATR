@@ -9,10 +9,12 @@ import logging
 import os
 import sys
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
 from .market_hours import KST
+from env import get_trading_mode
 
 # 로그 디렉토리 설정 (기본: ~/auto-trade/logs)
 LOG_DIR = Path(os.path.expanduser(os.getenv("AUTO_TRADE_LOG_DIR", "~/auto-trade/logs")))
@@ -53,8 +55,12 @@ def setup_logger(
     if logger.handlers:
         return logger
     
-    # 로그 레벨 설정
-    log_level = getattr(logging, level.upper(), logging.INFO)
+    # PAPER/REAL 정책: 둘 다 INFO 기본 (전략 내부 디버그만 DEBUG 별도 사용)
+    mode = get_trading_mode()
+    if mode in ("PAPER", "REAL"):
+        log_level = logging.INFO
+    else:
+        log_level = getattr(logging, level.upper(), logging.INFO)
     logger.setLevel(log_level)
     
     # 로그 포맷 설정
@@ -81,10 +87,12 @@ def setup_logger(
         log_filename = f"{name}_{datetime.now(KST).strftime('%Y%m%d')}.log"
         log_filepath = log_dir / log_filename
         
-        file_handler = logging.FileHandler(
+        file_handler = RotatingFileHandler(
             log_filepath,
             encoding="utf-8",
-            mode="a"
+            mode="a",
+            maxBytes=10 * 1024 * 1024,
+            backupCount=10
         )
         file_handler.setLevel(log_level)
         file_handler.setFormatter(formatter)

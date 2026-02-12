@@ -31,7 +31,10 @@ KIS Trend-ATR Trading System - 멀티데이 전략 실행 파일
 """
 
 import argparse
+import os
 import sys
+import time
+import subprocess
 from datetime import datetime
 
 # 프로젝트 모듈 임포트
@@ -42,6 +45,7 @@ from engine.multiday_executor import MultidayExecutor
 from backtest.backtester import Backtester
 from utils.logger import setup_logger, get_logger
 from utils.market_hours import KST
+from env import get_trading_mode, validate_environment, assert_not_real_mode
 
 
 def print_banner():
@@ -238,7 +242,24 @@ def run_backtest(stock_code: str, days: int = 365):
         logger.error(f"백테스트 오류: {e}")
 
 
-def run_trade(stock_code: str, interval: int = 60, max_runs: int = None):
+def _get_git_commit_hash() -> str:
+    """현재 git commit hash를 반환합니다."""
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            text=True
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+def run_trade(
+    stock_code: str,
+    interval: int = 60,
+    max_runs: int = None,
+    real_first_order_percent: int = 10,
+    real_limit_symbols_first_day: bool = True
+):
     """
     멀티데이 거래 실행
     
@@ -273,8 +294,18 @@ def run_trade(stock_code: str, interval: int = 60, max_runs: int = None):
     print(settings.get_settings_summary())
     
     try:
+        # REAL 첫날 종목수 제한 (세이프가드)
+        trading_mode = get_trading_mode()
+        if trading_mode == "REAL" and real_limit_symbols_first_day:
+            if os.getenv("REAL_TRADING_DAY1", "true").lower() in ("true", "1", "yes"):
+                if stock_code != settings.DEFAULT_STOCK_CODE:
+                    raise RuntimeError(
+                        "REAL 첫날 종목 수 제한이 활성화되었습니다. "
+                        f"기본 종목({settings.DEFAULT_STOCK_CODE})만 허용됩니다."
+                    )
+
         # API 클라이언트 생성
-        is_paper = settings.TRADING_MODE != "LIVE"
+        is_paper = trading_mode != "REAL"
         api = KISApi(is_paper_trading=is_paper)
         
         print("🔑 API 토큰 발급 중...")
@@ -285,11 +316,20 @@ def run_trade(stock_code: str, interval: int = 60, max_runs: int = None):
         strategy = MultidayTrendATRStrategy()
         
         # 멀티데이 실행 엔진 생성
+        order_quantity = settings.ORDER_QUANTITY
+        if trading_mode == "REAL":
+            capped_qty = max(1, int(order_quantity * (real_first_order_percent / 100.0)))
+            order_quantity = min(order_quantity, capped_qty)
+            logger.warning(
+                f"[SAFEGUARD] REAL 첫 주문 수량 제한 적용: {order_quantity}주 "
+                f"({real_first_order_percent}% of max_position_size)"
+            )
+
         executor = MultidayExecutor(
             api=api,
             strategy=strategy,
             stock_code=stock_code,
-            order_quantity=settings.ORDER_QUANTITY
+            order_quantity=order_quantity
         )
         
         # 포지션 복원 시도
@@ -337,8 +377,11 @@ def run_trade(stock_code: str, interval: int = 60, max_runs: int = None):
 
 def main():
     """메인 함수"""
+    trading_mode = get_trading_mode()
+    log_level = "INFO" if trading_mode in ("PAPER", "REAL") else settings.LOG_LEVEL
+
     # 로거 초기화
-    setup_logger("main", settings.LOG_LEVEL)
+    setup_logger("main", log_level)
     logger = get_logger("main")
     
     # 명령행 파서
@@ -404,6 +447,26 @@ def main():
         default=365,
         help="백테스트 기간 (일, 기본: 365)"
     )
+
+    parser.add_argument(
+        "--confirm-real-trading",
+        action="store_true",
+        help="REAL 모드 실행 확인 플래그 (REAL 모드 필수)"
+    )
+
+    parser.add_argument(
+        "--real-first-order-percent",
+        type=int,
+        default=10,
+        help="REAL 모드 첫 주문 수량 제한 비율 (기본: 10)"
+    )
+
+    parser.add_argument(
+        "--real-limit-symbols-first-day",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="REAL 첫날 종목 수 1개 제한 세이프가드 (기본: 활성화)"
+    )
     
     args = parser.parse_args()
     
@@ -412,6 +475,26 @@ def main():
     
     # 시작 시간
     start_time = datetime.now(KST)
+    trading_mode = get_trading_mode()
+
+    if not validate_environment():
+        print("❌ 환경 검증 실패로 프로그램을 종료합니다.")
+        raise SystemExit(1)
+
+    if trading_mode == "REAL":
+        if not args.confirm_real_trading:
+            print("❌ REAL 모드에서는 --confirm-real-trading 인자가 필수입니다.")
+            raise SystemExit(1)
+
+        print("\n" + "═" * 72)
+        print("⚠️ REAL 모드 진입: 10초 후 실계좌 거래를 시작합니다.")
+        print("⚠️ 취소하려면 지금 Ctrl+C를 누르세요.")
+        print("═" * 72 + "\n")
+        time.sleep(10)
+    else:
+        assert_not_real_mode(trading_mode)
+
+    logger.info(f"git_commit={_get_git_commit_hash()}")
     logger.info(f"프로그램 시작: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"실행 모드: {args.mode}, 트레이딩 모드: {settings.TRADING_MODE}")
     
@@ -427,7 +510,9 @@ def main():
         run_trade(
             stock_code=args.stock,
             interval=interval,
-            max_runs=args.max_runs
+            max_runs=args.max_runs,
+            real_first_order_percent=max(1, min(100, args.real_first_order_percent)),
+            real_limit_symbols_first_day=args.real_limit_symbols_first_day
         )
         
     elif args.mode == "verify":

@@ -103,6 +103,7 @@ class DatabaseConfig:
     pool_name: str = "kis_trading_pool"
     pool_size: int = 5
     pool_reset_session: bool = True
+    pool_recycle_seconds: int = 1800
     
     # 타임아웃 설정 (초)
     connect_timeout: int = 10
@@ -123,6 +124,8 @@ class DatabaseConfig:
         
         env_enabled = os.getenv("DB_ENABLED", "true").lower()
         self.enabled = env_enabled in ("true", "1", "yes")
+        # e2-micro 메모리 제약 대응: 커넥션 풀 상한 5 고정
+        self.pool_size = min(max(int(self.pool_size), 1), 5)
     
     def to_dict(self) -> Dict[str, Any]:
         """딕셔너리로 변환 (mysql.connector.connect용)"""
@@ -308,14 +311,16 @@ class MySQLManager:
             raise ConnectionError("데이터베이스에 연결되어 있지 않습니다.")
         
         conn = self._pool.get_connection()
+        conn.ping(reconnect=True, attempts=1, delay=0)
 
         # 세션 타임존을 KST로 고정하여 CURDATE/NOW 등 DB 날짜 함수의 기준을 일치시킵니다.
         try:
             with conn.cursor() as cursor:
                 cursor.execute("SET time_zone = '+09:00'")
+                cursor.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
         except MySQLError as e:
             conn.close()
-            raise ConnectionError(f"세션 타임존 설정 실패: {e}")
+            raise ConnectionError(f"세션 초기 설정 실패(타임존/격리수준): {e}")
 
         return conn
     
@@ -613,6 +618,20 @@ class MySQLManager:
                     statement = statement.strip()
                     if statement:
                         cursor.execute(statement)
+
+                # 기존 DB 호환을 위한 안전 마이그레이션
+                migration_sql = [
+                    "ALTER TABLE positions ADD COLUMN IF NOT EXISTS mode VARCHAR(16) NOT NULL DEFAULT 'PAPER'",
+                    "ALTER TABLE trades ADD COLUMN IF NOT EXISTS mode VARCHAR(16) NOT NULL DEFAULT 'PAPER'",
+                    "ALTER TABLE trades ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(128) NULL",
+                    "ALTER TABLE account_snapshots ADD COLUMN IF NOT EXISTS mode VARCHAR(16) NOT NULL DEFAULT 'PAPER'",
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_trades_idempotency_key ON trades(idempotency_key)",
+                ]
+                for stmt in migration_sql:
+                    try:
+                        cursor.execute(stmt)
+                    except MySQLError as e:
+                        logger.warning(f"[DB] 마이그레이션 건너뜀: {stmt} ({e})")
                 conn.commit()
                 
             logger.info("[DB] 스키마 초기화 완료")
@@ -645,12 +664,14 @@ class MySQLManager:
             take_profit_price DECIMAL(15, 2) NULL,
             trailing_stop DECIMAL(15, 2) NULL,
             highest_price DECIMAL(15, 2) NULL,
+            mode VARCHAR(16) NOT NULL DEFAULT 'PAPER',
             status VARCHAR(20) NOT NULL DEFAULT 'OPEN',
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         
         CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
+        CREATE INDEX IF NOT EXISTS idx_positions_mode_status ON positions(mode, status);
         
         CREATE TABLE IF NOT EXISTS trades (
             id INT AUTO_INCREMENT PRIMARY KEY,
@@ -665,12 +686,16 @@ class MySQLManager:
             entry_price DECIMAL(15, 2) NULL,
             holding_days INT NULL,
             order_no VARCHAR(50) NULL,
+            mode VARCHAR(16) NOT NULL DEFAULT 'PAPER',
+            idempotency_key VARCHAR(128) NOT NULL,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         
         CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol);
         CREATE INDEX IF NOT EXISTS idx_trades_executed_at ON trades(executed_at);
         CREATE INDEX IF NOT EXISTS idx_trades_side ON trades(side);
+        CREATE INDEX IF NOT EXISTS idx_trades_mode_executed_at ON trades(mode, executed_at);
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_trades_idempotency_key ON trades(idempotency_key);
         
         CREATE TABLE IF NOT EXISTS account_snapshots (
             snapshot_time DATETIME NOT NULL PRIMARY KEY,
@@ -678,11 +703,34 @@ class MySQLManager:
             cash DECIMAL(15, 2) NOT NULL,
             unrealized_pnl DECIMAL(15, 2) DEFAULT 0,
             realized_pnl DECIMAL(15, 2) DEFAULT 0,
+            mode VARCHAR(16) NOT NULL DEFAULT 'PAPER',
             position_count INT DEFAULT 0,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         
-        CREATE INDEX IF NOT EXISTS idx_snapshots_time ON account_snapshots(snapshot_time)
+        CREATE INDEX IF NOT EXISTS idx_snapshots_time ON account_snapshots(snapshot_time);
+        CREATE INDEX IF NOT EXISTS idx_snapshots_mode_time ON account_snapshots(mode, snapshot_time);
+
+        CREATE TABLE IF NOT EXISTS order_state (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            idempotency_key VARCHAR(128) NOT NULL,
+            signal_id VARCHAR(64) NULL,
+            symbol VARCHAR(20) NOT NULL,
+            side VARCHAR(10) NOT NULL,
+            requested_qty INT NOT NULL,
+            filled_qty INT NOT NULL DEFAULT 0,
+            remaining_qty INT NOT NULL DEFAULT 0,
+            order_no VARCHAR(50) NULL,
+            fill_id VARCHAR(64) NULL,
+            status VARCHAR(20) NOT NULL,
+            mode VARCHAR(16) NOT NULL DEFAULT 'PAPER',
+            requested_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_order_state_idem (idempotency_key)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+        CREATE INDEX IF NOT EXISTS idx_order_state_mode_status ON order_state(mode, status);
+        CREATE INDEX IF NOT EXISTS idx_order_state_order_no ON order_state(order_no)
         """
     
     def table_exists(self, table_name: str) -> bool:
