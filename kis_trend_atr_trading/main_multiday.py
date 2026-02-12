@@ -44,6 +44,7 @@ from api.kis_api import KISApi, KISApiError
 from strategy.multiday_trend_atr import MultidayTrendATRStrategy
 from engine.multiday_executor import MultidayExecutor
 from engine.order_synchronizer import get_instance_lock
+from engine.risk_manager import create_risk_manager_from_settings
 from backtest.backtester import Backtester
 from universe import UniverseSelector
 from utils.logger import setup_logger, get_logger
@@ -366,12 +367,14 @@ def run_trade(
             return PositionStore(file_path=data_dir / f"positions_{symbol}.json")
 
         print("🔄 저장된 포지션 확인 중...")
+        shared_risk_manager = create_risk_manager_from_settings()
         for symbol in run_symbols:
             executor = MultidayExecutor(
                 api=api,
                 strategy=MultidayTrendATRStrategy(),
                 stock_code=symbol,
                 order_quantity=order_quantity,
+                risk_manager=shared_risk_manager,
                 position_store=_symbol_position_store(symbol),
             )
             restored = executor.restore_position_on_start()

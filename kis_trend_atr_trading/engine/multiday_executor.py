@@ -76,6 +76,8 @@ class MultidayExecutor:
     """
     _shared_account_snapshot: Optional[Dict[str, Any]] = None
     _shared_account_snapshot_ts: Optional[datetime] = None
+    _pending_recovery_done: bool = False
+    _pending_recovery_count: int = 0
     
     def __init__(
         self,
@@ -159,6 +161,7 @@ class MultidayExecutor:
         self._last_near_sl_alert = None
         self._last_near_tp_alert = None
         self._last_trailing_update = None
+        self._last_market_closed_skip_log_at: Optional[datetime] = None
         
         # 일별 거래 기록
         self._daily_trades = []
@@ -278,11 +281,19 @@ class MultidayExecutor:
         logger.info("포지션 재동기화 프로세스 시작")
         logger.info("=" * 50)
 
-        pending_orders = self.order_synchronizer.recover_pending_orders()
-        if pending_orders:
-            logger.warning(
-                f"[RESYNC] DB 기준 미종결 주문 {len(pending_orders)}건 발견 "
-                "(open_orders/pending_orders/partial_fills 복구 필요)"
+        if not self.__class__._pending_recovery_done:
+            pending_orders = self.order_synchronizer.recover_pending_orders()
+            self.__class__._pending_recovery_done = True
+            self.__class__._pending_recovery_count = len(pending_orders)
+            if pending_orders:
+                logger.warning(
+                    f"[RESYNC] DB 기준 미종결 주문 {len(pending_orders)}건 발견 "
+                    "(open_orders/pending_orders/partial_fills 복구 필요)"
+                )
+        elif self.__class__._pending_recovery_count:
+            logger.info(
+                f"[RESYNC] 미종결 주문 점검은 이미 수행됨 "
+                f"(count={self.__class__._pending_recovery_count})"
             )
         
         # ★ API 기준 재동기화 (감사 보고서 지적 해결)
@@ -1070,8 +1081,22 @@ class MultidayExecutor:
             "position": None,
             "error": None
         }
-        
+
         try:
+            tradeable_now, market_reason = self.market_checker.is_tradeable()
+            if not self.strategy.has_position and not tradeable_now:
+                now = datetime.now(KST)
+                if (
+                    self._last_market_closed_skip_log_at is None
+                    or (now - self._last_market_closed_skip_log_at).total_seconds() >= 300
+                ):
+                    logger.info(
+                        f"[{self.stock_code}] 장외로 신규 시그널 계산 스킵: {market_reason}"
+                    )
+                    self._last_market_closed_skip_log_at = now
+                result["error"] = f"market_closed_skip:{market_reason}"
+                return result
+
             # 1. 시장 데이터 조회
             df = self.fetch_market_data()
             if df.empty:

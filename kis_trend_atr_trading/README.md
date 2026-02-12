@@ -215,6 +215,7 @@ selection_method:
 - `당일 실현 손익`: 당일 청산된 거래의 누적 손익(리스크 한도 판정 기준)
 - `계좌 평가손익`: KIS 잔고조회(`get_account_balance`) 기준 평가손익
 - 두 값은 목적이 다르므로 동일하지 않을 수 있음
+- 멀티종목 실행에서는 공용 `RiskManager` 인스턴스를 공유하여 계좌 단위 한도로 관리
 
 ### idempotency key
 
@@ -305,6 +306,7 @@ selection_method:
 
 - `order_state` 테이블에서 `PENDING/SUBMITTED/PARTIAL` 조회
 - 프로그램 시작 직후 복구 대상 건수 로그 출력
+- `PENDING_ORDER_STALE_MINUTES`(기본 240분) 이상 갱신 없는 미종결 건은 시작 시 `CANCELLED`로 자동 정리
 
 ### partial fill 복구
 

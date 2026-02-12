@@ -22,7 +22,7 @@ import fcntl
 import atexit
 import hashlib
 from pathlib import Path
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, timedelta
 from typing import List, Tuple, Optional, Dict, Set, Any
 from dataclasses import dataclass
 from enum import Enum
@@ -45,6 +45,7 @@ logger = get_logger("order_synchronizer")
 
 LOCK_FILE_PATH = Path(__file__).parent.parent / "data" / "instance.lock"
 LOCK_STALE_TIMEOUT_SECONDS = int(os.getenv("INSTANCE_LOCK_STALE_TIMEOUT", "3600"))
+PENDING_ORDER_STALE_MINUTES = int(os.getenv("PENDING_ORDER_STALE_MINUTES", "240"))
 
 # 한국 주식시장 시간
 MARKET_OPEN = dt_time(9, 0, 0)
@@ -552,6 +553,11 @@ class OrderSynchronizer:
             return []
         self._ensure_order_state_table()
         try:
+            stale_closed = self._cleanup_stale_pending_orders()
+            if stale_closed > 0:
+                logger.warning(
+                    f"[SYNC] stale 미종결 주문 {stale_closed}건을 CANCELLED로 정리했습니다."
+                )
             rows = self._db.execute_query(
                 """
                 SELECT * FROM order_state
@@ -564,6 +570,30 @@ class OrderSynchronizer:
         except Exception as e:
             logger.warning(f"[SYNC] pending 주문 복구 조회 실패: {e}")
             return []
+
+    def _cleanup_stale_pending_orders(self) -> int:
+        """
+        지정 시간 이상 갱신되지 않은 미종결 주문을 CANCELLED 처리합니다.
+        """
+        if not self._db or PENDING_ORDER_STALE_MINUTES <= 0:
+            return 0
+
+        cutoff = datetime.now(KST) - timedelta(minutes=PENDING_ORDER_STALE_MINUTES)
+        try:
+            affected = self._db.execute_command(
+                """
+                UPDATE order_state
+                   SET status = 'CANCELLED'
+                 WHERE mode = %s
+                   AND status IN ('PENDING', 'SUBMITTED', 'PARTIAL')
+                   AND updated_at < %s
+                """,
+                (self.mode, cutoff)
+            )
+            return int(affected or 0)
+        except Exception as e:
+            logger.warning(f"[SYNC] stale 미종결 주문 정리 실패: {e}")
+            return 0
     
     def execute_buy_order(
         self,

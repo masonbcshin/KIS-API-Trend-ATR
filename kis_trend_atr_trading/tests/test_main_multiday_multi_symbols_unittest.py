@@ -109,10 +109,12 @@ class _DummyLock:
 class _DummyExecutor:
     created_symbols = []
     run_once_calls = []
+    risk_manager_ids = []
 
     def __init__(self, *args, **kwargs):
         self.stock_code = kwargs["stock_code"]
         _DummyExecutor.created_symbols.append(self.stock_code)
+        _DummyExecutor.risk_manager_ids.append(id(kwargs.get("risk_manager")))
 
     def restore_position_on_start(self):
         return False
@@ -131,6 +133,7 @@ class TestMainMultidayMultiSymbols(unittest.TestCase):
     def test_run_trade_executes_all_selected_symbols_once(self):
         _DummyExecutor.created_symbols = []
         _DummyExecutor.run_once_calls = []
+        _DummyExecutor.risk_manager_ids = []
         selector = _DummySelector()
 
         with patch.object(main_multiday, "KISApi", _DummyAPI), \
@@ -149,6 +152,7 @@ class TestMainMultidayMultiSymbols(unittest.TestCase):
 
         self.assertEqual(_DummyExecutor.created_symbols, ["005930", "000660"])
         self.assertEqual(_DummyExecutor.run_once_calls, ["005930", "000660"])
+        self.assertEqual(len(set(_DummyExecutor.risk_manager_ids)), 1)
 
 
 if __name__ == "__main__":
