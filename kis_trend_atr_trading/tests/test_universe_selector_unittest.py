@@ -224,7 +224,22 @@ class UniverseSelectorFixedTests(unittest.TestCase):
             )
             selector = UniverseSelector(config=cfg, kis_client=_DummyKIS(), db=None)
             selected = selector._select_volume_top(limit=10)
-            self.assertEqual(len(selected), 5)
+            self.assertEqual(len(selected), 10)
+
+    def test_combined_stage1_can_exceed_max_stocks(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = UniverseSelectionConfig(
+                selection_method="combined",
+                candidate_pool_mode="market",
+                max_stocks=5,
+                market_scan_size=20,
+                min_volume=1_000_000_000,
+                min_market_cap=0,
+                universe_cache_file=str(Path(td) / "universe_cache.json"),
+            )
+            selector = UniverseSelector(config=cfg, kis_client=_DummyKIS(), db=None)
+            stage1 = selector._select_volume_top(limit=cfg.max_stocks * 3)
+            self.assertEqual(len(stage1), 15)
 
 
 if __name__ == "__main__":

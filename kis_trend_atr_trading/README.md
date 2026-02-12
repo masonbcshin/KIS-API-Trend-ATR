@@ -135,7 +135,8 @@ selection_method:
 - 구현 상태: 사용 중
 - 풀 모드:
   - `candidate_pool_mode=yaml`(restricted): `candidate_stocks` 또는 `stocks` 내부에서만 정렬
-  - `candidate_pool_mode=market`: 시장 후보군 스캔(가능하면 API universe, 없으면 KOSPI200 대체)
+- `candidate_pool_mode=market`: 시장 후보군 스캔(가능하면 API universe, 없으면 KOSPI200 대체)
+- `market_scan_size`: market 모드에서 실제 스캔할 후보군 상한 (combined 1차에도 동일 적용)
 - 1차 후보: 풀 모드별 후보군
 - 거래대금 기준 정렬
 - 필터:
@@ -307,6 +308,7 @@ selection_method:
 - `order_state` 테이블에서 `PENDING/SUBMITTED/PARTIAL` 조회
 - 프로그램 시작 직후 복구 대상 건수 로그 출력
 - `PENDING_ORDER_STALE_MINUTES`(기본 240분) 이상 갱신 없는 미종결 건은 시작 시 `CANCELLED`로 자동 정리
+- `PENDING_NO_ORDER_STALE_MINUTES`(기본 15분): 주문번호 없는 `PENDING` 건 조기 정리
 
 ### partial fill 복구
 

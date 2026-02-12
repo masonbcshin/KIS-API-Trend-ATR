@@ -193,18 +193,22 @@ class UniverseSelector:
 
     def _select_volume_top(self, limit: int) -> List[str]:
         mode = self.config.candidate_pool_mode
+        effective_limit = max(int(limit), 1)
         candidates = self._candidate_pool_for_volume_scan()
         pool_size = len(candidates)
         volume_source = "market_scan" if mode == "market" else "restricted_pool"
         logger.info(
             f"[UNIVERSE] volume_top scope={volume_source}, pool_mode={mode}, "
-            f"pool_size={pool_size}, limit={limit}"
+            f"pool_size={pool_size}, limit={effective_limit}"
         )
         rows: List[Tuple[str, float]] = []
         bulk_ok = False
         if mode == "market" and hasattr(self.kis_client, "get_market_top_by_trade_value"):
             try:
-                top_n = max(limit * 5, self.config.max_stocks * 5)
+                top_n = min(
+                    max(effective_limit * 5, self.config.max_stocks * 5),
+                    max(int(self.config.market_scan_size), effective_limit),
+                )
                 market_rows = self.kis_client.get_market_top_by_trade_value(top_n=top_n)
                 for snap in market_rows:
                     if self._passes_safety_filters(snap):
@@ -224,7 +228,14 @@ class UniverseSelector:
                 bulk_ok = False
 
         if not bulk_ok:
-            scan_candidates = candidates[: max(limit * 5, self.config.max_stocks * 5)]
+            scan_window = min(
+                len(candidates),
+                max(int(self.config.market_scan_size), effective_limit * 5, self.config.max_stocks * 5),
+            )
+            scan_candidates = candidates[:scan_window]
+            logger.info(
+                f"[UNIVERSE] volume_top fallback snapshot scan: candidates={len(scan_candidates)}"
+            )
             for idx, code in enumerate(scan_candidates):
                 try:
                     snap = self._snapshot_for_symbol(code)
@@ -232,14 +243,16 @@ class UniverseSelector:
                         continue
                     rows.append((code, snap["trade_value"]))
                     # rate limit friendly
-                    if idx % 10 == 0:
+                    if mode == "market":
+                        time.sleep(0.12)
+                    elif idx % 10 == 0:
                         time.sleep(0.05)
                 except Exception:
                     continue
         rows.sort(key=lambda x: x[1], reverse=True)
-        selected = [c for c, _ in rows[: max(limit, self.config.max_stocks)]]
+        selected = [c for c, _ in rows[:effective_limit]]
         logger.info(f"[UNIVERSE] volume_top 통과={len(selected)}")
-        return selected[: self.config.max_stocks]
+        return selected
 
     def _select_atr_filter_from_pool(self) -> List[str]:
         pool = self._resolve_atr_candidate_pool()

@@ -46,6 +46,7 @@ logger = get_logger("order_synchronizer")
 LOCK_FILE_PATH = Path(__file__).parent.parent / "data" / "instance.lock"
 LOCK_STALE_TIMEOUT_SECONDS = int(os.getenv("INSTANCE_LOCK_STALE_TIMEOUT", "3600"))
 PENDING_ORDER_STALE_MINUTES = int(os.getenv("PENDING_ORDER_STALE_MINUTES", "240"))
+PENDING_NO_ORDER_STALE_MINUTES = int(os.getenv("PENDING_NO_ORDER_STALE_MINUTES", "15"))
 
 # 한국 주식시장 시간
 MARKET_OPEN = dt_time(9, 0, 0)
@@ -575,10 +576,16 @@ class OrderSynchronizer:
         """
         지정 시간 이상 갱신되지 않은 미종결 주문을 CANCELLED 처리합니다.
         """
-        if not self._db or PENDING_ORDER_STALE_MINUTES <= 0:
+        if not self._db:
+            return 0
+        now = datetime.now(KST)
+        stale_minutes = max(PENDING_ORDER_STALE_MINUTES, 0)
+        no_order_stale_minutes = max(PENDING_NO_ORDER_STALE_MINUTES, 0)
+        if stale_minutes <= 0 and no_order_stale_minutes <= 0:
             return 0
 
-        cutoff = datetime.now(KST) - timedelta(minutes=PENDING_ORDER_STALE_MINUTES)
+        cutoff = now - timedelta(minutes=stale_minutes or 10_000_000)
+        no_order_cutoff = now - timedelta(minutes=no_order_stale_minutes or 10_000_000)
         try:
             affected = self._db.execute_command(
                 """
@@ -586,9 +593,12 @@ class OrderSynchronizer:
                    SET status = 'CANCELLED'
                  WHERE mode = %s
                    AND status IN ('PENDING', 'SUBMITTED', 'PARTIAL')
-                   AND updated_at < %s
+                   AND (
+                        updated_at < %s
+                        OR (status = 'PENDING' AND (order_no IS NULL OR order_no = '') AND updated_at < %s)
+                   )
                 """,
-                (self.mode, cutoff)
+                (self.mode, cutoff, no_order_cutoff)
             )
             return int(affected or 0)
         except Exception as e:
@@ -668,6 +678,16 @@ class OrderSynchronizer:
             )
             
             if not order_result.get("success"):
+                self._upsert_order_state(
+                    idempotency_key=idempotency_key,
+                    signal_id=signal_id,
+                    stock_code=stock_code,
+                    side="BUY",
+                    quantity=quantity,
+                    status="FAILED",
+                    filled_qty=0,
+                    remaining_qty=quantity
+                )
                 return SynchronizedOrderResult(
                     success=False,
                     result_type=OrderExecutionResult.FAILED,
@@ -688,6 +708,16 @@ class OrderSynchronizer:
             )
             
         except Exception as e:
+            self._upsert_order_state(
+                idempotency_key=idempotency_key,
+                signal_id=signal_id,
+                stock_code=stock_code,
+                side="BUY",
+                quantity=quantity,
+                status="FAILED",
+                filled_qty=0,
+                remaining_qty=quantity
+            )
             logger.error(f"[SYNC] 매수 주문 전송 오류: {e}")
             return SynchronizedOrderResult(
                 success=False,
@@ -850,6 +880,16 @@ class OrderSynchronizer:
             )
             
             if not order_result.get("success"):
+                self._upsert_order_state(
+                    idempotency_key=idempotency_key,
+                    signal_id=signal_id,
+                    stock_code=stock_code,
+                    side="SELL",
+                    quantity=quantity,
+                    status="FAILED",
+                    filled_qty=0,
+                    remaining_qty=quantity
+                )
                 return SynchronizedOrderResult(
                     success=False,
                     result_type=OrderExecutionResult.FAILED,
@@ -870,6 +910,16 @@ class OrderSynchronizer:
             )
             
         except Exception as e:
+            self._upsert_order_state(
+                idempotency_key=idempotency_key,
+                signal_id=signal_id,
+                stock_code=stock_code,
+                side="SELL",
+                quantity=quantity,
+                status="FAILED",
+                filled_qty=0,
+                remaining_qty=quantity
+            )
             logger.error(f"[SYNC] 매도 주문 전송 오류: {e}")
             return SynchronizedOrderResult(
                 success=False,
