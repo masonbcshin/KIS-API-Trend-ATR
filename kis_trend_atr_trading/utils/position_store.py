@@ -150,10 +150,12 @@ class PositionStore:
             bool: 저장 성공 여부
         """
         try:
+            previous = self._load_raw_data()
             data = {
                 "position": asdict(position),
                 "version": "1.0",
-                "updated_at": datetime.now(KST).isoformat()
+                "updated_at": datetime.now(KST).isoformat(),
+                "pending_exit": previous.get("pending_exit")
             }
             
             with open(self.file_path, 'w', encoding='utf-8') as f:
@@ -207,7 +209,8 @@ class PositionStore:
                     "position": None,
                     "version": "1.0",
                     "updated_at": datetime.now(KST).isoformat(),
-                    "cleared_at": datetime.now(KST).isoformat()
+                    "cleared_at": datetime.now(KST).isoformat(),
+                    "pending_exit": None,
                 }
                 
                 with open(self.file_path, 'w', encoding='utf-8') as f:
@@ -219,6 +222,41 @@ class PositionStore:
         except Exception as e:
             logger.error(f"포지션 삭제 실패: {e}")
             return False
+
+    def save_pending_exit(self, pending_exit: Optional[Dict[str, Any]]) -> bool:
+        """pending_exit 상태를 저장합니다."""
+        try:
+            data = self._load_raw_data()
+            data["pending_exit"] = pending_exit
+            data["version"] = data.get("version", "1.0")
+            data["updated_at"] = datetime.now(KST).isoformat()
+            with open(self.file_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            return True
+        except Exception as e:
+            logger.error(f"pending_exit 저장 실패: {e}")
+            return False
+
+    def load_pending_exit(self) -> Optional[Dict[str, Any]]:
+        """저장된 pending_exit 상태를 반환합니다."""
+        data = self._load_raw_data()
+        pending = data.get("pending_exit")
+        return pending if isinstance(pending, dict) else None
+
+    def clear_pending_exit(self) -> bool:
+        """pending_exit 상태를 초기화합니다."""
+        return self.save_pending_exit(None)
+
+    def _load_raw_data(self) -> Dict[str, Any]:
+        """포지션 파일 원문 payload를 로드합니다."""
+        if not self.file_path.exists():
+            return {}
+        try:
+            with open(self.file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
     
     def has_position(self) -> bool:
         """
@@ -495,7 +533,7 @@ class DailyTradeStore:
                 return json.load(f)
         except:
             return {}
-    
+
     def _save_data(self, data: Dict) -> None:
         """데이터를 파일에 저장합니다."""
         with open(self.file_path, 'w', encoding='utf-8') as f:

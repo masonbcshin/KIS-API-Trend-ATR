@@ -36,6 +36,9 @@ from utils.market_hours import KST
 
 
 class _DummyKIS:
+    def __init__(self):
+        self._market_codes = [f"{i:06d}" for i in range(100001, 100021)]
+
     def get_current_price(self, stock_code):
         return {"current_price": 70000, "open_price": 69000, "volume": 100000}
 
@@ -55,6 +58,25 @@ class _DummyKIS:
                 }
             )
         return pd.DataFrame(rows)
+
+    def get_market_universe_codes(self, limit=200):
+        return self._market_codes[:limit]
+
+    def get_market_snapshot_bulk(self, codes):
+        snaps = []
+        for idx, code in enumerate(codes):
+            trade_value = 5_000_000_000 - (idx * 100_000_000)
+            snaps.append(
+                {
+                    "code": code,
+                    "trade_value": trade_value,
+                    "market_cap": 2000 if idx < 10 else 500,
+                    "is_suspended": False,
+                    "is_management": False,
+                    "pct_from_open": 1.5,
+                }
+            )
+        return snaps
 
 
 class UniverseSelectorFixedTests(unittest.TestCase):
@@ -176,6 +198,33 @@ class UniverseSelectorFixedTests(unittest.TestCase):
             selector._select_combined = lambda: ["000660", "035420", "051910"]  # type: ignore
             selected = selector.select()
             self.assertEqual(selected, ["000660", "035420", "051910"])
+
+    def test_restricted_mode_keeps_yaml_pool_size(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = UniverseSelectionConfig(
+                selection_method="volume_top",
+                candidate_pool_mode="yaml",
+                candidate_stocks=["005930", "000660", "035420", "035720", "051910"],
+                max_stocks=5,
+                universe_cache_file=str(Path(td) / "universe_cache.json"),
+            )
+            selector = UniverseSelector(config=cfg, kis_client=_DummyKIS(), db=None)
+            candidates = selector._candidate_pool_for_volume_scan()
+            self.assertEqual(len(candidates), 5)
+
+    def test_market_mode_scans_and_limits_from_market_pool(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = UniverseSelectionConfig(
+                selection_method="volume_top",
+                candidate_pool_mode="market",
+                max_stocks=5,
+                min_volume=1_000_000_000,
+                min_market_cap=1000,
+                universe_cache_file=str(Path(td) / "universe_cache.json"),
+            )
+            selector = UniverseSelector(config=cfg, kis_client=_DummyKIS(), db=None)
+            selected = selector._select_volume_top(limit=10)
+            self.assertEqual(len(selected), 5)
 
 
 if __name__ == "__main__":

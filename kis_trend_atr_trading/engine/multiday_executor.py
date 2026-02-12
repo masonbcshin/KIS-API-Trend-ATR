@@ -20,7 +20,7 @@ KIS Trend-ATR Trading System - 멀티데이 거래 실행 엔진
 import time
 import signal
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Optional, Any
 import pandas as pd
 
@@ -160,6 +160,16 @@ class MultidayExecutor:
         
         # 일별 거래 기록
         self._daily_trades = []
+        self._pending_exit_backoff_minutes = int(
+            getattr(settings, "PENDING_EXIT_BACKOFF_MINUTES", 5)
+        )
+        self._pending_exit_state: Optional[Dict[str, Any]] = self.position_store.load_pending_exit()
+        if self._pending_exit_state:
+            logger.info(
+                f"[PENDING_EXIT] 복원: symbol={self._pending_exit_state.get('stock_code')}, "
+                f"exit_reason={self._pending_exit_state.get('exit_reason')}, "
+                f"next_retry_at={self._pending_exit_state.get('next_retry_at')}"
+            )
         
         # ★ 신규: 초기 자본금 기록 (누적 드로다운 계산용)
         self._initial_capital = getattr(settings, 'BACKTEST_INITIAL_CAPITAL', 10_000_000)
@@ -198,9 +208,12 @@ class MultidayExecutor:
             pos = self.strategy.position
             stored = StoredPosition.from_multiday_position(pos)
             self.position_store.save_position(stored)
+            if self._pending_exit_state is not None:
+                self.position_store.save_pending_exit(self._pending_exit_state)
             logger.info(f"포지션 저장 완료: {pos.symbol}")
         else:
             self.position_store.clear_position()
+            self._pending_exit_state = None
             logger.info("포지션 없음 - 저장 파일 클리어")
     
     def restore_position_on_start(self) -> bool:
@@ -368,6 +381,124 @@ class MultidayExecutor:
     def _can_place_orders(self) -> bool:
         """실제 주문 가능 여부"""
         return self.trading_mode in ("LIVE", "PAPER")
+
+    def _build_exit_retry_key(self, signal: TradingSignal) -> str:
+        exit_reason = signal.exit_reason.value if signal.exit_reason else ExitReason.MANUAL_EXIT.value
+        reason_code = signal.reason_code or "NO_REASON_CODE"
+        return f"{self.stock_code}:{exit_reason}:{reason_code}"
+
+    @staticmethod
+    def _is_market_unavailable_error(message: str) -> bool:
+        lower = (message or "").lower()
+        keywords = [
+            "장종료",
+            "장 종료",
+            "장마감",
+            "폐장",
+            "주문불가",
+            "주문 불가",
+            "market closed",
+            "market is closed",
+        ]
+        return any(k in lower for k in keywords)
+
+    def _activate_pending_exit(self, signal: TradingSignal, error_message: str) -> None:
+        now = datetime.now(KST)
+        retry_key = self._build_exit_retry_key(signal)
+        next_retry_at = now + timedelta(minutes=max(self._pending_exit_backoff_minutes, 1))
+        pending = {
+            "status": "pending",
+            "stock_code": self.stock_code,
+            "retry_key": retry_key,
+            "exit_reason": signal.exit_reason.value if signal.exit_reason else ExitReason.MANUAL_EXIT.value,
+            "reason_code": signal.reason_code or "",
+            "next_retry_at": next_retry_at.isoformat(),
+            "last_error": error_message,
+            "updated_at": now.isoformat(),
+        }
+        prev = self._pending_exit_state or {}
+        self._pending_exit_state = pending
+        self.position_store.save_pending_exit(pending)
+        is_first_transition = (
+            prev.get("status") != "pending" or prev.get("retry_key") != retry_key
+        )
+        logger.warning(
+            f"[PENDING_EXIT] 전환: symbol={self.stock_code}, retry_key={retry_key}, "
+            f"next_retry_at={pending['next_retry_at']}, error={error_message}"
+        )
+        if is_first_transition:
+            self.telegram.notify_warning(
+                f"청산 보류(PENDING_EXIT)\n"
+                f"종목: {self.stock_code}\n"
+                f"사유: {pending['exit_reason']} / {pending['reason_code']}\n"
+                f"재시도 예정: {pending['next_retry_at']}\n"
+                f"원인: {error_message}"
+            )
+
+    def _clear_pending_exit(self, clear_reason: str) -> None:
+        if not self._pending_exit_state:
+            return
+        prev = self._pending_exit_state
+        self._pending_exit_state = None
+        self.position_store.clear_pending_exit()
+        logger.info(
+            f"[PENDING_EXIT] 해제: symbol={self.stock_code}, reason={clear_reason}, "
+            f"prev_retry_key={prev.get('retry_key')}"
+        )
+        self.telegram.notify_info(
+            f"청산 보류 해제\n종목: {self.stock_code}\n사유: {clear_reason}"
+        )
+
+    def _should_attempt_exit_order(self, signal: TradingSignal) -> tuple[bool, str]:
+        pending = self._pending_exit_state
+        if not pending:
+            return True, "no_pending_exit"
+
+        retry_key = self._build_exit_retry_key(signal)
+        if pending.get("retry_key") != retry_key:
+            self._clear_pending_exit("exit_reason_changed")
+            return True, "reason_changed"
+
+        next_retry_raw = pending.get("next_retry_at")
+        try:
+            next_retry = datetime.fromisoformat(next_retry_raw) if next_retry_raw else None
+        except ValueError:
+            next_retry = None
+
+        now = datetime.now(KST)
+        if next_retry and now < next_retry:
+            return False, f"backoff_until={next_retry.isoformat()}"
+
+        tradeable, market_reason = self.market_checker.is_tradeable()
+        if not tradeable:
+            next_retry = now + timedelta(minutes=max(self._pending_exit_backoff_minutes, 1))
+            pending["next_retry_at"] = next_retry.isoformat()
+            pending["updated_at"] = now.isoformat()
+            self._pending_exit_state = pending
+            self.position_store.save_pending_exit(pending)
+            return False, f"market_unavailable={market_reason}"
+
+        return True, "retry_due"
+
+    def _execute_exit_with_pending_control(self, signal: TradingSignal) -> Dict[str, Any]:
+        can_attempt, reason = self._should_attempt_exit_order(signal)
+        if not can_attempt:
+            logger.info(
+                f"[PENDING_EXIT] 재시도 스킵: symbol={self.stock_code}, "
+                f"reason={reason}, exit_reason={signal.exit_reason.value if signal.exit_reason else 'UNKNOWN'}"
+            )
+            return {"success": False, "pending_exit": True, "message": reason}
+
+        order_result = self.execute_sell(signal)
+        if order_result.get("success"):
+            self._clear_pending_exit("order_success")
+            return order_result
+
+        error_message = str(order_result.get("message", ""))
+        if self._is_market_unavailable_error(error_message):
+            self._activate_pending_exit(signal, error_message)
+
+        return order_result
     
     def execute_buy(self, signal: TradingSignal) -> Dict[str, Any]:
         """
@@ -696,10 +827,14 @@ class MultidayExecutor:
             
             else:
                 # 완전 실패 - 포지션 상태 변경 없음 (매우 위험!)
-                logger.error(f"매도 실패 (포지션 유지됨): {sync_result.message}")
+                market_unavailable = self._is_market_unavailable_error(sync_result.message)
+                if market_unavailable:
+                    logger.warning(f"매도 실패(주문불가/장종료): {sync_result.message}")
+                else:
+                    logger.error(f"매도 실패 (포지션 유지됨): {sync_result.message}")
                 
                 # 긴급 손절 실패 시 킬 스위치 발동
-                if is_emergency:
+                if is_emergency and not market_unavailable:
                     if exit_reason == ExitReason.GAP_PROTECTION:
                         logger.error(
                             f"[{GAP_REASON_FALLBACK}] 갭 보호 청산 주문 실패: "
@@ -945,7 +1080,7 @@ class MultidayExecutor:
                 result["order_result"] = order_result
                 
             elif signal.signal_type == SignalType.SELL:
-                order_result = self.execute_sell(signal)
+                order_result = self._execute_exit_with_pending_control(signal)
                 result["order_result"] = order_result
                 
             elif signal.signal_type == SignalType.HOLD:

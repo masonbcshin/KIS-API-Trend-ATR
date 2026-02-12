@@ -10,6 +10,10 @@
 #   - atr_filter: ATR 기반 변동성 필터 통과 종목
 #   - combined: 복합 조건 (거래대금 + ATR 필터)
 #
+# ★ candidate_pool_mode 의미:
+#   - yaml (restricted): candidate_stocks 내부에서만 정렬/필터
+#   - market: 시장 후보군(가능하면 API 제공 universe, 없으면 kospi200 대체)에서 스캔
+#
 # ═══════════════════════════════════════════════════════════════════════════════
 
 universe:
@@ -46,11 +50,15 @@ universe:
   # ATR 계산 기간
   atr_period: 14
 
-  # ATR 후보 풀 모드
+  # ATR/거래대금 후보 풀 모드
+  # - yaml: restricted 모드 (candidate_stocks 또는 stocks 내부에서만 선정)
+  # - market: 시장 스캔 모드 (combined를 시장 자동선정처럼 사용하려면 이 값을 사용)
   # - kospi200: KOSPI200 후보 풀
-  # - yaml: candidate_stocks 또는 stocks 사용
   # - volume_top: volume_top 결과를 ATR 후보로 사용
   candidate_pool_mode: "yaml"
+
+  # candidate_pool_mode=market에서 조회할 후보군 최대 스캔 수
+  market_scan_size: 200
 
   # candidate_pool_mode=yaml일 때 사용할 후보군
   candidate_stocks:
@@ -78,6 +86,16 @@ universe:
     - "combined"
     - "volume_top"
     - "atr_filter"
+
+  # 예시 1) restricted(현재 기본):
+  #   selection_method: "combined"
+  #   candidate_pool_mode: "yaml"
+  #   candidate_stocks: ["005930","000660",...]
+  #
+  # 예시 2) market 자동선정:
+  #   selection_method: "combined"
+  #   candidate_pool_mode: "market"
+  #   market_scan_size: 200
   
   # ────────────────────────────────────────────────────────────────
   # 고정 종목 리스트 (selection_method: fixed)

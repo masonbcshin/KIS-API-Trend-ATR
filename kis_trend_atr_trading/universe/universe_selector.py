@@ -43,7 +43,7 @@ class UniverseSelectionConfig:
     fallback_to_fixed: bool = True
     halt_on_fallback_in_real: bool = False
     universe_cache_file: str = "data/universe_cache.json"
-    candidate_pool_mode: str = "yaml"  # kospi200 | yaml | volume_top
+    candidate_pool_mode: str = "yaml"  # yaml | kospi200 | volume_top | market
     candidate_stocks: List[str] = field(default_factory=list)
     stocks: List[str] = field(default_factory=list)
     cache_refresh_enabled: bool = False
@@ -53,6 +53,7 @@ class UniverseSelectionConfig:
     cache_refresh_methods: List[str] = field(
         default_factory=lambda: ["combined", "volume_top", "atr_filter"]
     )
+    market_scan_size: int = 200
 
 
 class UniverseSelector:
@@ -102,6 +103,7 @@ class UniverseSelector:
                     "cache_refresh_methods", ["combined", "volume_top", "atr_filter"]
                 )
             ],
+            market_scan_size=int(section.get("market_scan_size", 200)),
         )
         return cls(config=cfg, kis_client=kis_client, db=db)
 
@@ -190,11 +192,28 @@ class UniverseSelector:
         return self.config.stocks[: self.config.max_stocks]
 
     def _select_volume_top(self, limit: int) -> List[str]:
+        mode = self.config.candidate_pool_mode
         candidates = self._candidate_pool_for_volume_scan()
-        logger.info(f"[UNIVERSE] volume_top 후보={len(candidates)}")
+        pool_size = len(candidates)
+        volume_source = "market_scan" if mode == "market" else "restricted_pool"
+        logger.info(
+            f"[UNIVERSE] volume_top scope={volume_source}, pool_mode={mode}, "
+            f"pool_size={pool_size}, limit={limit}"
+        )
         rows: List[Tuple[str, float]] = []
         bulk_ok = False
-        if hasattr(self.kis_client, "get_market_snapshot_bulk"):
+        if mode == "market" and hasattr(self.kis_client, "get_market_top_by_trade_value"):
+            try:
+                top_n = max(limit * 5, self.config.max_stocks * 5)
+                market_rows = self.kis_client.get_market_top_by_trade_value(top_n=top_n)
+                for snap in market_rows:
+                    if self._passes_safety_filters(snap):
+                        rows.append((str(snap["code"]), float(snap["trade_value"])))
+                bulk_ok = True
+            except Exception:
+                bulk_ok = False
+
+        if not bulk_ok and hasattr(self.kis_client, "get_market_snapshot_bulk"):
             try:
                 bulk = self.kis_client.get_market_snapshot_bulk(candidates)
                 for snap in bulk:
@@ -249,6 +268,14 @@ class UniverseSelector:
             if self.config.min_atr_pct <= ratio <= self.config.max_atr_pct:
                 second_stage.append(code)
         logger.info(f"[UNIVERSE] combined stage2={len(second_stage)}")
+        if (
+            self.config.candidate_pool_mode == "yaml"
+            and len(second_stage) > 0
+            and self._dedupe(second_stage) == self._dedupe(self.config.candidate_stocks)[: len(second_stage)]
+        ):
+            logger.info(
+                "[UNIVERSE] restricted pool 모드(yaml): 최종 선정이 candidate_stocks와 동일합니다."
+            )
         return second_stage[: self.config.max_stocks]
 
     # ----------------------------
@@ -272,7 +299,10 @@ class UniverseSelector:
         return fallback
 
     def _candidate_pool_for_volume_scan(self) -> List[str]:
-        # KIS bulk universe endpoint가 없어서 제한된 후보군 내 snapshot 스캔
+        mode = self.config.candidate_pool_mode
+        if mode == "market":
+            return self._load_market_codes()
+        # yaml/kospi200/volume_top은 제한 후보군 스캔
         if self.config.candidate_stocks:
             return self._dedupe(self.config.candidate_stocks)
         if self.config.stocks:
@@ -283,9 +313,19 @@ class UniverseSelector:
         mode = self.config.candidate_pool_mode
         if mode == "kospi200":
             return self._load_kospi200_codes()
-        if mode == "volume_top":
+        if mode in ("volume_top", "market"):
             return self._select_volume_top(self.config.max_stocks * 3)
         return self._dedupe(self.config.candidate_stocks or self.config.stocks)
+
+    def _load_market_codes(self) -> List[str]:
+        if hasattr(self.kis_client, "get_market_universe_codes"):
+            try:
+                codes = self.kis_client.get_market_universe_codes(limit=self.config.market_scan_size)
+                if codes:
+                    return self._dedupe([str(c) for c in codes])
+            except Exception:
+                pass
+        return self._load_kospi200_codes()
 
     def _load_kospi200_codes(self) -> List[str]:
         # Optional local list file

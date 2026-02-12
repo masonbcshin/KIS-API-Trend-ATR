@@ -196,6 +196,9 @@ CUMULATIVE_DRAWDOWN_WARNING_PCT: float = 10.0
 # 주문 실행 설정
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# 장종료/주문불가 시 pending_exit 재시도 백오프(분)
+PENDING_EXIT_BACKOFF_MINUTES: int = 5
+
 # 긴급 손절 최대 재시도 횟수
 EMERGENCY_SELL_MAX_RETRIES: int = 10
 

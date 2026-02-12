@@ -133,7 +133,10 @@ selection_method:
 ### volume_top
 
 - 구현 상태: 사용 중
-- 1차 후보: `candidate_stocks` 또는 `stocks`, 없으면 KOSPI200 seed
+- 풀 모드:
+  - `candidate_pool_mode=yaml`(restricted): `candidate_stocks` 또는 `stocks` 내부에서만 정렬
+  - `candidate_pool_mode=market`: 시장 후보군 스캔(가능하면 API universe, 없으면 KOSPI200 대체)
+- 1차 후보: 풀 모드별 후보군
 - 거래대금 기준 정렬
 - 필터:
   - `min_volume`
@@ -148,7 +151,7 @@ selection_method:
 ### atr_filter
 
 - 구현 상태: 사용 중
-- 후보풀(`candidate_pool_mode`): `kospi200 | yaml | volume_top`
+- 후보풀(`candidate_pool_mode`): `kospi200 | yaml | volume_top | market`
 - ATR 비율 계산: `(ATR / 종가) * 100`
 - 필터: `min_atr_pct <= ratio <= max_atr_pct`
 - 제외 조건:
@@ -162,6 +165,9 @@ selection_method:
   1. `volume_top(max_stocks * 3)`
   2. ATR 필터 적용
   3. `max_stocks`로 최종 제한
+- 주의:
+  - `candidate_pool_mode=yaml`이면 `combined`도 restricted 모드(후보군 내부 선별)로 동작
+  - 시장 자동선정이 목적이면 `candidate_pool_mode=market`을 사용
 
 ### 캐싱 구조
 
@@ -262,6 +268,15 @@ selection_method:
 - 요청 실패 시 단절 시작 시각 기록
 - 60초 이상 단절이면 실행 사이클에서 거래 중단 에러 반환
 - 네트워크 복구 감지 시 단절 시간 로그
+
+### 장종료/주문불가 반복 방지
+
+- 동일 종목 + 동일 청산사유(`exit_reason/reason_code`)에서 주문 실패가 장종료/주문불가로 판정되면 `pending_exit`로 전환
+- `PENDING_EXIT_BACKOFF_MINUTES` 동안 동일 주문 재시도 차단
+- 장중/주문 가능 시점 도달 시 1회 재시도 후 성공하면 `pending_exit` 해제
+- 상태 변경 시에만 알림:
+  - pending 전환
+  - pending 해제(주문 성공/사유 변경)
 
 ### 토큰 재발급
 
@@ -443,6 +458,7 @@ python -m unittest kis_trend_atr_trading.tests.test_universe_selector_unittest -
 python -m unittest kis_trend_atr_trading.tests.test_gap_protection_unittest -v
 python -m unittest kis_trend_atr_trading.tests.test_gap_notification_alignment_unittest -v
 python -m unittest kis_trend_atr_trading.tests.test_main_multiday_multi_symbols_unittest -v
+python -m unittest kis_trend_atr_trading.tests.test_pending_exit_unittest -v
 python -m pytest kis_trend_atr_trading/tests/test_api.py -q
 python -m pytest kis_trend_atr_trading/tests/test_executor.py::TestPositionRecognitionAfterRestart::test_position_lost_after_restart_simulation -q
 ```
