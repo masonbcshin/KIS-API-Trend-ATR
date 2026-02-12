@@ -58,12 +58,9 @@ class KISApi:
             app_key: API 앱 키 (미입력 시 settings에서 로드)
             app_secret: API 앱 시크릿 (미입력 시 settings에서 로드)
             account_no: 계좌번호 (미입력 시 settings에서 로드)
-            is_paper_trading: 모의투자 여부 (항상 True 유지)
+            is_paper_trading: 모의투자 여부
         """
-        # 실계좌 사용 방지
-        if not is_paper_trading:
-            raise KISApiError("⚠️ 실계좌 사용이 금지되어 있습니다. 모의투자만 가능합니다.")
-        
+        self.is_paper_trading = bool(is_paper_trading)
         self.app_key = app_key or settings.APP_KEY
         self.app_secret = app_secret or settings.APP_SECRET
         self.account_no = account_no or settings.ACCOUNT_NO
@@ -83,7 +80,31 @@ class KISApi:
         self._network_down_since: Optional[float] = None
         self._was_disconnected: bool = False
         
-        logger.info(f"KIS API 클라이언트 초기화 완료 (모의투자: {is_paper_trading})")
+        logger.info(f"KIS API 클라이언트 초기화 완료 (모의투자: {self.is_paper_trading})")
+
+    def _resolve_tr_id(self, purpose: str) -> str:
+        """
+        API 목적별 TR ID를 모의/운영 모드에 맞게 반환합니다.
+        """
+        paper_map = {
+            "order_buy": "VTTC0802U",
+            "order_sell": "VTTC0801U",
+            "order_status": "VTTC8001R",
+            "order_cancel": "VTTC0803U",
+            "balance": "VTTC8434R",
+        }
+        real_map = {
+            "order_buy": "TTTC0802U",
+            "order_sell": "TTTC0801U",
+            "order_status": "TTTC8001R",
+            "order_cancel": "TTTC0803U",
+            "balance": "TTTC8434R",
+        }
+        table = paper_map if self.is_paper_trading else real_map
+        tr_id = table.get(purpose, "")
+        if not tr_id:
+            raise KISApiError(f"지원하지 않는 TR ID 목적: {purpose}")
+        return tr_id
     
     def _wait_for_rate_limit(self) -> None:
         """
@@ -666,10 +687,7 @@ class KISApi:
         """
         url = f"{self.base_url}/uapi/domestic-stock/v1/trading/order-cash"
         
-        # 모의투자 TR_ID
-        # VTTC0802U: 모의투자 매수
-        # VTTC0801U: 모의투자 매도
-        tr_id = "VTTC0802U" if is_buy else "VTTC0801U"
+        tr_id = self._resolve_tr_id("order_buy" if is_buy else "order_sell")
         headers = self._get_auth_headers(tr_id)
         
         body = {
@@ -740,8 +758,7 @@ class KISApi:
         """
         url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
         
-        # 모의투자용 TR_ID
-        tr_id = "VTTC8001R"
+        tr_id = self._resolve_tr_id("order_status")
         headers = self._get_auth_headers(tr_id)
         
         today = datetime.now(KST).strftime("%Y%m%d")
@@ -923,8 +940,7 @@ class KISApi:
         """
         url = f"{self.base_url}/uapi/domestic-stock/v1/trading/order-rvsecncl"
         
-        # 모의투자 취소 TR_ID
-        tr_id = "VTTC0803U"
+        tr_id = self._resolve_tr_id("order_cancel")
         headers = self._get_auth_headers(tr_id)
         
         body = {
@@ -981,8 +997,7 @@ class KISApi:
         """
         url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
         
-        # 모의투자용 TR_ID
-        tr_id = "VTTC8434R"
+        tr_id = self._resolve_tr_id("balance")
         headers = self._get_auth_headers(tr_id)
         
         params = {
