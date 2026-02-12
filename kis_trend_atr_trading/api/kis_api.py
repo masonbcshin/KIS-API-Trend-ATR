@@ -12,7 +12,7 @@ API 문서 참고: https://apiportal.koreainvestment.com/
 import time
 import threading
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Tuple, Any
+from typing import Dict, Optional, Tuple, Any, List
 import requests
 import pandas as pd
 
@@ -437,6 +437,137 @@ class KISApi:
         logger.info(f"일봉 데이터 조회 완료: {stock_code}, {len(df)}개")
         
         return df
+
+    # ════════════════════════════════════════════════════════════════
+    # 시장 랭킹/유니버스 API
+    # ════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _to_float(value: Any, default: float = 0.0) -> float:
+        try:
+            if value is None:
+                return default
+            if isinstance(value, str):
+                value = value.replace(",", "").strip()
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _to_int(value: Any, default: int = 0) -> int:
+        try:
+            if value is None:
+                return default
+            if isinstance(value, str):
+                value = value.replace(",", "").strip()
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _first_present(item: Dict[str, Any], keys: List[str], default: Any = None) -> Any:
+        for key in keys:
+            if key in item and item.get(key) not in (None, ""):
+                return item.get(key)
+        return default
+
+    def get_market_top_by_trade_value(self, top_n: int = 200) -> List[Dict[str, Any]]:
+        """
+        거래량 순위 API(volume-rank)를 이용해 거래대금 상위 후보를 조회합니다.
+
+        NOTE:
+            - 일부 환경(특히 모의투자)에서는 미지원일 수 있습니다.
+            - 호출 실패 시 KISApiError를 raise하며, 상위 로직에서 fallback 처리합니다.
+        """
+        limit = max(int(top_n), 1)
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/volume-rank"
+
+        # 시세 조회 계열 TR_ID (운영/모의 환경에서 동일 키 사용, 미지원 시 서버 오류 응답)
+        headers = self._get_auth_headers("FHPST01710000")
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_COND_SCR_DIV_CODE": "20171",
+            "FID_INPUT_ISCD": "0000",
+            "FID_DIV_CLS_CODE": "0",
+            "FID_BLNG_CLS_CODE": "0",
+            "FID_TRGT_CLS_CODE": "111111111",
+            "FID_TRGT_EXLS_CLS_CODE": "000000",
+            "FID_INPUT_PRICE_1": "0",
+            "FID_INPUT_PRICE_2": "0",
+            "FID_VOL_CNT": "0",
+            "FID_INPUT_DATE_1": "",
+        }
+
+        response = self._request_with_retry("GET", url, headers, params=params)
+        data = response.json()
+        if data.get("rt_cd") != "0":
+            raise KISApiError(f"거래량 순위 조회 실패: {data.get('msg1', 'Unknown error')}")
+
+        output = data.get("output") or data.get("output1") or []
+        rows: List[Dict[str, Any]] = []
+        for item in output:
+            code = str(
+                self._first_present(
+                    item,
+                    ["mksc_shrn_iscd", "stck_shrn_iscd", "pdno", "iscd", "code"],
+                    "",
+                )
+            )
+            if not (len(code) == 6 and code.isdigit()):
+                continue
+
+            current_price = self._to_float(
+                self._first_present(item, ["stck_prpr", "prpr", "current_price"], 0)
+            )
+            volume = self._to_float(
+                self._first_present(item, ["acml_vol", "acml_voln", "volume"], 0)
+            )
+            trade_value = self._to_float(
+                self._first_present(
+                    item,
+                    ["acml_tr_pbmn", "stck_acml_tr_pbmn", "trade_value"],
+                    0,
+                )
+            )
+            if trade_value <= 0 and current_price > 0 and volume > 0:
+                trade_value = current_price * volume
+
+            pct_from_open = self._to_float(
+                self._first_present(item, ["prdy_ctrt", "change_rate"], 0)
+            )
+            market_cap = self._to_float(
+                self._first_present(item, ["hts_avls", "market_cap"], 0)
+            )
+
+            rows.append(
+                {
+                    "code": code,
+                    "trade_value": trade_value,
+                    "current_price": current_price,
+                    "volume": volume,
+                    "market_cap": market_cap,
+                    "is_suspended": False,
+                    "is_management": False,
+                    "pct_from_open": pct_from_open,
+                }
+            )
+
+        rows.sort(key=lambda x: float(x.get("trade_value", 0.0)), reverse=True)
+        return rows[:limit]
+
+    def get_market_universe_codes(self, limit: int = 200) -> List[str]:
+        """
+        시장 후보 종목 코드를 반환합니다.
+        우선순위:
+            1) volume-rank API 기반 상위 코드
+            2) 실패 시 빈 리스트 반환 (상위 호출부가 안전 fallback 수행)
+        """
+        try:
+            rows = self.get_market_top_by_trade_value(top_n=limit)
+            return [str(r["code"]) for r in rows if str(r.get("code", "")).isdigit()]
+        except Exception as e:
+            logger.warning(f"시장 후보군 조회 실패(volume-rank): {e}")
+            return []
     
     # ════════════════════════════════════════════════════════════════
     # 주문 API (모의투자 전용)

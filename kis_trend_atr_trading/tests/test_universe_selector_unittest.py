@@ -226,6 +226,17 @@ class UniverseSelectorFixedTests(unittest.TestCase):
             selected = selector._select_volume_top(limit=10)
             self.assertEqual(len(selected), 10)
 
+    def test_fallback_seed_codes_are_extended_to_50(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = UniverseSelectionConfig(
+                selection_method="fixed",
+                max_stocks=5,
+                universe_cache_file=str(Path(td) / "universe_cache.json"),
+            )
+            selector = UniverseSelector(config=cfg, kis_client=_DummyKIS(), db=None)
+            codes = selector._load_kospi200_codes()
+            self.assertGreaterEqual(len(codes), 50)
+
     def test_combined_stage1_can_exceed_max_stocks(self):
         with tempfile.TemporaryDirectory() as td:
             cfg = UniverseSelectionConfig(
