@@ -47,6 +47,7 @@ from engine.order_synchronizer import get_instance_lock
 from engine.risk_manager import create_risk_manager_from_settings
 from backtest.backtester import Backtester
 from universe import UniverseSelector
+from universe.universe_service import UniverseService
 from utils.logger import setup_logger, get_logger
 from utils.market_hours import KST
 from utils.position_store import PositionStore
@@ -318,17 +319,12 @@ def run_trade(
         api.get_access_token()
         print("✅ 토큰 발급 완료\n")
         
-        # Universe 선정 (장 시작 전 1회 / 장중 재시작은 캐시 재사용)
+        # Universe 서비스 (일자별 1회 생성 + 재사용, 보유종목/신규진입 분리)
         universe_yaml = Path(__file__).resolve().parent / "config" / "universe.yaml"
-        selector = UniverseSelector.from_yaml(
+        universe_service = UniverseService(
             yaml_path=str(universe_yaml),
             kis_client=api,
-            db=None
         )
-        selected_universe = selector.select()
-        if not selected_universe:
-            raise RuntimeError("Universe 종목 수가 0개입니다. 거래를 중단합니다.")
-        logger.info(f"[UNIVERSE] selected={selected_universe}")
 
         # 주문 수량 계산
         order_quantity = settings.ORDER_QUANTITY
@@ -340,34 +336,54 @@ def run_trade(
                 f"({real_first_order_percent}% of max_position_size)"
             )
 
-        # 명시 종목이 기본값이 아닌 경우 해당 1종목만 실행
-        run_symbols = list(selected_universe)
-        single_symbol_reason = ""
-        if stock_code != settings.DEFAULT_STOCK_CODE:
-            if stock_code in selected_universe:
-                run_symbols = [stock_code]
-                single_symbol_reason = f"CLI --stock 지정({stock_code})"
-            else:
-                raise RuntimeError(
-                    f"명시 종목({stock_code})이 금일 Universe({selected_universe})에 없습니다."
-                )
-        elif len(run_symbols) == 1:
-            single_symbol_reason = "Universe 선정 결과가 1개"
-
-        logger.info(
-            f"[UNIVERSE] executor_symbols={run_symbols}, "
-            f"selection_method={selector.config.selection_method}, "
-            f"cache_file={selector.cache_file}"
-        )
-        if len(run_symbols) == 1:
-            logger.info(f"[UNIVERSE] 단일 종목 실행 사유: {single_symbol_reason or '명시적 제한 없음'}")
-
         def _symbol_position_store(symbol: str) -> PositionStore:
             data_dir = Path(__file__).resolve().parent / "data"
             return PositionStore(file_path=data_dir / f"positions_{symbol}.json")
 
+        def _merge_symbols(holdings_symbols, entry_candidates_symbols):
+            merged = []
+            for sym in list(holdings_symbols) + list(entry_candidates_symbols):
+                if sym not in merged:
+                    merged.append(sym)
+            return merged
+
+        def _refresh_daily_universe():
+            trade_date = datetime.now(KST).strftime("%Y-%m-%d")
+            holdings_symbols = universe_service.load_holdings_symbols()
+            todays_universe = universe_service.get_or_create_todays_universe(trade_date)
+            entry_candidates = universe_service.compute_entry_candidates(
+                holdings_symbols, todays_universe
+            )
+            for sym in holdings_symbols:
+                if sym in todays_universe:
+                    logger.info(f"[ENTRY] skipped: already holding symbol={sym}")
+            return trade_date, holdings_symbols, todays_universe, entry_candidates
+
+        current_trade_date, holdings_symbols, todays_universe, entry_candidates = _refresh_daily_universe()
+        if not holdings_symbols and not todays_universe:
+            raise RuntimeError("Universe 종목 수가 0개이고 보유 종목도 없어 거래를 중단합니다.")
+
+        # 기본 실행은 holdings + (today_universe - holdings), CLI --stock은 단일종목 모드 우선
+        run_symbols = _merge_symbols(holdings_symbols, entry_candidates)
+        single_symbol_reason = ""
+        if stock_code != settings.DEFAULT_STOCK_CODE:
+            run_symbols = [stock_code]
+            single_symbol_reason = f"CLI --stock 지정({stock_code})"
+        elif len(run_symbols) == 1:
+            single_symbol_reason = "보유/진입 후보 합집합 결과가 1개"
+
+        logger.info(f"[UNIVERSE] selected={todays_universe}")
+        logger.info(
+            f"[UNIVERSE] executor_symbols={run_symbols}, "
+            f"selection_method={universe_service.policy.selection_method}, "
+            f"cache_file={universe_service.policy.cache_file}"
+        )
+        if len(run_symbols) == 1:
+            logger.info(f"[UNIVERSE] 단일 종목 실행 사유: {single_symbol_reason or '명시적 제한 없음'}")
+
         print("🔄 저장된 포지션 확인 중...")
         shared_risk_manager = create_risk_manager_from_settings()
+        executors_by_symbol = {}
         for symbol in run_symbols:
             executor = MultidayExecutor(
                 api=api,
@@ -381,6 +397,7 @@ def run_trade(
             state_msg = "복원 완료 - Exit 조건 감시" if restored else "복원 포지션 없음 - Entry 조건 감시"
             print(f"  - {symbol}: {state_msg}")
             executors.append(executor)
+            executors_by_symbol[symbol] = executor
         print("")
 
         # 거래 시작
@@ -390,53 +407,92 @@ def run_trade(
         print("   ★ 포지션은 프로그램 종료 시에도 유지됩니다.")
         print("   ★ Exit는 오직 가격 조건으로만 발생합니다.\n")
 
-        # 단일 종목은 기존 엔진 루프 사용
-        if len(executors) == 1:
-            executors[0].run(
-                interval_seconds=interval,
-                max_iterations=max_runs
-            )
-            summary = executors[0].get_daily_summary()
-            print("\n" + "=" * 50)
-            print("                  거래 요약")
-            print("=" * 50)
-            print(f"총 거래: {summary['total_trades']}회")
-            print(f"  - 매수: {summary['buy_count']}회")
-            print(f"  - 매도: {summary['sell_count']}회")
-            print(f"총 손익: {summary['total_pnl']:,.0f}원")
-            print("=" * 50)
-        else:
-            iteration = 0
-            while True:
-                iteration += 1
-                logger.info(f"[MULTI] 반복 #{iteration} / symbols={len(executors)}")
-                for executor in executors:
-                    executor.run_once()
+        iteration = 0
+        while True:
+            iteration += 1
+            logger.info(f"[MULTI] 반복 #{iteration} / symbols={len(executors)}")
 
-                if max_runs and iteration >= max_runs:
-                    logger.info(f"[MULTI] 최대 반복 도달: {max_runs}")
-                    break
+            # 날짜 변경 시 유니버스 1회 재생성/재사용 후 진입 후보 재계산
+            now_trade_date = datetime.now(KST).strftime("%Y-%m-%d")
+            if now_trade_date != current_trade_date:
+                current_trade_date, holdings_symbols, todays_universe, entry_candidates = _refresh_daily_universe()
+                refreshed_symbols = _merge_symbols(holdings_symbols, entry_candidates)
+                if stock_code != settings.DEFAULT_STOCK_CODE:
+                    refreshed_symbols = [stock_code]
+                for symbol in refreshed_symbols:
+                    if symbol in executors_by_symbol:
+                        continue
+                    executor = MultidayExecutor(
+                        api=api,
+                        strategy=MultidayTrendATRStrategy(),
+                        stock_code=symbol,
+                        order_quantity=order_quantity,
+                        risk_manager=shared_risk_manager,
+                        position_store=_symbol_position_store(symbol),
+                    )
+                    restored = executor.restore_position_on_start()
+                    state_msg = "복원 완료 - Exit 조건 감시" if restored else "복원 포지션 없음 - Entry 조건 감시"
+                    print(f"  - {symbol}: {state_msg}")
+                    executors_by_symbol[symbol] = executor
+                    executors.append(executor)
 
-                logger.info(f"[MULTI] 다음 실행까지 {interval}초 대기")
-                time.sleep(interval)
+            # 런타임 holdings/entry_candidates 재계산 (보유는 항상 관리, 진입은 후보만)
+            runtime_holdings = [e.stock_code for e in executors if e.strategy.has_position]
+            if stock_code == settings.DEFAULT_STOCK_CODE:
+                entry_candidates = universe_service.compute_entry_candidates(runtime_holdings, todays_universe)
+            else:
+                entry_candidates = [stock_code] if stock_code not in runtime_holdings else []
+            holdings_count = len(runtime_holdings)
+            max_positions = max(int(universe_service.policy.max_positions), 0)
 
-            print("\n" + "=" * 50)
-            print("              멀티종목 거래 요약")
-            print("=" * 50)
-            total_trades = 0
-            total_pnl = 0
             for executor in executors:
-                summary = executor.get_daily_summary()
-                total_trades += summary.get("total_trades", 0)
-                total_pnl += summary.get("total_pnl", 0)
-                print(
-                    f"{executor.stock_code}: 거래 {summary.get('total_trades', 0)}회, "
-                    f"손익 {summary.get('total_pnl', 0):,.0f}원"
-                )
-            print("-" * 50)
-            print(f"총 거래: {total_trades}회")
-            print(f"총 손익: {total_pnl:,.0f}원")
-            print("=" * 50)
+                symbol = executor.stock_code
+                if symbol in runtime_holdings:
+                    executor.set_entry_control(False, f"[ENTRY] skipped: already holding symbol={symbol}")
+                elif symbol not in entry_candidates:
+                    executor.set_entry_control(False, f"[ENTRY] skipped: symbol={symbol} not in entry_candidates")
+                elif holdings_count >= max_positions:
+                    msg = (
+                        f"[ENTRY] blocked: max_positions reached "
+                        f"(holdings={holdings_count}, max={max_positions})"
+                    )
+                    logger.info(msg)
+                    executor.set_entry_control(False, msg)
+                else:
+                    executor.set_entry_control(True, "")
+
+                executor.run_once()
+                runtime_holdings = [e.stock_code for e in executors if e.strategy.has_position]
+                holdings_count = len(runtime_holdings)
+                if stock_code == settings.DEFAULT_STOCK_CODE:
+                    entry_candidates = universe_service.compute_entry_candidates(runtime_holdings, todays_universe)
+                else:
+                    entry_candidates = [stock_code] if stock_code not in runtime_holdings else []
+
+            if max_runs and iteration >= max_runs:
+                logger.info(f"[MULTI] 최대 반복 도달: {max_runs}")
+                break
+
+            logger.info(f"[MULTI] 다음 실행까지 {interval}초 대기")
+            time.sleep(interval)
+
+        print("\n" + "=" * 50)
+        print("              멀티종목 거래 요약")
+        print("=" * 50)
+        total_trades = 0
+        total_pnl = 0
+        for executor in executors:
+            summary = executor.get_daily_summary()
+            total_trades += summary.get("total_trades", 0)
+            total_pnl += summary.get("total_pnl", 0)
+            print(
+                f"{executor.stock_code}: 거래 {summary.get('total_trades', 0)}회, "
+                f"손익 {summary.get('total_pnl', 0):,.0f}원"
+            )
+        print("-" * 50)
+        print(f"총 거래: {total_trades}회")
+        print(f"총 손익: {total_pnl:,.0f}원")
+        print("=" * 50)
         
     except KISApiError as e:
         print(f"\n❌ API 오류: {e}")

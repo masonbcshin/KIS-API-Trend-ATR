@@ -168,6 +168,8 @@ class MultidayExecutor:
         self._pending_exit_backoff_minutes = int(
             getattr(settings, "PENDING_EXIT_BACKOFF_MINUTES", 5)
         )
+        self._entry_allowed: bool = True
+        self._entry_block_reason: str = ""
         self._pending_exit_state: Optional[Dict[str, Any]] = self.position_store.load_pending_exit()
         if self._pending_exit_state:
             logger.info(
@@ -194,6 +196,11 @@ class MultidayExecutor:
 
         # 리스크 매니저 상태 출력
         self.risk_manager.print_status()
+
+    def set_entry_control(self, allow_entry: bool, reason: str = "") -> None:
+        """외부 정책(유니버스/보유 상한)에 따른 신규 진입 허용 여부 설정."""
+        self._entry_allowed = bool(allow_entry)
+        self._entry_block_reason = reason or ""
     
     def _signal_handler(self, signum, frame):
         """종료 시그널 핸들러"""
@@ -1143,8 +1150,17 @@ class MultidayExecutor:
             
             # 4. 시그널에 따른 주문 실행
             if signal.signal_type == SignalType.BUY:
-                order_result = self.execute_buy(signal)
-                result["order_result"] = order_result
+                if not self._entry_allowed:
+                    block_msg = self._entry_block_reason or f"[ENTRY] blocked: symbol={self.stock_code}"
+                    logger.info(block_msg)
+                    result["order_result"] = {
+                        "success": False,
+                        "skipped": True,
+                        "message": block_msg,
+                    }
+                else:
+                    order_result = self.execute_buy(signal)
+                    result["order_result"] = order_result
                 
             elif signal.signal_type == SignalType.SELL:
                 order_result = self._execute_exit_with_pending_control(signal)
