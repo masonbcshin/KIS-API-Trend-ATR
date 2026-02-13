@@ -44,12 +44,15 @@ from db.repository import (
     PositionRepository,
     TradeRepository,
     AccountSnapshotRepository,
+    SymbolCacheRepository,
     PositionRecord,
     TradeRecord,
     AccountSnapshotRecord,
+    SymbolCacheRecord,
     get_position_repository,
     get_trade_repository,
-    get_account_snapshot_repository
+    get_account_snapshot_repository,
+    get_symbol_cache_repository
 )
 
 __all__ = [
@@ -66,12 +69,15 @@ __all__ = [
     "PositionRecord",
     "TradeRecord",
     "AccountSnapshotRecord",
+    "SymbolCacheRecord",
     
     # Repositories
     "PositionRepository",
     "TradeRepository",
     "AccountSnapshotRepository",
+    "SymbolCacheRepository",
     "get_position_repository",
     "get_trade_repository",
-    "get_account_snapshot_repository"
+    "get_account_snapshot_repository",
+    "get_symbol_cache_repository"
 ]

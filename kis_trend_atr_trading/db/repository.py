@@ -196,6 +196,29 @@ class AccountSnapshotRecord:
         }
 
 
+@dataclass
+class SymbolCacheRecord:
+    """종목명 캐시 데이터 클래스"""
+    stock_code: str
+    stock_name: str
+    updated_at: datetime
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SymbolCacheRecord":
+        updated_at = data.get("updated_at")
+        if isinstance(updated_at, str):
+            try:
+                # MySQL DATETIME 문자열 파싱
+                updated_at = datetime.fromisoformat(updated_at)
+            except ValueError:
+                updated_at = datetime.strptime(updated_at, "%Y-%m-%d %H:%M:%S")
+        return cls(
+            stock_code=str(data.get("stock_code", "")),
+            stock_name=str(data.get("stock_name", "")),
+            updated_at=updated_at or datetime.now(KST),
+        )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # 포지션 Repository
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1255,6 +1278,60 @@ class AccountSnapshotRepository:
         )
 
 
+class SymbolCacheRepository:
+    """
+    종목명 캐시 데이터 접근 클래스
+
+    ★ SSOT DB(positions/trades와 동일한 MySQL)에 종목명 캐시를 저장합니다.
+    """
+
+    def __init__(self, db: MySQLManager = None):
+        self.db = db or get_db_manager()
+
+    def get(self, stock_code: str) -> Optional[SymbolCacheRecord]:
+        """종목코드로 캐시를 조회합니다."""
+        try:
+            result = self.db.execute_query(
+                """
+                SELECT stock_code, stock_name, updated_at
+                FROM symbol_cache
+                WHERE stock_code = %s
+                """,
+                (stock_code,),
+                fetch_one=True,
+            )
+            if not result:
+                return None
+            return SymbolCacheRecord.from_dict(result)
+        except Exception as e:
+            logger.warning(f"[REPO] symbol_cache 조회 실패: {stock_code}, {e}")
+            return None
+
+    def upsert(
+        self,
+        stock_code: str,
+        stock_name: str,
+        updated_at: datetime = None,
+    ) -> bool:
+        """종목명 캐시를 upsert 합니다."""
+        ts = updated_at or datetime.now(KST)
+        try:
+            self.db.execute_command(
+                """
+                INSERT INTO symbol_cache (stock_code, stock_name, updated_at)
+                VALUES (%s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    stock_name = VALUES(stock_name),
+                    updated_at = VALUES(updated_at)
+                """,
+                (stock_code, stock_name, ts),
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"[REPO] symbol_cache upsert 실패: {stock_code}, {e}")
+            return False
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # 싱글톤 인스턴스
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1262,6 +1339,7 @@ class AccountSnapshotRepository:
 _position_repo: Optional[PositionRepository] = None
 _trade_repo: Optional[TradeRepository] = None
 _snapshot_repo: Optional[AccountSnapshotRepository] = None
+_symbol_cache_repo: Optional[SymbolCacheRepository] = None
 
 
 def get_position_repository() -> PositionRepository:
@@ -1286,3 +1364,11 @@ def get_account_snapshot_repository() -> AccountSnapshotRepository:
     if _snapshot_repo is None:
         _snapshot_repo = AccountSnapshotRepository()
     return _snapshot_repo
+
+
+def get_symbol_cache_repository() -> SymbolCacheRepository:
+    """싱글톤 SymbolCacheRepository 인스턴스"""
+    global _symbol_cache_repo
+    if _symbol_cache_repo is None:
+        _symbol_cache_repo = SymbolCacheRepository()
+    return _symbol_cache_repo

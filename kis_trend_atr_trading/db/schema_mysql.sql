@@ -182,7 +182,24 @@ CREATE INDEX idx_snapshots_mode_time ON account_snapshots(mode, snapshot_time);
 
 
 -- ───────────────────────────────────────────────────────────────────────────────
--- 4-1. 주문 상태 테이블: 재시작 복원용
+-- 4. symbol_cache 테이블: 종목명 캐시
+-- ───────────────────────────────────────────────────────────────────────────────
+--
+-- ★ 왜 필요한가?
+--    - 텔레그램 알림에서 종목코드만 보이는 문제 해결
+--    - API 호출을 최소화하고, 장애 시에도 기존 종목명 유지
+--
+CREATE TABLE IF NOT EXISTS symbol_cache (
+    stock_code VARCHAR(20) NOT NULL PRIMARY KEY COMMENT '종목 코드',
+    stock_name VARCHAR(100) NOT NULL COMMENT '종목명',
+    updated_at DATETIME NOT NULL COMMENT '마지막 갱신 시각'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='종목코드-종목명 캐시';
+
+CREATE INDEX idx_symbol_cache_updated_at ON symbol_cache(updated_at);
+
+
+-- ───────────────────────────────────────────────────────────────────────────────
+-- 5-1. 주문 상태 테이블: 재시작 복원용
 -- ───────────────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS order_state (
     id INT AUTO_INCREMENT PRIMARY KEY COMMENT '주문 상태 고유 ID',
@@ -207,7 +224,7 @@ CREATE INDEX idx_order_state_order_no ON order_state(order_no);
 
 
 -- ───────────────────────────────────────────────────────────────────────────────
--- 5. daily_summary 테이블: 일별 요약
+-- 6. daily_summary 테이블: 일별 요약
 -- ───────────────────────────────────────────────────────────────────────────────
 --
 -- ★ 왜 필요한가?

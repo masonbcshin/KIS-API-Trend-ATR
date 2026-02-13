@@ -689,6 +689,12 @@ class MySQLManager:
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+        CREATE TABLE IF NOT EXISTS symbol_cache (
+            stock_code VARCHAR(20) NOT NULL PRIMARY KEY,
+            stock_name VARCHAR(100) NOT NULL,
+            updated_at DATETIME NOT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
         CREATE TABLE IF NOT EXISTS order_state (
             id INT AUTO_INCREMENT PRIMARY KEY,
             idempotency_key VARCHAR(128) NOT NULL,
@@ -767,6 +773,7 @@ class MySQLManager:
             ("trades", "uq_trades_idempotency_key", "CREATE UNIQUE INDEX uq_trades_idempotency_key ON trades(idempotency_key)"),
             ("account_snapshots", "idx_snapshots_time", "CREATE INDEX idx_snapshots_time ON account_snapshots(snapshot_time)"),
             ("account_snapshots", "idx_snapshots_mode_time", "CREATE INDEX idx_snapshots_mode_time ON account_snapshots(mode, snapshot_time)"),
+            ("symbol_cache", "idx_symbol_cache_updated_at", "CREATE INDEX idx_symbol_cache_updated_at ON symbol_cache(updated_at)"),
             ("order_state", "idx_order_state_mode_status", "CREATE INDEX idx_order_state_mode_status ON order_state(mode, status)"),
             ("order_state", "idx_order_state_order_no", "CREATE INDEX idx_order_state_order_no ON order_state(order_no)"),
         ]
