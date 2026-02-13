@@ -315,9 +315,10 @@ def run_trade(
         is_paper = trading_mode != "REAL"
         api = KISApi(is_paper_trading=is_paper)
         
-        print("🔑 API 토큰 발급 중...")
+        print("🔑 API 토큰 준비 중...")
+        api.prewarm_access_token_if_due()
         api.get_access_token()
-        print("✅ 토큰 발급 완료\n")
+        print("✅ 토큰 준비 완료\n")
         
         # Universe 서비스 (일자별 1회 생성 + 재사용, 보유종목/신규진입 분리)
         universe_yaml = Path(__file__).resolve().parent / "config" / "universe.yaml"
@@ -411,6 +412,7 @@ def run_trade(
         while True:
             iteration += 1
             logger.info(f"[MULTI] 반복 #{iteration} / symbols={len(executors)}")
+            api.prewarm_access_token_if_due()
 
             # 날짜 변경 시 유니버스 1회 재생성/재사용 후 진입 후보 재계산
             now_trade_date = datetime.now(KST).strftime("%Y-%m-%d")

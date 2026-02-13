@@ -9,9 +9,11 @@ API 문서 참고: https://apiportal.koreainvestment.com/
 ⚠️ 주의: 이 모듈은 모의투자 전용입니다. 실계좌 사용을 금지합니다.
 """
 
+import json
 import time
 import threading
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Dict, Optional, Tuple, Any, List
 import requests
 import pandas as pd
@@ -22,7 +24,10 @@ from utils.market_hours import KST
 
 logger = get_logger("kis_api")
 trade_logger = TradeLogger("kis_api")
-TOKEN_RETRY_DELAY_SECONDS = 1.5
+
+DEFAULT_TOKEN_RETRY_DELAY_SECONDS = 61.0
+DEFAULT_TOKEN_REFRESH_MARGIN_MINUTES = 10
+DEFAULT_TOKEN_CACHE_FILE_NAME = "access_token_cache.json"
 
 
 class KISApiError(Exception):
@@ -71,8 +76,26 @@ class KISApi:
         # 토큰 관리
         self.access_token: Optional[str] = None
         self.token_expires_at: Optional[datetime] = None
-        self._last_token_refresh_date = None
         self._token_lock = threading.Lock()
+        self._token_retry_delay = float(
+            getattr(settings, "TOKEN_RETRY_DELAY_SECONDS", DEFAULT_TOKEN_RETRY_DELAY_SECONDS)
+        )
+        self._token_refresh_margin = timedelta(
+            minutes=max(
+                int(
+                    getattr(
+                        settings,
+                        "TOKEN_REFRESH_MARGIN_MINUTES",
+                        DEFAULT_TOKEN_REFRESH_MARGIN_MINUTES,
+                    )
+                ),
+                1,
+            )
+        )
+        self._token_prewarm_hour = int(getattr(settings, "TOKEN_PREWARM_HOUR", 8))
+        self._token_prewarm_minute = int(getattr(settings, "TOKEN_PREWARM_MINUTE", 0))
+        self._token_cache_file = self._build_token_cache_file_path()
+        self._last_token_prewarm_date = None
 
         # Rate Limit 관리
         self._last_api_call_time: float = 0.0
@@ -91,6 +114,7 @@ class KISApi:
             self._resolve_tr_id("order_cancel"),
             self._resolve_tr_id("balance"),
         )
+        self._load_token_cache()
 
     def _resolve_tr_id(self, purpose: str) -> str:
         """
@@ -115,6 +139,94 @@ class KISApi:
         if not tr_id:
             raise KISApiError(f"지원하지 않는 TR ID 목적: {purpose}")
         return tr_id
+
+    def _build_token_cache_file_path(self) -> Path:
+        data_dir = Path(
+            getattr(
+                settings,
+                "DATA_DIR",
+                Path(__file__).resolve().parent.parent / "data",
+            )
+        )
+        return data_dir / DEFAULT_TOKEN_CACHE_FILE_NAME
+
+    @staticmethod
+    def _parse_datetime(value: Any) -> Optional[datetime]:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(raw)
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=KST)
+            return dt.astimezone(KST)
+        except Exception:
+            return None
+
+    def _is_token_usable(self, now_kst: Optional[datetime] = None) -> bool:
+        if not self.access_token or not self.token_expires_at:
+            return False
+
+        expires_at = self.token_expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=KST)
+
+        now = now_kst or datetime.now(KST)
+        return now < (expires_at - self._token_refresh_margin)
+
+    def _load_token_cache(self) -> bool:
+        path = self._token_cache_file
+        if not path.exists():
+            return False
+
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            token = str(payload.get("access_token", "")).strip()
+            expires_at = self._parse_datetime(payload.get("token_expires_at"))
+            prewarm_date_raw = str(payload.get("last_prewarm_date", "")).strip()
+
+            if token and expires_at:
+                self.access_token = token
+                self.token_expires_at = expires_at
+
+            if prewarm_date_raw:
+                try:
+                    self._last_token_prewarm_date = datetime.strptime(
+                        prewarm_date_raw, "%Y-%m-%d"
+                    ).date()
+                except Exception:
+                    self._last_token_prewarm_date = None
+
+            if self._is_token_usable():
+                logger.info(f"[KIS] 토큰 캐시 재사용 (만료: {self.token_expires_at})")
+                return True
+            return bool(self.access_token and self.token_expires_at)
+        except Exception as e:
+            logger.warning(f"[KIS] 토큰 캐시 로드 실패: {e}")
+            return False
+
+    def _save_token_cache(self) -> None:
+        try:
+            if not self.access_token or not self.token_expires_at:
+                return
+
+            payload = {
+                "access_token": self.access_token,
+                "token_expires_at": self.token_expires_at.astimezone(KST).isoformat(),
+                "updated_at": datetime.now(KST).isoformat(),
+            }
+            if self._last_token_prewarm_date:
+                payload["last_prewarm_date"] = self._last_token_prewarm_date.isoformat()
+
+            self._token_cache_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self._token_cache_file.with_suffix(".tmp")
+            tmp_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            tmp_path.replace(self._token_cache_file)
+        except Exception as e:
+            logger.warning(f"[KIS] 토큰 캐시 저장 실패: {e}")
     
     def _wait_for_rate_limit(self) -> None:
         """
@@ -163,6 +275,7 @@ class KISApi:
         base_retry_delay = float(settings.RETRY_DELAY if retry_delay is None else retry_delay)
         
         last_exception = None
+        did_auth_refresh = False
         
         for attempt in range(max_retries + 1):
             try:
@@ -201,6 +314,23 @@ class KISApi:
                     self._was_disconnected = False
                     return response
                 
+                if (
+                    response.status_code == 401
+                    and isinstance(headers, dict)
+                    and "authorization" in headers
+                    and "/oauth2/tokenP" not in url
+                    and not did_auth_refresh
+                ):
+                    logger.warning("401 인증 오류 감지: 토큰 강제 갱신 후 재시도")
+                    try:
+                        self.get_access_token(force_refresh=True)
+                        headers["authorization"] = f"Bearer {self.access_token}"
+                        did_auth_refresh = True
+                        continue
+                    except Exception as refresh_error:
+                        logger.warning(f"401 처리 중 토큰 갱신 실패: {refresh_error}")
+                        did_auth_refresh = True
+
                 # 에러 응답 처리
                 error_msg = f"HTTP {response.status_code}: {response.text}"
                 logger.warning(f"API 호출 실패 (시도 {attempt + 1}/{max_retries + 1}): {error_msg}")
@@ -249,7 +379,7 @@ class KISApi:
         Returns:
             Dict: 인증 헤더
         """
-        if not self.access_token:
+        if not self._is_token_usable():
             self.get_access_token()
         
         return {
@@ -264,7 +394,37 @@ class KISApi:
     # 인증 관련 API
     # ════════════════════════════════════════════════════════════════
     
-    def get_access_token(self) -> str:
+    def prewarm_access_token_if_due(self) -> bool:
+        """
+        장 시작 전 프리워밍 시각(기본 08:00 KST) 이후 하루 1회 토큰을 준비합니다.
+        """
+        now_kst = datetime.now(KST)
+        prewarm_at = now_kst.replace(
+            hour=self._token_prewarm_hour,
+            minute=self._token_prewarm_minute,
+            second=0,
+            microsecond=0,
+        )
+        today = now_kst.date()
+
+        if now_kst < prewarm_at:
+            return False
+        if self._last_token_prewarm_date == today:
+            return False
+
+        try:
+            self.get_access_token()
+            self._last_token_prewarm_date = today
+            self._save_token_cache()
+            logger.info(
+                f"[KIS] 토큰 프리워밍 완료 (기준 시각: {self._token_prewarm_hour:02d}:{self._token_prewarm_minute:02d} KST)"
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"[KIS] 토큰 프리워밍 실패: {e}")
+            return False
+
+    def get_access_token(self, force_refresh: bool = False) -> str:
         """
         OAuth 액세스 토큰을 발급받습니다.
         
@@ -280,14 +440,15 @@ class KISApi:
         """
         with self._token_lock:
             now_kst = datetime.now(KST)
-            today_kst = now_kst.date()
 
-            # 토큰이 유효하고 당일 갱신 이력이 있으면 재사용
-            if self.access_token and self.token_expires_at:
-                if (
-                    now_kst < self.token_expires_at - timedelta(minutes=10)
-                    and self._last_token_refresh_date == today_kst
-                ):
+            # 메모리 토큰이 유효하면 즉시 재사용
+            if not force_refresh and self._is_token_usable(now_kst):
+                return self.access_token
+
+            # 재기동/멀티프로세스 대비: 파일 캐시에서 재로드 후 유효하면 재사용
+            if not force_refresh:
+                self._load_token_cache()
+                if self._is_token_usable(now_kst):
                     return self.access_token
 
             url = f"{self.base_url}/oauth2/tokenP"
@@ -306,7 +467,7 @@ class KISApi:
                 headers,
                 json_data=body,
                 max_retries=3,
-                retry_delay=TOKEN_RETRY_DELAY_SECONDS,
+                retry_delay=self._token_retry_delay,
                 use_exponential_backoff=False,
             )
             data = response.json()
@@ -319,7 +480,7 @@ class KISApi:
             # 토큰 만료 시간 설정 (KIS 토큰은 24시간 유효)
             expires_in = int(data.get("expires_in", 86400))
             self.token_expires_at = datetime.now(KST) + timedelta(seconds=expires_in)
-            self._last_token_refresh_date = today_kst
+            self._save_token_cache()
             
             logger.info(f"액세스 토큰 발급 완료 (만료: {self.token_expires_at})")
             

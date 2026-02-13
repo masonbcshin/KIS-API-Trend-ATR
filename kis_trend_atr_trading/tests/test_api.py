@@ -76,9 +76,15 @@ class TestRealAccountPrevention:
 
 class TestTokenManagement:
     """토큰 관리 테스트"""
+
+    def test_token_prewarm_default_time_is_0800(self):
+        """토큰 프리워밍 기본 시각이 08:00인지 테스트"""
+        api = KISApi(is_paper_trading=True)
+        assert api._token_prewarm_hour == 8
+        assert api._token_prewarm_minute == 0
     
     @patch('api.kis_api.requests.post')
-    def test_get_access_token_success(self, mock_post):
+    def test_get_access_token_success(self, mock_post, tmp_path):
         """토큰 발급 성공 테스트"""
         mock_response = Mock()
         mock_response.status_code = 200
@@ -89,16 +95,17 @@ class TestTokenManagement:
         }
         mock_post.return_value = mock_response
         
-        with patch.object(KISApi, '_wait_for_rate_limit', return_value=None):
-            api = KISApi(is_paper_trading=True)
-            token = api.get_access_token()
+        with patch("api.kis_api.settings.DATA_DIR", tmp_path):
+            with patch.object(KISApi, '_wait_for_rate_limit', return_value=None):
+                api = KISApi(is_paper_trading=True)
+                token = api.get_access_token()
         
         assert token == "test_token_12345"
         assert api.access_token == "test_token_12345"
         assert api.token_expires_at is not None
     
     @patch('api.kis_api.requests.post')
-    def test_token_reuse_when_valid(self, mock_post):
+    def test_token_reuse_when_valid(self, mock_post, tmp_path):
         """유효한 토큰 재사용 테스트"""
         mock_response = Mock()
         mock_response.status_code = 200
@@ -108,21 +115,22 @@ class TestTokenManagement:
         }
         mock_post.return_value = mock_response
         
-        with patch.object(KISApi, '_wait_for_rate_limit', return_value=None):
-            api = KISApi(is_paper_trading=True)
-            
-            # 첫 번째 토큰 발급
-            token1 = api.get_access_token()
-            
-            # 두 번째 호출 - 토큰이 유효하면 재사용
-            token2 = api.get_access_token()
+        with patch("api.kis_api.settings.DATA_DIR", tmp_path):
+            with patch.object(KISApi, '_wait_for_rate_limit', return_value=None):
+                api = KISApi(is_paper_trading=True)
+                
+                # 첫 번째 토큰 발급
+                token1 = api.get_access_token()
+                
+                # 두 번째 호출 - 토큰이 유효하면 재사용
+                token2 = api.get_access_token()
         
         assert token1 == token2
         # API는 첫 번째 호출에서만 호출됨
         assert mock_post.call_count == 1
     
     @patch('api.kis_api.requests.post')
-    def test_token_refresh_when_expired(self, mock_post):
+    def test_token_refresh_when_expired(self, mock_post, tmp_path):
         """만료된 토큰 갱신 테스트"""
         mock_response = Mock()
         mock_response.status_code = 200
@@ -132,22 +140,23 @@ class TestTokenManagement:
         }
         mock_post.return_value = mock_response
         
-        with patch.object(KISApi, '_wait_for_rate_limit', return_value=None):
-            api = KISApi(is_paper_trading=True)
-            
-            # 만료된 토큰 설정
-            api.access_token = "old_token"
-            api.token_expires_at = datetime.now() - timedelta(hours=1)
-            
-            # 토큰 갱신 요청
-            token = api.get_access_token()
+        with patch("api.kis_api.settings.DATA_DIR", tmp_path):
+            with patch.object(KISApi, '_wait_for_rate_limit', return_value=None):
+                api = KISApi(is_paper_trading=True)
+                
+                # 만료된 토큰 설정
+                api.access_token = "old_token"
+                api.token_expires_at = datetime.now() - timedelta(hours=1)
+                
+                # 토큰 갱신 요청
+                token = api.get_access_token()
         
         assert token == "new_token_67890"
 
     @patch('api.kis_api.time.sleep')
     @patch('api.kis_api.requests.post')
-    def test_get_access_token_retry_interval_fixed_1_5_seconds(self, mock_post, mock_sleep):
-        """토큰 발급 재시도 간격이 1.5초 고정인지 테스트"""
+    def test_get_access_token_retry_interval_fixed_61_seconds(self, mock_post, mock_sleep, tmp_path):
+        """토큰 발급 재시도 간격이 61초 고정인지 테스트"""
         timeout_exc = requests.exceptions.Timeout("token timeout")
         success_response = Mock()
         success_response.status_code = 200
@@ -158,15 +167,33 @@ class TestTokenManagement:
         # 2회 실패 후 성공
         mock_post.side_effect = [timeout_exc, timeout_exc, success_response]
 
-        with patch.object(KISApi, '_wait_for_rate_limit', return_value=None):
-            api = KISApi(is_paper_trading=True)
-            token = api.get_access_token()
+        with patch("api.kis_api.settings.DATA_DIR", tmp_path):
+            with patch.object(KISApi, '_wait_for_rate_limit', return_value=None):
+                api = KISApi(is_paper_trading=True)
+                token = api.get_access_token()
 
         assert token == "token_after_retry"
-        # 두 번의 재시도 대기 모두 1.5초 고정
+        # 두 번의 재시도 대기 모두 61초 고정
         assert mock_sleep.call_count >= 2
         first_two = [c.args[0] for c in mock_sleep.call_args_list[:2]]
-        assert first_two == [1.5, 1.5]
+        assert first_two == [61.0, 61.0]
+
+    @patch("api.kis_api.requests.post")
+    def test_get_access_token_reuses_persisted_cache_on_restart(self, mock_post, tmp_path):
+        """재기동 시 영속 토큰 캐시를 재사용해 재발급을 피하는지 테스트"""
+        with patch("api.kis_api.settings.DATA_DIR", tmp_path):
+            with patch.object(KISApi, "_wait_for_rate_limit", return_value=None):
+                issuer = KISApi(is_paper_trading=True)
+                issuer.access_token = "persisted_token"
+                issuer.token_expires_at = datetime.now().astimezone() + timedelta(hours=23)
+                issuer._save_token_cache()
+
+            with patch.object(KISApi, "_wait_for_rate_limit", return_value=None):
+                reloaded = KISApi(is_paper_trading=True)
+                token = reloaded.get_access_token()
+
+        assert token == "persisted_token"
+        mock_post.assert_not_called()
 
 
 class TestRateLimiting:

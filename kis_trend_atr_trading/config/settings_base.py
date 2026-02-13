@@ -242,6 +242,16 @@ RETRY_DELAY: float = 1.0
 # Rate Limit 대기 시간 (초) - KIS API 초당 20회 제한
 RATE_LIMIT_DELAY: float = 0.1
 
+# 토큰 발급 재시도 간격 (초) - KIS 토큰발급 API 1분당 1회 제한 대응
+TOKEN_RETRY_DELAY_SECONDS: float = float(os.getenv("TOKEN_RETRY_DELAY_SECONDS", "61.0"))
+
+# 토큰 만료 임박 판단 기준 (분)
+TOKEN_REFRESH_MARGIN_MINUTES: int = int(os.getenv("TOKEN_REFRESH_MARGIN_MINUTES", "10"))
+
+# 장 시작 전 토큰 프리워밍 시각 (KST, 기본 08:00)
+TOKEN_PREWARM_HOUR: int = int(os.getenv("TOKEN_PREWARM_HOUR", "8"))
+TOKEN_PREWARM_MINUTE: int = int(os.getenv("TOKEN_PREWARM_MINUTE", "0"))
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 실행 주기 설정
