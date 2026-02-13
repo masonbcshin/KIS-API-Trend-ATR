@@ -206,6 +206,15 @@ class TestSendMessage:
         sent_text = mock_requests_post.call_args[1]["json"]["text"]
         assert "삼성전자(005930)" in sent_text
 
+    def test_send_message_formats_symbol_label_without_bullet(self, mock_telegram_notifier, mock_requests_post):
+        """불릿 없는 `종목:` 라인도 포맷 보정되는지 테스트"""
+        direct_message = "청산 보류 해제\n종목: 005930\n사유: exit_reason_changed"
+        result = mock_telegram_notifier.send_message(direct_message)
+
+        assert result is True
+        sent_text = mock_requests_post.call_args[1]["json"]["text"]
+        assert "삼성전자(005930)" in sent_text
+
 
 # ════════════════════════════════════════════════════════════════
 # 거래 알림 테스트
@@ -422,6 +431,14 @@ class TestSystemNotifications:
         text = call_args[1]['json']['text']
         assert "경고" in text
         assert "변동성" in text
+
+    def test_notify_warning_formats_inline_symbol_code(self, mock_telegram_notifier, mock_requests_post):
+        """warning 본문 내 6자리 종목코드를 name(code)로 변환하는지 테스트"""
+        result = mock_telegram_notifier.notify_warning("부분 체결: 005930 1/2주 @ 70,000원")
+
+        assert result is True
+        text = mock_requests_post.call_args[1]["json"]["text"]
+        assert "삼성전자(005930)" in text
     
     def test_notify_info(self, mock_telegram_notifier, mock_requests_post):
         """정보 알림 테스트"""
@@ -433,6 +450,14 @@ class TestSystemNotifications:
         text = call_args[1]['json']['text']
         assert "정보" in text
         assert "토큰" in text
+
+    def test_notify_info_formats_multiline_symbol_line(self, mock_telegram_notifier, mock_requests_post):
+        """info 본문의 종목 라인이 불릿 없이 와도 변환되는지 테스트"""
+        result = mock_telegram_notifier.notify_info("청산 보류 해제\n종목: 000660\n사유: retry_key_changed")
+
+        assert result is True
+        text = mock_requests_post.call_args[1]["json"]["text"]
+        assert "SK하이닉스(000660)" in text
     
     def test_notify_daily_summary(self, mock_telegram_notifier, mock_requests_post):
         """일일 요약 알림 테스트"""

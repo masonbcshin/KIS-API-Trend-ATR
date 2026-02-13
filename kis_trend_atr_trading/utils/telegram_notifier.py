@@ -533,11 +533,15 @@ class TelegramNotifier:
 
     def _format_symbol_label_lines(self, text: str) -> str:
         """
-        직접 구성된 메시지에서 `• 종목:` 라인의 코드만 안전하게 포맷합니다.
+        직접 구성된 메시지에서 `종목:`/`종목코드:` 라인의 코드만 안전하게 포맷합니다.
+        (`•` 불릿 유무와 무관)
         """
         if not text:
             return text
-        pattern = re.compile(r"(•\s*종목(?:코드)?\s*:\s*`?)(\d{6})(`?)")
+        pattern = re.compile(
+            r"(^\s*(?:•\s*)?종목(?:코드)?\s*:\s*`?)(\d{6})(`?)",
+            re.MULTILINE,
+        )
         return pattern.sub(
             lambda m: f"{m.group(1)}{self._format_symbol(m.group(2))}{m.group(3)}",
             text,
@@ -927,8 +931,9 @@ class TelegramNotifier:
         Returns:
             bool: 전송 성공 여부
         """
+        display_message = self._format_symbol_codes_in_text(message)
         formatted = MESSAGE_TEMPLATES["warning"].format(
-            message=message,
+            message=display_message,
             timestamp=self._get_timestamp()
         )
         return self.send_message(formatted)
@@ -943,8 +948,9 @@ class TelegramNotifier:
         Returns:
             bool: 전송 성공 여부
         """
+        display_message = self._format_symbol_codes_in_text(message)
         formatted = MESSAGE_TEMPLATES["info"].format(
-            message=message,
+            message=display_message,
             timestamp=self._get_timestamp()
         )
         return self.send_message(formatted)
