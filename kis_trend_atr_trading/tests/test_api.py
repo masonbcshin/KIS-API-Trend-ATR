@@ -144,6 +144,30 @@ class TestTokenManagement:
         
         assert token == "new_token_67890"
 
+    @patch('api.kis_api.time.sleep')
+    @patch('api.kis_api.requests.post')
+    def test_get_access_token_retry_interval_fixed_1_5_seconds(self, mock_post, mock_sleep):
+        """토큰 발급 재시도 간격이 1.5초 고정인지 테스트"""
+        timeout_exc = requests.exceptions.Timeout("token timeout")
+        success_response = Mock()
+        success_response.status_code = 200
+        success_response.json.return_value = {
+            "access_token": "token_after_retry",
+            "expires_in": 86400
+        }
+        # 2회 실패 후 성공
+        mock_post.side_effect = [timeout_exc, timeout_exc, success_response]
+
+        with patch.object(KISApi, '_wait_for_rate_limit', return_value=None):
+            api = KISApi(is_paper_trading=True)
+            token = api.get_access_token()
+
+        assert token == "token_after_retry"
+        # 두 번의 재시도 대기 모두 1.5초 고정
+        assert mock_sleep.call_count >= 2
+        first_two = [c.args[0] for c in mock_sleep.call_args_list[:2]]
+        assert first_two == [1.5, 1.5]
+
 
 class TestRateLimiting:
     """Rate Limit 테스트"""
