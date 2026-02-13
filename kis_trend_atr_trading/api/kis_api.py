@@ -12,6 +12,7 @@ API 문서 참고: https://apiportal.koreainvestment.com/
 import json
 import time
 import threading
+from copy import deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Any, List
@@ -99,6 +100,13 @@ class KISApi:
 
         # Rate Limit 관리
         self._last_api_call_time: float = 0.0
+
+        # 계좌 잔고 조회 단기 캐시 (다종목 초기화 시 과도한 연속 호출 완화)
+        self._balance_cache: Optional[Dict[str, Any]] = None
+        self._balance_cache_ts: float = 0.0
+        self._balance_cache_ttl_sec: float = float(
+            getattr(settings, "ACCOUNT_BALANCE_CACHE_TTL_SEC", 2.0)
+        )
         
         # 네트워크 상태 관리 (1분 이상 단절 시 거래 중단 판단)
         self._network_down_since: Optional[float] = None
@@ -1220,6 +1228,17 @@ class KISApi:
         Returns:
             Dict: 계좌 잔고 정보
         """
+        now_ts = time.time()
+        if (
+            self._balance_cache is not None
+            and (now_ts - self._balance_cache_ts) < max(self._balance_cache_ttl_sec, 0.0)
+        ):
+            logger.info(
+                "[KIS][BAL] 캐시 재사용: age=%.2fs",
+                now_ts - self._balance_cache_ts,
+            )
+            return deepcopy(self._balance_cache)
+
         url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
         
         tr_id = self._resolve_tr_id("balance")
@@ -1260,14 +1279,6 @@ class KISApi:
                     max_attempts,
                     msg,
                 )
-                try:
-                    self.get_access_token(force_refresh=True)
-                    headers = self._get_auth_headers(tr_id)
-                except Exception as refresh_error:
-                    logger.warning(
-                        "[KIS][BAL] 토큰 강제 갱신 실패 (재시도 지속): %s",
-                        refresh_error,
-                    )
                 time.sleep(0.3 * attempt)
                 continue
 
@@ -1310,10 +1321,13 @@ class KISApi:
         # 계좌 요약
         output2 = data.get("output2", [{}])[0] if data.get("output2") else {}
         
-        return {
+        result = {
             "success": True,
             "holdings": holdings,
             "total_eval": self._parse_numeric_float(output2.get("tot_evlu_amt"), 0.0),
             "cash_balance": self._parse_numeric_float(output2.get("dnca_tot_amt"), 0.0),
             "total_pnl": self._parse_numeric_float(output2.get("evlu_pfls_smtl_amt"), 0.0),
         }
+        self._balance_cache = deepcopy(result)
+        self._balance_cache_ts = time.time()
+        return result

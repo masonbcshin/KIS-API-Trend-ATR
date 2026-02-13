@@ -620,7 +620,7 @@ class TestAccountBalanceAPI:
 
         assert result["success"] is True
         assert result["holdings"][0]["quantity"] == 3
-        assert mocked_refresh.call_count >= 1
+        assert mocked_refresh.call_count == 0
 
 
 class TestAuthHeaders:
