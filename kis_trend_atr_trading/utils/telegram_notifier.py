@@ -899,7 +899,8 @@ class TelegramNotifier:
     def notify_error(
         self,
         error_type: str,
-        error_message: str
+        error_message: str,
+        error_detail: Optional[str] = None,
     ) -> bool:
         """
         오류 발생 알림
@@ -907,12 +908,20 @@ class TelegramNotifier:
         Args:
             error_type: 오류 유형
             error_message: 오류 메시지
+            error_detail: 추가 상세 정보 (선택)
         
         Returns:
             bool: 전송 성공 여부
         """
+        merged_message = str(error_message or "")
+        if error_detail:
+            merged_message = (
+                f"{merged_message}\n\n"
+                f"[DETAIL]\n{error_detail}"
+            )
+
         # 마크다운 특수문자 이스케이프
-        safe_message = self._escape_markdown(error_message)
+        safe_message = self._escape_markdown(merged_message)
         
         message = MESSAGE_TEMPLATES["error"].format(
             error_type=error_type,

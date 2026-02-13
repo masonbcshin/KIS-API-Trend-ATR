@@ -366,6 +366,15 @@ class MultidayExecutor:
             self.telegram.notify_info(f"포지션 자동복구 완료: {recovery}")
         
         action = sync_result.get("action", "")
+        sync_warnings = sync_result.get("warnings", []) or []
+        sync_recoveries = sync_result.get("recoveries", []) or []
+        sync_detail_lines = []
+        if sync_warnings:
+            sync_detail_lines.append(f"warnings={sync_warnings}")
+        if sync_recoveries:
+            sync_detail_lines.append(f"recoveries={sync_recoveries}")
+        sync_detail_lines.append(f"action={action}")
+        sync_error_detail = "\n".join(sync_detail_lines)
         
         if action in ("NO_POSITION", "AUTO_RECOVERED_CLEARED"):
             logger.info("포지션 없음 확인")
@@ -377,7 +386,8 @@ class MultidayExecutor:
             self.telegram.notify_error(
                 "미기록 보유 발견",
                 "저장된 포지션 없이 실제 보유가 발견되었습니다.\n"
-                "수동으로 확인하고 처리하세요."
+                "수동으로 확인하고 처리하세요.",
+                error_detail=sync_error_detail,
             )
             return False
         
@@ -392,7 +402,8 @@ class MultidayExecutor:
             self.telegram.notify_error(
                 "심각한 포지션 불일치",
                 "저장된 포지션과 실제 보유가 다릅니다.\n"
-                "즉시 확인하세요!"
+                "즉시 확인하세요!",
+                error_detail=sync_error_detail,
             )
             # 안전을 위해 킬 스위치 발동 고려
             return False
@@ -444,6 +455,11 @@ class MultidayExecutor:
         
         else:
             logger.warning(f"알 수 없는 동기화 결과: {action}")
+            self.telegram.notify_error(
+                "알 수 없는 포지션 동기화 결과",
+                "포지션 복원 동기화 결과를 해석하지 못했습니다.",
+                error_detail=sync_error_detail,
+            )
             return False
     
     def _calculate_holding_days(self, entry_date: str) -> int:

@@ -744,6 +744,7 @@ class MySQLManager:
         """필수 컬럼을 존재할 때만 안전하게 추가합니다."""
         column_specs = [
             ("positions", "mode", "VARCHAR(16) NOT NULL DEFAULT 'PAPER'"),
+            ("positions", "status", "VARCHAR(20) NOT NULL DEFAULT 'OPEN'"),
             ("trades", "mode", "VARCHAR(16) NOT NULL DEFAULT 'PAPER'"),
             ("trades", "idempotency_key", "VARCHAR(128) NULL"),
             ("account_snapshots", "mode", "VARCHAR(16) NOT NULL DEFAULT 'PAPER'"),
@@ -851,6 +852,7 @@ class MySQLManager:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _db_manager: Optional[MySQLManager] = None
+_db_schema_init_attempted: bool = False
 
 
 def get_db_manager(config: DatabaseConfig = None) -> MySQLManager:
@@ -866,9 +868,18 @@ def get_db_manager(config: DatabaseConfig = None) -> MySQLManager:
         MySQLManager: DB 관리자 인스턴스
     """
     global _db_manager
+    global _db_schema_init_attempted
     
     if _db_manager is None:
         _db_manager = MySQLManager(config)
+
+    # 런타임 구버전 스키마(예: positions.status 누락) 자동 보정
+    if not _db_schema_init_attempted:
+        _db_schema_init_attempted = True
+        try:
+            _db_manager.initialize_schema()
+        except Exception as e:
+            logger.warning(f"[DB] 초기 스키마 보정 실패(계속 진행): {e}")
     
     return _db_manager
 
@@ -876,7 +887,9 @@ def get_db_manager(config: DatabaseConfig = None) -> MySQLManager:
 def close_db_manager() -> None:
     """싱글톤 DB 관리자 연결 종료"""
     global _db_manager
+    global _db_schema_init_attempted
     
     if _db_manager is not None:
         _db_manager.close()
         _db_manager = None
+        _db_schema_init_attempted = False
