@@ -29,26 +29,43 @@ from utils.telegram_notifier import (
 # ════════════════════════════════════════════════════════════════
 
 @pytest.fixture
-def mock_telegram_notifier():
+def mock_symbol_resolver():
+    """종목 코드 -> 종목명 포맷 Mock"""
+    resolver = MagicMock()
+
+    def _format_symbol(code: str) -> str:
+        table = {
+            "005930": "삼성전자(005930)",
+            "000660": "SK하이닉스(000660)",
+        }
+        key = str(code)
+        return table.get(key, f"UNKNOWN({key})")
+
+    resolver.format_symbol.side_effect = _format_symbol
+    return resolver
+
+
+@pytest.fixture
+def mock_telegram_notifier(mock_symbol_resolver):
     """환경변수가 설정된 텔레그램 알림기를 생성합니다."""
     with patch.dict('os.environ', {
         'TELEGRAM_BOT_TOKEN': 'test_token_12345',
         'TELEGRAM_CHAT_ID': '123456789',
         'TELEGRAM_ENABLED': 'true'
     }):
-        notifier = TelegramNotifier()
+        notifier = TelegramNotifier(symbol_resolver=mock_symbol_resolver)
         yield notifier
 
 
 @pytest.fixture
-def disabled_notifier():
+def disabled_notifier(mock_symbol_resolver):
     """비활성화된 텔레그램 알림기를 생성합니다."""
     with patch.dict('os.environ', {
         'TELEGRAM_BOT_TOKEN': '',
         'TELEGRAM_CHAT_ID': '',
         'TELEGRAM_ENABLED': 'false'
     }):
-        notifier = TelegramNotifier()
+        notifier = TelegramNotifier(symbol_resolver=mock_symbol_resolver)
         yield notifier
 
 
@@ -180,6 +197,15 @@ class TestSendMessage:
             assert result is False
             assert mock_post.call_count == 2
 
+    def test_send_message_formats_direct_symbol_label(self, mock_telegram_notifier, mock_requests_post):
+        """엔진 직접 메시지의 종목 라벨 포맷 보정 테스트"""
+        direct_message = "• 종목: `005930`\n• 진입가: 70,000원"
+        result = mock_telegram_notifier.send_message(direct_message)
+
+        assert result is True
+        sent_text = mock_requests_post.call_args[1]["json"]["text"]
+        assert "삼성전자(005930)" in sent_text
+
 
 # ════════════════════════════════════════════════════════════════
 # 거래 알림 테스트
@@ -203,6 +229,7 @@ class TestTradeNotifications:
         call_args = mock_requests_post.call_args
         text = call_args[1]['json']['text']
         assert "매수 주문 체결" in text
+        assert "삼성전자(005930)" in text
         assert "005930" in text
         assert "70,000" in text
         assert "10" in text
@@ -223,6 +250,7 @@ class TestTradeNotifications:
         call_args = mock_requests_post.call_args
         text = call_args[1]['json']['text']
         assert "매도 주문 체결" in text
+        assert "삼성전자(005930)" in text
         assert "익절 도달" in text
         assert "+50,000" in text
     
@@ -260,6 +288,26 @@ class TestTradeNotifications:
         text = call_args[1]['json']['text']
         assert "익절 청산" in text
         assert "목표 수익" in text
+
+    def test_notify_gap_protection_formats_symbol(self, mock_telegram_notifier, mock_requests_post):
+        """갭 보호 알림 종목명 포맷 테스트"""
+        result = mock_telegram_notifier.notify_gap_protection(
+            stock_code="005930",
+            open_price=65000,
+            stop_loss=66000,
+            entry_price=70000,
+            gap_loss_pct=2.3,
+            raw_gap_pct=2.3456,
+            reference_price=66500,
+            reference_type="prev_close",
+            reason_code="GAP_DOWN",
+            pnl=-50000,
+            pnl_pct=-7.14,
+        )
+
+        assert result is True
+        text = mock_requests_post.call_args[1]["json"]["text"]
+        assert "삼성전자(005930)" in text
 
 
 # ════════════════════════════════════════════════════════════════
@@ -319,6 +367,20 @@ class TestSystemNotifications:
         assert "시스템 시작" in text
         assert "005930" in text
         assert "모의투자" in text
+
+    def test_notify_system_start_multi_symbols(self, mock_telegram_notifier, mock_requests_post):
+        """시스템 시작 알림에서 다중 종목 포맷 테스트"""
+        result = mock_telegram_notifier.notify_system_start(
+            stock_code="['005930', '000660']",
+            order_quantity=10,
+            interval=60,
+            mode="모의투자",
+        )
+
+        assert result is True
+        text = mock_requests_post.call_args[1]["json"]["text"]
+        assert "삼성전자(005930)" in text
+        assert "SK하이닉스(000660)" in text
     
     def test_notify_system_stop(self, mock_telegram_notifier, mock_requests_post):
         """시스템 종료 알림 테스트"""
