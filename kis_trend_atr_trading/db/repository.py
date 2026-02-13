@@ -1313,13 +1313,6 @@ class SymbolCacheRepository:
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                     """
                 )
-                try:
-                    self.db.execute_command(
-                        "CREATE INDEX idx_symbol_cache_updated_at ON symbol_cache(updated_at)"
-                    )
-                except Exception:
-                    # 이미 존재하는 인덱스 오류는 무시
-                    pass
                 self._schema_ready = True
             except Exception as e:
                 logger.warning(f"[REPO] symbol_cache 스키마 보장 실패: {e}")
