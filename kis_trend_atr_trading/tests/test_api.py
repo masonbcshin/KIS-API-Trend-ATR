@@ -574,6 +574,54 @@ class TestAccountBalanceAPI:
         assert result["cash_balance"] == 9476354
         assert result["total_pnl"] == -7748
 
+    @patch('api.kis_api.requests.get')
+    def test_get_account_balance_retries_invalid_check_acno_then_succeeds(self, mock_get):
+        """INVALID_CHECK_ACNO 응답은 토큰 갱신 후 재시도하여 복구해야 합니다."""
+        first = Mock()
+        first.status_code = 200
+        first.json.return_value = {
+            "rt_cd": "1",
+            "msg1": "ERROR : INPUT INVALID_CHECK_ACNO"
+        }
+
+        second = Mock()
+        second.status_code = 200
+        second.json.return_value = {
+            "rt_cd": "0",
+            "output1": [
+                {
+                    "pdno": "005930",
+                    "prdt_name": "삼성전자",
+                    "hldg_qty": "3",
+                    "ord_psbl_qty": "3",
+                    "pchs_avg_pric": "178100.00",
+                    "prpr": "181200",
+                    "evlu_amt": "543600",
+                    "evlu_pfls_amt": "9300",
+                    "evlu_pfls_rt": "1.74"
+                }
+            ],
+            "output2": [
+                {
+                    "tot_evlu_amt": "10002834",
+                    "dnca_tot_amt": "9476354",
+                    "evlu_pfls_smtl_amt": "-7748"
+                }
+            ]
+        }
+        mock_get.side_effect = [first, second]
+
+        with patch.object(KISApi, '_wait_for_rate_limit', return_value=None):
+            with patch("api.kis_api.time.sleep", return_value=None):
+                api = KISApi(is_paper_trading=True)
+                api.access_token = "test_token"
+                with patch.object(api, "get_access_token", return_value="test_token") as mocked_refresh:
+                    result = api.get_account_balance()
+
+        assert result["success"] is True
+        assert result["holdings"][0]["quantity"] == 3
+        assert mocked_refresh.call_count >= 1
+
 
 class TestAuthHeaders:
     """인증 헤더 테스트"""

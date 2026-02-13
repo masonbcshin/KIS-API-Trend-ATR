@@ -99,7 +99,16 @@ class _DummyStore:
         self._stored = position
 
 
+class _DummyBrokenDbRepository:
+    def get_open_positions(self):
+        raise RuntimeError("쿼리 실행 실패: 1054 (42S22): Unknown column 'status' in 'where clause'")
+
+
 class TestPositionResynchronizerModes(unittest.TestCase):
+    def setUp(self):
+        PositionResynchronizer._db_sync_disabled_globally = False
+        PositionResynchronizer._db_sync_disable_reason = ""
+
     def test_paper_mode_sync_uses_api_on_startup(self):
         api = _DummyApi(holdings=[])
         store = _DummyStore(stored=None)
@@ -270,6 +279,38 @@ class TestPositionResynchronizerModes(unittest.TestCase):
         self.assertEqual(result["action"], "QTY_ADJUSTED")
         self.assertEqual(result["position"].stock_code, "005930")
         self.assertEqual(result["position"].quantity, 3)
+
+    def test_db_schema_incompatible_disables_db_sync_but_keeps_resync(self):
+        stored = StoredPosition(
+            stock_code="005930",
+            entry_price=70000,
+            quantity=1,
+            stop_loss=68000,
+            take_profit=73000,
+            entry_date="2026-02-01",
+            atr_at_entry=1200,
+        )
+        api = _DummyApi(
+            holdings=[
+                {"stock_code": "005930", "quantity": 3, "avg_price": 71000, "current_price": 71500}
+            ]
+        )
+        store = _DummyStore(stored=stored)
+        syncer = PositionResynchronizer(
+            api=api,
+            position_store=store,
+            db_repository=_DummyBrokenDbRepository(),
+            trading_mode="PAPER",
+            target_symbol="005930",
+        )
+
+        result = syncer.synchronize_on_startup()
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["action"], "QTY_ADJUSTED")
+        self.assertEqual(result["position"].quantity, 3)
+        self.assertTrue(PositionResynchronizer._db_sync_disabled_globally)
+        self.assertTrue(result["warnings"])
 
 
 if __name__ == "__main__":

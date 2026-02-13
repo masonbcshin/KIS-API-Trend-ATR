@@ -1239,11 +1239,43 @@ class KISApi:
             "CTX_AREA_NK100": "",
         }
         
-        response = self._request_with_retry("GET", url, headers, params=params)
-        data = response.json()
-        
-        if data.get("rt_cd") != "0":
-            raise KISApiError(f"잔고 조회 실패: {data.get('msg1', 'Unknown error')}")
+        max_attempts = 3
+        data = {}
+        for attempt in range(1, max_attempts + 1):
+            response = self._request_with_retry("GET", url, headers, params=params)
+            data = response.json()
+            rt_cd = str(data.get("rt_cd", ""))
+            if rt_cd == "0":
+                break
+
+            msg = str(data.get("msg1", "Unknown error"))
+            should_retry_invalid_acno = (
+                "INVALID_CHECK_ACNO" in msg
+                and attempt < max_attempts
+            )
+            if should_retry_invalid_acno:
+                logger.warning(
+                    "[KIS][BAL] 계좌 검증 오류 재시도(%s/%s): %s",
+                    attempt,
+                    max_attempts,
+                    msg,
+                )
+                try:
+                    self.get_access_token(force_refresh=True)
+                    headers = self._get_auth_headers(tr_id)
+                except Exception as refresh_error:
+                    logger.warning(
+                        "[KIS][BAL] 토큰 강제 갱신 실패 (재시도 지속): %s",
+                        refresh_error,
+                    )
+                time.sleep(0.3 * attempt)
+                continue
+
+            raise KISApiError(f"잔고 조회 실패: {msg}")
+        else:
+            raise KISApiError(
+                f"잔고 조회 실패: {str(data.get('msg1', 'Unknown error'))}"
+            )
         
         # 보유 종목
         holdings = []

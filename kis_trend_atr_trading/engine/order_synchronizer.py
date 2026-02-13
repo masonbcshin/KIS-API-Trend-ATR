@@ -1019,6 +1019,8 @@ class PositionResynchronizer:
     ★ 감사 보고서 해결:
         - "DB vs 실제 계좌 vs 메모리 상태 불일치" 해결
     """
+    _db_sync_disabled_globally: bool = False
+    _db_sync_disable_reason: str = ""
     
     def __init__(
         self,
@@ -1206,6 +1208,14 @@ class PositionResynchronizer:
         if not self.db_repository:
             return
 
+        if self.__class__._db_sync_disabled_globally:
+            if self.__class__._db_sync_disable_reason:
+                logger.warning(
+                    "[RESYNC][DB] DB 동기화 비활성 상태 유지: %s",
+                    self.__class__._db_sync_disable_reason,
+                )
+            return
+
         try:
             db_open_positions = self.db_repository.get_open_positions()
             db_map = {p.symbol: p for p in db_open_positions}
@@ -1262,7 +1272,24 @@ class PositionResynchronizer:
                         f"qty={qty}, avg={base_price:,.0f}"
                     )
         except Exception as e:
-            result["warnings"].append(f"DB 동기화 실패: {str(e)}")
+            err_text = str(e)
+            lowered = err_text.lower()
+            schema_incompatible = (
+                "unknown column" in lowered
+                and ("status" in lowered or "mode" in lowered)
+            )
+            if schema_incompatible:
+                self.__class__._db_sync_disabled_globally = True
+                self.__class__._db_sync_disable_reason = err_text
+                msg = (
+                    "DB 스키마 호환성 문제로 계좌→DB 동기화를 비활성화합니다. "
+                    "포지션 복원/감시는 계속 진행됩니다."
+                )
+                result["warnings"].append(msg)
+                logger.error(f"[RESYNC][DB] {msg} 원인={err_text}")
+                return
+
+            result["warnings"].append(f"DB 동기화 실패: {err_text}")
             logger.error(f"[RESYNC][DB] 동기화 오류: {e}")
     
     def synchronize_on_startup(self) -> Dict[str, Any]:
