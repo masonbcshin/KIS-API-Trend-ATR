@@ -40,6 +40,7 @@ from typing import Optional, Dict, List, Any, Tuple
 from dataclasses import dataclass
 from decimal import Decimal
 import hashlib
+import threading
 
 from db.mysql import MySQLManager, get_db_manager, QueryError
 from utils.logger import get_logger
@@ -1287,9 +1288,45 @@ class SymbolCacheRepository:
 
     def __init__(self, db: MySQLManager = None):
         self.db = db or get_db_manager()
+        self._schema_lock = threading.Lock()
+        self._schema_ready = False
+        self._ensure_table()
+
+    def _is_missing_table_error(self, error: Exception) -> bool:
+        msg = str(error)
+        return "1146" in msg and "symbol_cache" in msg
+
+    def _ensure_table(self) -> None:
+        if self._schema_ready:
+            return
+
+        with self._schema_lock:
+            if self._schema_ready:
+                return
+            try:
+                self.db.execute_command(
+                    """
+                    CREATE TABLE IF NOT EXISTS symbol_cache (
+                        stock_code VARCHAR(20) NOT NULL PRIMARY KEY,
+                        stock_name VARCHAR(100) NOT NULL,
+                        updated_at DATETIME NOT NULL
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                    """
+                )
+                try:
+                    self.db.execute_command(
+                        "CREATE INDEX idx_symbol_cache_updated_at ON symbol_cache(updated_at)"
+                    )
+                except Exception:
+                    # 이미 존재하는 인덱스 오류는 무시
+                    pass
+                self._schema_ready = True
+            except Exception as e:
+                logger.warning(f"[REPO] symbol_cache 스키마 보장 실패: {e}")
 
     def get(self, stock_code: str) -> Optional[SymbolCacheRecord]:
         """종목코드로 캐시를 조회합니다."""
+        self._ensure_table()
         try:
             result = self.db.execute_query(
                 """
@@ -1304,6 +1341,23 @@ class SymbolCacheRepository:
                 return None
             return SymbolCacheRecord.from_dict(result)
         except Exception as e:
+            if self._is_missing_table_error(e):
+                self._ensure_table()
+                try:
+                    result = self.db.execute_query(
+                        """
+                        SELECT stock_code, stock_name, updated_at
+                        FROM symbol_cache
+                        WHERE stock_code = %s
+                        """,
+                        (stock_code,),
+                        fetch_one=True,
+                    )
+                    if result:
+                        return SymbolCacheRecord.from_dict(result)
+                    return None
+                except Exception as retry_err:
+                    logger.warning(f"[REPO] symbol_cache 재조회 실패: {stock_code}, {retry_err}")
             logger.warning(f"[REPO] symbol_cache 조회 실패: {stock_code}, {e}")
             return None
 
@@ -1314,6 +1368,7 @@ class SymbolCacheRepository:
         updated_at: datetime = None,
     ) -> bool:
         """종목명 캐시를 upsert 합니다."""
+        self._ensure_table()
         ts = updated_at or datetime.now(KST)
         try:
             self.db.execute_command(
@@ -1328,6 +1383,22 @@ class SymbolCacheRepository:
             )
             return True
         except Exception as e:
+            if self._is_missing_table_error(e):
+                self._ensure_table()
+                try:
+                    self.db.execute_command(
+                        """
+                        INSERT INTO symbol_cache (stock_code, stock_name, updated_at)
+                        VALUES (%s, %s, %s)
+                        ON DUPLICATE KEY UPDATE
+                            stock_name = VALUES(stock_name),
+                            updated_at = VALUES(updated_at)
+                        """,
+                        (stock_code, stock_name, ts),
+                    )
+                    return True
+                except Exception as retry_err:
+                    logger.warning(f"[REPO] symbol_cache 재upsert 실패: {stock_code}, {retry_err}")
             logger.warning(f"[REPO] symbol_cache upsert 실패: {stock_code}, {e}")
             return False
 

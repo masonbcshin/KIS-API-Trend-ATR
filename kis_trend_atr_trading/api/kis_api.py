@@ -22,6 +22,7 @@ from utils.market_hours import KST
 
 logger = get_logger("kis_api")
 trade_logger = TradeLogger("kis_api")
+TOKEN_RETRY_DELAY_SECONDS = 1.5
 
 
 class KISApiError(Exception):
@@ -132,7 +133,9 @@ class KISApi:
         headers: Dict,
         params: Dict = None,
         json_data: Dict = None,
-        max_retries: int = None
+        max_retries: int = None,
+        retry_delay: float = None,
+        use_exponential_backoff: bool = True,
     ) -> requests.Response:
         """
         재시도 로직이 포함된 HTTP 요청
@@ -144,6 +147,8 @@ class KISApi:
             params: URL 파라미터
             json_data: JSON 바디
             max_retries: 최대 재시도 횟수
+            retry_delay: 재시도 대기 시간(초). None이면 settings.RETRY_DELAY 사용
+            use_exponential_backoff: 지수 백오프 사용 여부
         
         Returns:
             requests.Response: 응답 객체
@@ -155,6 +160,7 @@ class KISApi:
             max_retries = min(int(settings.MAX_RETRIES), 3)
         else:
             max_retries = min(int(max_retries), 3)
+        base_retry_delay = float(settings.RETRY_DELAY if retry_delay is None else retry_delay)
         
         last_exception = None
         
@@ -212,7 +218,10 @@ class KISApi:
             
             # 재시도 전 대기
             if attempt < max_retries:
-                wait_time = settings.RETRY_DELAY * (2 ** attempt)  # 지수 백오프
+                if use_exponential_backoff:
+                    wait_time = base_retry_delay * (2 ** attempt)
+                else:
+                    wait_time = base_retry_delay
                 logger.info(f"{wait_time}초 후 재시도...")
                 time.sleep(wait_time)
         
@@ -291,7 +300,15 @@ class KISApi:
             
             logger.info("액세스 토큰 발급 요청...")
             
-            response = self._request_with_retry("POST", url, headers, json_data=body)
+            response = self._request_with_retry(
+                "POST",
+                url,
+                headers,
+                json_data=body,
+                max_retries=3,
+                retry_delay=TOKEN_RETRY_DELAY_SECONDS,
+                use_exponential_backoff=False,
+            )
             data = response.json()
             
             if "access_token" not in data:
