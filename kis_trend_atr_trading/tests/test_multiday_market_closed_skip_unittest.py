@@ -76,6 +76,30 @@ class _DummyMarketChecker:
 
 
 class TestMultidayMarketClosedSkip(unittest.TestCase):
+    def test_resync_mode_overrides_cbt_to_real_with_injected_real_api(self):
+        mode = MultidayExecutor._resolve_resync_mode(
+            trading_mode="CBT",
+            api_obj=SimpleNamespace(is_paper_trading=False),
+            api_was_injected=True,
+        )
+        self.assertEqual(mode, "REAL")
+
+    def test_resync_mode_overrides_cbt_to_paper_with_injected_paper_api(self):
+        mode = MultidayExecutor._resolve_resync_mode(
+            trading_mode="CBT",
+            api_obj=SimpleNamespace(is_paper_trading=True),
+            api_was_injected=True,
+        )
+        self.assertEqual(mode, "PAPER")
+
+    def test_resync_mode_keeps_cbt_without_injected_api(self):
+        mode = MultidayExecutor._resolve_resync_mode(
+            trading_mode="CBT",
+            api_obj=SimpleNamespace(is_paper_trading=False),
+            api_was_injected=False,
+        )
+        self.assertEqual(mode, "CBT")
+
     def test_run_once_skips_entry_signal_generation_when_market_closed_and_no_position(self):
         ex = MultidayExecutor.__new__(MultidayExecutor)
         ex.trading_mode = "PAPER"
@@ -94,6 +118,48 @@ class TestMultidayMarketClosedSkip(unittest.TestCase):
 
         result = ex.run_once()
         self.assertIn("market_closed_skip", result["error"])
+
+    def test_can_place_orders_allows_real_mode(self):
+        ex = MultidayExecutor.__new__(MultidayExecutor)
+        ex.trading_mode = "REAL"
+        self.assertTrue(ex._can_place_orders())
+
+    def test_can_place_orders_blocks_cbt_mode(self):
+        ex = MultidayExecutor.__new__(MultidayExecutor)
+        ex.trading_mode = "CBT"
+        self.assertFalse(ex._can_place_orders())
+
+    def test_restore_position_sends_info_on_auto_recovery(self):
+        info_messages = []
+        warning_messages = []
+
+        ex = MultidayExecutor.__new__(MultidayExecutor)
+        ex.order_synchronizer = SimpleNamespace(recover_pending_orders=lambda: [])
+        ex.position_resync = SimpleNamespace(
+            synchronize_on_startup=lambda: {
+                "success": True,
+                "position": None,
+                "action": "AUTO_RECOVERED_CLEARED",
+                "warnings": [],
+                "recoveries": ["API 기준 자동복구: 저장 포지션 정리(005930)"],
+            }
+        )
+        ex.telegram = SimpleNamespace(
+            notify_warning=lambda msg: warning_messages.append(msg),
+            notify_info=lambda msg: info_messages.append(msg),
+            notify_error=lambda *args, **kwargs: None,
+            notify_position_restored=lambda **kwargs: None,
+        )
+
+        MultidayExecutor._pending_recovery_done = False
+        MultidayExecutor._pending_recovery_count = 0
+
+        restored = ex.restore_position_on_start()
+
+        self.assertFalse(restored)
+        self.assertEqual(len(warning_messages), 0)
+        self.assertEqual(len(info_messages), 1)
+        self.assertIn("포지션 자동복구 완료", info_messages[0])
 
 
 if __name__ == "__main__":

@@ -163,6 +163,44 @@ class KISApi:
         except Exception:
             return None
 
+    @staticmethod
+    def _parse_numeric_float(value: Any, default: float = 0.0) -> float:
+        """문자열/숫자 입력을 float로 안전 변환합니다."""
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return float(value)
+        raw = str(value).strip().replace(",", "")
+        if not raw:
+            return default
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return default
+
+    @classmethod
+    def _parse_numeric_int(cls, value: Any, default: int = 0) -> int:
+        """문자열/숫자 입력을 int로 안전 변환합니다."""
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+
+        raw = str(value).strip().replace(",", "")
+        if not raw:
+            return default
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            try:
+                return int(float(raw))
+            except (TypeError, ValueError):
+                return default
+
     def _is_token_usable(self, now_kst: Optional[datetime] = None) -> bool:
         if not self.access_token or not self.token_expires_at:
             return False
@@ -1210,16 +1248,31 @@ class KISApi:
         # 보유 종목
         holdings = []
         for item in data.get("output1", []):
-            if int(item.get("hldg_qty", 0)) > 0:
+            holding_qty = self._parse_numeric_int(item.get("hldg_qty"), 0)
+            sellable_qty = self._parse_numeric_int(item.get("ord_psbl_qty"), holding_qty)
+            # 모의투자 환경에서 hldg_qty가 축소 보고되는 사례가 있어 주문가능수량을 보정값으로 사용
+            effective_qty = max(holding_qty, sellable_qty)
+
+            if effective_qty > 0:
+                if effective_qty != holding_qty:
+                    logger.warning(
+                        "[KIS][BAL] 수량 보정 적용: symbol=%s, hldg_qty=%s, ord_psbl_qty=%s -> quantity=%s",
+                        item.get("pdno"),
+                        holding_qty,
+                        sellable_qty,
+                        effective_qty,
+                    )
                 holdings.append({
                     "stock_code": item.get("pdno"),
                     "stock_name": item.get("prdt_name"),
-                    "quantity": int(item.get("hldg_qty", 0)),
-                    "avg_price": float(item.get("pchs_avg_pric", 0)),
-                    "current_price": float(item.get("prpr", 0)),
-                    "eval_amount": float(item.get("evlu_amt", 0)),
-                    "pnl_amount": float(item.get("evlu_pfls_amt", 0)),
-                    "pnl_rate": float(item.get("evlu_pfls_rt", 0)),
+                    "quantity": effective_qty,
+                    "holding_qty": holding_qty,
+                    "sellable_qty": sellable_qty,
+                    "avg_price": self._parse_numeric_float(item.get("pchs_avg_pric"), 0.0),
+                    "current_price": self._parse_numeric_float(item.get("prpr"), 0.0),
+                    "eval_amount": self._parse_numeric_float(item.get("evlu_amt"), 0.0),
+                    "pnl_amount": self._parse_numeric_float(item.get("evlu_pfls_amt"), 0.0),
+                    "pnl_rate": self._parse_numeric_float(item.get("evlu_pfls_rt"), 0.0),
                 })
         
         # 계좌 요약
@@ -1228,7 +1281,7 @@ class KISApi:
         return {
             "success": True,
             "holdings": holdings,
-            "total_eval": float(output2.get("tot_evlu_amt", 0)),
-            "cash_balance": float(output2.get("dnca_tot_amt", 0)),
-            "total_pnl": float(output2.get("evlu_pfls_smtl_amt", 0)),
+            "total_eval": self._parse_numeric_float(output2.get("tot_evlu_amt"), 0.0),
+            "cash_balance": self._parse_numeric_float(output2.get("dnca_tot_amt"), 0.0),
+            "total_pnl": self._parse_numeric_float(output2.get("evlu_pfls_smtl_amt"), 0.0),
         }

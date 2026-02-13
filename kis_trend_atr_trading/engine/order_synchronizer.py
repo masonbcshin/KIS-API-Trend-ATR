@@ -1020,7 +1020,14 @@ class PositionResynchronizer:
         - "DB vs 실제 계좌 vs 메모리 상태 불일치" 해결
     """
     
-    def __init__(self, api, position_store, db_repository=None, trading_mode: str = None):
+    def __init__(
+        self,
+        api,
+        position_store,
+        db_repository=None,
+        trading_mode: str = None,
+        target_symbol: str = None,
+    ):
         """
         Args:
             api: KIS API 클라이언트
@@ -1030,7 +1037,142 @@ class PositionResynchronizer:
         self.api = api
         self.position_store = position_store
         self.db_repository = db_repository
-        self.trading_mode = trading_mode or get_trading_mode()
+        mode = (trading_mode or get_trading_mode() or "").upper().strip()
+        # 하위 호환 모드명 정규화
+        self.trading_mode = "REAL" if mode == "LIVE" else mode
+        self.target_symbol = str(target_symbol or "").strip()
+
+    def _is_account_sync_mode(self) -> bool:
+        """API 계좌 기준 동기화가 필요한 모드(PAPER/REAL)인지 확인합니다."""
+        return self.trading_mode in ("PAPER", "REAL")
+
+    @staticmethod
+    def _extract_active_holdings(balance: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        holdings = balance.get("holdings", []) if isinstance(balance, dict) else []
+        aggregated: Dict[str, Dict[str, Any]] = {}
+
+        for raw_holding in holdings:
+            stock_code = str(raw_holding.get("stock_code", "")).strip()
+            qty = PositionResynchronizer._safe_int(raw_holding.get("quantity"), 0)
+            if not stock_code or qty <= 0:
+                continue
+
+            if stock_code not in aggregated:
+                holding = dict(raw_holding)
+                holding["quantity"] = qty
+                aggregated[stock_code] = holding
+                continue
+
+            existing = aggregated[stock_code]
+            prev_qty = PositionResynchronizer._safe_int(existing.get("quantity"), 0)
+            new_qty = prev_qty + qty
+            if new_qty <= 0:
+                continue
+
+            prev_avg = PositionResynchronizer._safe_float(existing.get("avg_price"), 0.0)
+            new_avg = PositionResynchronizer._safe_float(raw_holding.get("avg_price"), prev_avg)
+            blended_avg = (
+                ((prev_avg * prev_qty) + (new_avg * qty)) / new_qty
+                if prev_qty > 0 and new_avg > 0
+                else max(prev_avg, new_avg)
+            )
+
+            existing["quantity"] = new_qty
+            existing["avg_price"] = blended_avg
+            latest_price = PositionResynchronizer._safe_float(
+                raw_holding.get("current_price"),
+                PositionResynchronizer._safe_float(existing.get("current_price"), 0.0),
+            )
+            if latest_price > 0:
+                existing["current_price"] = latest_price
+            logger.warning(
+                "[RESYNC] 동일 종목 다중 보유 row 감지: %s qty 누적 %s + %s = %s",
+                stock_code,
+                prev_qty,
+                qty,
+                new_qty,
+            )
+
+        return aggregated
+
+    def _resolve_target_holding(
+        self,
+        api_holdings: Dict[str, Dict[str, Any]],
+        stored_position: Optional[Any],
+    ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+        """동기화 대상 보유를 선택합니다 (target_symbol 우선)."""
+        if self.target_symbol and self.target_symbol in api_holdings:
+            return self.target_symbol, api_holdings[self.target_symbol]
+
+        if stored_position is not None:
+            stored_symbol = str(getattr(stored_position, "stock_code", "")).strip()
+            if stored_symbol and stored_symbol in api_holdings:
+                return stored_symbol, api_holdings[stored_symbol]
+
+        if len(api_holdings) == 1:
+            symbol = next(iter(api_holdings))
+            return symbol, api_holdings[symbol]
+
+        return None, None
+
+    def _build_stored_position_from_holding(
+        self,
+        symbol: str,
+        holding: Dict[str, Any],
+        base_position: Optional[Any] = None,
+    ):
+        """API 보유 정보로 StoredPosition을 구성합니다."""
+        from utils.position_store import StoredPosition
+
+        qty = self._safe_int(holding.get("quantity"), 0)
+        avg_price = self._safe_float(holding.get("avg_price"), 0.0)
+        current_price = self._safe_float(holding.get("current_price"), avg_price)
+        base_price = avg_price if avg_price > 0 else max(current_price, 1.0)
+
+        if qty <= 0:
+            return None
+
+        if base_position and getattr(base_position, "stock_code", None) == symbol:
+            atr_at_entry = self._safe_float(getattr(base_position, "atr_at_entry", 0.0), 0.0)
+            stop_loss = self._safe_float(getattr(base_position, "stop_loss", 0.0), 0.0)
+            take_profit = getattr(base_position, "take_profit", None)
+            trailing_stop = self._safe_float(getattr(base_position, "trailing_stop", 0.0), 0.0)
+            highest_price = self._safe_float(getattr(base_position, "highest_price", 0.0), 0.0)
+            entry_date = getattr(base_position, "entry_date", "") or datetime.now(KST).strftime("%Y-%m-%d")
+            entry_time = getattr(base_position, "entry_time", "") or datetime.now(KST).strftime("%H:%M:%S")
+            state = getattr(base_position, "state", "ENTERED")
+        else:
+            atr_at_entry = 0.0
+            stop_loss = 0.0
+            take_profit = None
+            trailing_stop = 0.0
+            highest_price = 0.0
+            entry_date = datetime.now(KST).strftime("%Y-%m-%d")
+            entry_time = datetime.now(KST).strftime("%H:%M:%S")
+            state = "ENTERED"
+
+        if atr_at_entry <= 0:
+            atr_at_entry = max(base_price * 0.01, 1.0)
+        if stop_loss <= 0:
+            stop_loss = round(base_price * 0.95, 2)
+        if trailing_stop <= 0:
+            trailing_stop = stop_loss
+        if highest_price <= 0:
+            highest_price = max(base_price, current_price)
+
+        return StoredPosition(
+            stock_code=symbol,
+            entry_price=base_price,
+            quantity=qty,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            entry_date=entry_date,
+            atr_at_entry=atr_at_entry,
+            trailing_stop=trailing_stop,
+            highest_price=highest_price,
+            entry_time=entry_time,
+            state=str(state),
+        )
 
     @staticmethod
     def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -1144,12 +1286,13 @@ class PositionResynchronizer:
             "success": False,
             "position": None,
             "action": "",
-            "warnings": []
+            "warnings": [],
+            "recoveries": [],
         }
         
         api_holdings: Dict[str, Dict[str, Any]] = {}
-        if self.trading_mode == "REAL":
-            # 1. API로 실제 보유 조회 (REAL 모드에서만)
+        if self._is_account_sync_mode():
+            # 1. API로 실제 보유 조회 (PAPER/REAL 모드)
             try:
                 self.api.get_access_token()
                 balance = self.api.get_account_balance()
@@ -1158,10 +1301,9 @@ class PositionResynchronizer:
                     result["warnings"].append("계좌 잔고 조회 실패")
                     return result
                 
-                holdings = balance.get("holdings", [])
-                api_holdings = {h["stock_code"]: h for h in holdings if h.get("quantity", 0) > 0}
+                api_holdings = self._extract_active_holdings(balance)
 
-                # ★ DB는 항상 실계좌 보유를 기준으로 선반영
+                # ★ DB는 항상 API 계좌 보유를 기준으로 선반영
                 self._sync_db_positions_from_api(api_holdings, result)
 
             except Exception as e:
@@ -1171,8 +1313,8 @@ class PositionResynchronizer:
         # 2. 저장된 포지션 로드
         stored_position = self.position_store.load_position()
 
-        # PAPER 모드는 API 계좌 동기화를 하지 않고 저장 상태만 사용
-        if self.trading_mode != "REAL":
+        # CBT/기타 모드는 API 계좌 동기화를 하지 않고 저장 상태만 사용
+        if not self._is_account_sync_mode():
             if stored_position is None:
                 result["success"] = True
                 result["position"] = None
@@ -1183,72 +1325,112 @@ class PositionResynchronizer:
                 result["action"] = "MATCHED"
             return result
 
-        # 3. 불일치 해결
-        if stored_position is None and not api_holdings:
-            # 케이스 1: 저장 없음 + 보유 없음 → 정상
+        # 3. 불일치 해결 (자동복구 정책)
+        resolved_symbol, resolved_holding = self._resolve_target_holding(api_holdings, stored_position)
+
+        if stored_position is None:
+            if resolved_holding is None:
+                if api_holdings and not self.target_symbol:
+                    result["success"] = False
+                    result["position"] = None
+                    result["action"] = "UNTRACKED_HOLDING"
+                    result["warnings"].append(
+                        f"미기록 보유 발견(대상 미확정): 보유={list(api_holdings.keys())}"
+                    )
+                    logger.warning("[RESYNC] 대상 종목이 없어 자동복구를 수행하지 못했습니다.")
+                else:
+                    result["success"] = True
+                    result["position"] = None
+                    result["action"] = "NO_POSITION"
+                    logger.info("[RESYNC] 포지션 없음 확인")
+            else:
+                recovered = self._build_stored_position_from_holding(
+                    symbol=resolved_symbol,
+                    holding=resolved_holding,
+                    base_position=None,
+                )
+                if recovered is None:
+                    result["success"] = False
+                    result["position"] = None
+                    result["action"] = "UNTRACKED_HOLDING"
+                    result["warnings"].append("API 보유를 포지션으로 복구하지 못했습니다.")
+                else:
+                    self.position_store.save_position(recovered)
+                    result["success"] = True
+                    result["position"] = recovered
+                    result["action"] = "AUTO_RECOVERED_FROM_API"
+                    msg = (
+                        f"API 기준 자동복구: {recovered.stock_code} "
+                        f"{recovered.quantity}주 @ {recovered.entry_price:,.0f}원"
+                    )
+                    result["recoveries"].append(msg)
+                    logger.warning(f"[RESYNC][AUTO] {msg}")
+
+            return result
+
+        if resolved_holding is None:
+            self.position_store.clear_position()
             result["success"] = True
             result["position"] = None
-            result["action"] = "NO_POSITION"
-            logger.info("[RESYNC] 포지션 없음 확인")
-        
-        elif stored_position is None and api_holdings:
-            # 케이스 2: 저장 없음 + 보유 있음 → 미기록 보유 발견
-            stock_code = list(api_holdings.keys())[0]
-            holding = api_holdings[stock_code]
-            
-            result["success"] = False
-            result["position"] = None
-            result["action"] = "UNTRACKED_HOLDING"
-            result["warnings"].append(
-                f"미기록 보유 발견: {stock_code} {holding['quantity']}주 @ {holding['avg_price']:,.0f}원"
+            result["action"] = "AUTO_RECOVERED_CLEARED"
+            msg = f"API 기준 자동복구: 저장 포지션 정리({stored_position.stock_code})"
+            result["recoveries"].append(msg)
+            logger.warning(f"[RESYNC][AUTO] {msg}")
+            return result
+
+        if stored_position.stock_code == resolved_symbol:
+            api_qty = self._safe_int(resolved_holding.get("quantity"), stored_position.quantity)
+            logger.info(
+                "[RESYNC] 수량 대조: symbol=%s, stored_qty=%s, api_qty=%s",
+                stored_position.stock_code,
+                stored_position.quantity,
+                api_qty,
             )
-            logger.warning(f"[RESYNC] 미기록 보유 발견: {stock_code}")
-        
-        elif stored_position is not None and not api_holdings:
-            # 케이스 3: 저장 있음 + 보유 없음 → 불일치 (저장 데이터 무효)
-            result["success"] = False
-            result["position"] = None
-            result["action"] = "STORED_INVALID"
-            result["warnings"].append(
-                f"저장된 포지션 무효: {stored_position.stock_code} - 실제 보유 없음"
-            )
-            
-            # 저장 데이터 삭제
-            self.position_store.clear_position()
-            logger.warning(f"[RESYNC] 저장된 포지션 삭제됨: {stored_position.stock_code}")
-        
-        elif stored_position is not None and stored_position.stock_code in api_holdings:
-            # 케이스 4: 저장 있음 + 일치하는 보유 있음 → 정상 (수량 확인)
-            holding = api_holdings[stored_position.stock_code]
-            
-            if holding["quantity"] == stored_position.quantity:
-                # 수량 일치
+            if api_qty == stored_position.quantity:
                 result["success"] = True
                 result["position"] = stored_position
                 result["action"] = "MATCHED"
-                logger.info(f"[RESYNC] 포지션 일치 확인: {stored_position.stock_code}")
+                logger.info(
+                    "[RESYNC] 포지션 일치 확인: %s (%s주)",
+                    stored_position.stock_code,
+                    stored_position.quantity,
+                )
             else:
-                # 수량 불일치 - API 기준으로 조정
                 result["success"] = True
-                stored_position.quantity = holding["quantity"]
+                stored_position.quantity = api_qty
                 self.position_store.save_position(stored_position)
                 result["position"] = stored_position
                 result["action"] = "QTY_ADJUSTED"
-                result["warnings"].append(
-                    f"수량 조정됨: {stored_position.stock_code} → {holding['quantity']}주"
-                )
-                logger.warning(f"[RESYNC] 수량 조정: {stored_position.stock_code}")
-        
-        else:
-            # 케이스 5: 저장 있음 + 다른 종목 보유 → 심각한 불일치
+                msg = f"API 기준 자동복구: 수량 조정 {stored_position.stock_code} → {api_qty}주"
+                result["recoveries"].append(msg)
+                logger.warning(f"[RESYNC][AUTO] {msg}")
+            return result
+
+        recovered = self._build_stored_position_from_holding(
+            symbol=resolved_symbol,
+            holding=resolved_holding,
+            base_position=None,
+        )
+        if recovered is None:
             result["success"] = False
             result["position"] = None
             result["action"] = "CRITICAL_MISMATCH"
             result["warnings"].append(
-                f"심각한 불일치: 저장={stored_position.stock_code}, "
-                f"보유={list(api_holdings.keys())}"
+                f"심각한 불일치: 저장={stored_position.stock_code}, 보유={list(api_holdings.keys())}"
             )
             logger.error("[RESYNC] 심각한 포지션 불일치")
+            return result
+
+        self.position_store.save_position(recovered)
+        result["success"] = True
+        result["position"] = recovered
+        result["action"] = "AUTO_RECOVERED_REPLACED"
+        msg = (
+            f"API 기준 자동복구: 종목 교체 {stored_position.stock_code} → "
+            f"{recovered.stock_code} ({recovered.quantity}주)"
+        )
+        result["recoveries"].append(msg)
+        logger.warning(f"[RESYNC][AUTO] {msg}")
         
         return result
     
@@ -1267,7 +1449,7 @@ class PositionResynchronizer:
             "action": ""
         }
 
-        if self.trading_mode != "REAL":
+        if not self._is_account_sync_mode():
             result["success"] = True
             result["action"] = "SKIPPED_NON_REAL_MODE"
             return result
@@ -1288,12 +1470,22 @@ class PositionResynchronizer:
             result["holdings"] = active_holdings
             result["action"] = "SYNCED"
 
-            # DB도 실계좌 기준으로 동기화
+            # DB도 API 계좌 기준으로 동기화
             self._sync_db_positions_from_api(api_holdings, result)
             
-            # 저장 데이터 클리어 (보유 없으면)
-            if not active_holdings:
+            # 저장 포지션도 API 기준으로 강제 동기화
+            stored_position = self.position_store.load_position()
+            resolved_symbol, resolved_holding = self._resolve_target_holding(api_holdings, stored_position)
+            if resolved_holding is None:
                 self.position_store.clear_position()
+            else:
+                recovered = self._build_stored_position_from_holding(
+                    symbol=resolved_symbol,
+                    holding=resolved_holding,
+                    base_position=stored_position,
+                )
+                if recovered is not None:
+                    self.position_store.save_position(recovered)
             
             logger.info(f"[RESYNC] API 강제 동기화 완료: {len(active_holdings)}개 보유")
             return result

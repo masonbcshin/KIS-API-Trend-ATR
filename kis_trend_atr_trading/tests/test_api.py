@@ -529,6 +529,51 @@ class TestAccountBalanceAPI:
         assert result["holdings"][0]["quantity"] == 100
         assert result["total_eval"] == 16500000
 
+    @patch('api.kis_api.requests.get')
+    def test_get_account_balance_prefers_sellable_qty_when_larger(self, mock_get):
+        """hldg_qty보다 ord_psbl_qty가 클 때 보정 수량을 사용해야 합니다."""
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "rt_cd": "0",
+            "output1": [
+                {
+                    "pdno": "005930",
+                    "prdt_name": "삼성전자",
+                    "hldg_qty": "1",
+                    "ord_psbl_qty": "3",
+                    "pchs_avg_pric": "178,100.00",
+                    "prpr": "181,200",
+                    "evlu_amt": "543600",
+                    "evlu_pfls_amt": "9300",
+                    "evlu_pfls_rt": "1.74"
+                }
+            ],
+            "output2": [
+                {
+                    "tot_evlu_amt": "10,002,834",
+                    "dnca_tot_amt": "9,476,354",
+                    "evlu_pfls_smtl_amt": "-7,748"
+                }
+            ]
+        }
+        mock_get.return_value = mock_response
+
+        with patch.object(KISApi, '_wait_for_rate_limit', return_value=None):
+            api = KISApi(is_paper_trading=True)
+            api.access_token = "test_token"
+            result = api.get_account_balance()
+
+        assert result["success"] is True
+        assert len(result["holdings"]) == 1
+        assert result["holdings"][0]["stock_code"] == "005930"
+        assert result["holdings"][0]["holding_qty"] == 1
+        assert result["holdings"][0]["sellable_qty"] == 3
+        assert result["holdings"][0]["quantity"] == 3
+        assert result["total_eval"] == 10002834
+        assert result["cash_balance"] == 9476354
+        assert result["total_pnl"] == -7748
+
 
 class TestAuthHeaders:
     """인증 헤더 테스트"""

@@ -78,6 +78,39 @@ class MultidayExecutor:
     _shared_account_snapshot_ts: Optional[datetime] = None
     _pending_recovery_done: bool = False
     _pending_recovery_count: int = 0
+
+    @staticmethod
+    def _normalize_mode_label(mode: Optional[str]) -> str:
+        """모드 문자열을 내부 표준값(CBT/PAPER/REAL)으로 정규화합니다."""
+        normalized = str(mode or "CBT").upper().strip()
+        if normalized == "DRY_RUN":
+            return "CBT"
+        if normalized == "LIVE":
+            return "REAL"
+        return normalized
+
+    @classmethod
+    def _resolve_resync_mode(
+        cls,
+        trading_mode: Optional[str],
+        api_obj: Optional[Any],
+        api_was_injected: bool = False,
+    ) -> str:
+        """
+        포지션 복원용 동기화 모드를 결정합니다.
+
+        기본은 설정값(trading_mode)을 따르되, 외부에서 API 객체를 주입했고
+        설정 모드가 CBT 계열이면 API의 실제 계좌 모드(PAPER/REAL)로 보정합니다.
+        """
+        normalized_mode = cls._normalize_mode_label(trading_mode)
+        if not api_was_injected or normalized_mode in ("PAPER", "REAL"):
+            return normalized_mode
+
+        api_is_paper = getattr(api_obj, "is_paper_trading", None)
+        if isinstance(api_is_paper, bool):
+            return "PAPER" if api_is_paper else "REAL"
+
+        return normalized_mode
     
     def __init__(
         self,
@@ -106,11 +139,14 @@ class MultidayExecutor:
             if not ensure_single_instance():
                 raise RuntimeError("이미 실행 중인 인스턴스가 있습니다. 프로그램을 종료합니다.")
         
-        # 트레이딩 모드 확인
-        self.trading_mode = settings.TRADING_MODE
+        # 트레이딩 모드 확인 (하위 호환 모드명 포함)
+        self.trading_mode = self._normalize_mode_label(
+            getattr(settings, "TRADING_MODE", "CBT")
+        )
         
         # API 클라이언트 (CBT 모드에서도 데이터 조회용으로 필요)
-        is_paper = self.trading_mode != "LIVE"
+        is_real_mode = self.trading_mode in ("REAL", "LIVE")
+        is_paper = not is_real_mode
         self.api = api or KISApi(is_paper_trading=is_paper)
         
         # 전략 초기화
@@ -142,11 +178,24 @@ class MultidayExecutor:
             market_checker=self.market_checker,
             execution_timeout=getattr(settings, 'ORDER_EXECUTION_TIMEOUT', 45)
         )
+        resync_mode = self._resolve_resync_mode(
+            trading_mode=self.trading_mode,
+            api_obj=self.api,
+            api_was_injected=api is not None,
+        )
+        if resync_mode != self.trading_mode:
+            logger.warning(
+                "[RESYNC] 모드 보정 적용: trading_mode=%s, api_is_paper=%s → resync_mode=%s",
+                self.trading_mode,
+                getattr(self.api, "is_paper_trading", None),
+                resync_mode,
+            )
         self.position_resync = PositionResynchronizer(
             api=self.api,
             position_store=self.position_store,
             db_repository=self.db_position_repo,
-            trading_mode="REAL" if self.trading_mode == "LIVE" else self.trading_mode
+            trading_mode=resync_mode,
+            target_symbol=self.stock_code,
         )
         
         # 실행 상태
@@ -310,10 +359,15 @@ class MultidayExecutor:
         for warning in sync_result.get("warnings", []):
             logger.warning(f"[RESYNC] {warning}")
             self.telegram.notify_warning(f"포지션 동기화: {warning}")
+
+        # 자동복구 메시지 출력/알림
+        for recovery in sync_result.get("recoveries", []):
+            logger.info(f"[RESYNC][AUTO] {recovery}")
+            self.telegram.notify_info(f"포지션 자동복구 완료: {recovery}")
         
         action = sync_result.get("action", "")
         
-        if action == "NO_POSITION":
+        if action in ("NO_POSITION", "AUTO_RECOVERED_CLEARED"):
             logger.info("포지션 없음 확인")
             return False
         
@@ -343,7 +397,12 @@ class MultidayExecutor:
             # 안전을 위해 킬 스위치 발동 고려
             return False
         
-        elif action in ("MATCHED", "QTY_ADJUSTED"):
+        elif action in (
+            "MATCHED",
+            "QTY_ADJUSTED",
+            "AUTO_RECOVERED_FROM_API",
+            "AUTO_RECOVERED_REPLACED",
+        ):
             # 정상 또는 수량 조정됨
             stored = sync_result.get("position")
             
@@ -353,7 +412,7 @@ class MultidayExecutor:
             
             logger.info(
                 f"포지션 동기화 완료: {stored.stock_code} @ {stored.entry_price:,.0f}원, "
-                f"ATR={stored.atr_at_entry:,.0f} (고정)"
+                f"수량={stored.quantity}주, ATR={stored.atr_at_entry:,.0f} (고정)"
             )
             
             # 전략에 복원
@@ -440,7 +499,7 @@ class MultidayExecutor:
     
     def _can_place_orders(self) -> bool:
         """실제 주문 가능 여부"""
-        return self.trading_mode in ("LIVE", "PAPER")
+        return self.trading_mode in ("LIVE", "REAL", "PAPER")
 
     def _build_exit_retry_key(self, signal: TradingSignal) -> str:
         exit_reason = signal.exit_reason.value if signal.exit_reason else ExitReason.MANUAL_EXIT.value
@@ -565,7 +624,7 @@ class MultidayExecutor:
         매수 주문 실행
         
         ★ 모드별 처리:
-            - LIVE/PAPER: 실제 주문 (동기화 체결 확인 포함)
+            - REAL/PAPER/LIVE: 실제 주문 (동기화 체결 확인 포함)
             - CBT: 텔레그램 알림만
         
         ★ 감사 보고서 해결:
@@ -618,7 +677,7 @@ class MultidayExecutor:
             
             return {"success": True, "message": "[CBT] 가상 매수", "order_no": "CBT-VIRTUAL"}
         
-        # ★ LIVE/PAPER: 동기화 주문 실행 (감사 보고서 지적 해결)
+        # ★ REAL/PAPER/LIVE: 동기화 주문 실행 (감사 보고서 지적 해결)
         try:
             # 동기화 주문 - 체결 확인 후에만 성공 반환
             sync_result = self.order_synchronizer.execute_buy_order(
@@ -789,7 +848,7 @@ class MultidayExecutor:
             
             return {"success": True, "message": "[CBT] 가상 청산", "order_no": "CBT-VIRTUAL"}
         
-        # ★ LIVE/PAPER: 동기화 주문 실행 (감사 보고서 지적 해결)
+        # ★ REAL/PAPER/LIVE: 동기화 주문 실행 (감사 보고서 지적 해결)
         try:
             # 동기화 주문 - 체결 확인 후에만 성공 반환
             sync_result = self.order_synchronizer.execute_sell_order(
@@ -1273,6 +1332,7 @@ class MultidayExecutor:
         
         # 시작 알림
         mode_display = {
+            "REAL": "🔴 실계좌",
             "LIVE": "🔴 실계좌",
             "CBT": "🟡 종이매매",
             "PAPER": "🟢 모의투자"
