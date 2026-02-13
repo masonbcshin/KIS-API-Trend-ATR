@@ -351,6 +351,21 @@ selection_method:
 - ERROR 경로에서 Telegram 알림 전송 (`notify_error`)
 - Slack 연동은 현재 코드 경로에 없음
 
+### 종목명 해석/캐시 (Telegram)
+
+- 대상: 종목코드가 포함되는 알림 메시지
+- 출력 형식: 항상 `종목명(종목코드)` (예: `삼성전자(005930)`)
+- 해석 순서:
+  - 메모리 캐시 (`utils/symbol_resolver.py`)
+  - SSOT DB 캐시 (`symbol_cache` 테이블)
+  - KIS API 재조회 (`KISApi.get_account_balance()`의 `holdings[].stock_name`, 원본 키: `output1[].prdt_name`)
+  - 실패 폴백: 기존 캐시값 유지, 없으면 `UNKNOWN(코드)`
+- TTL 정책:
+  - `updated_at` 기준 30일 이내는 캐시값 즉시 사용
+  - 30일 초과 시 다음 요청에서 갱신 시도 (실패해도 알림/거래 흐름 중단 없음)
+- 캐시 확인:
+  - `SELECT stock_code, stock_name, updated_at FROM symbol_cache ORDER BY updated_at DESC LIMIT 20;`
+
 ### 감사 추적
 
 - `order_state`에 `order_no`, `fill_id`, `status` 저장

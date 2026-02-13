@@ -22,6 +22,7 @@ import pandas as pd
 import numpy as np
 
 from utils.logger import get_logger
+from utils.symbol_resolver import get_symbol_resolver
 
 logger = get_logger("report_calculator")
 
@@ -341,8 +342,12 @@ class ReportCalculator:
         # 최악의 거래 정보
         if report.worst_trade:
             worst = report.worst_trade
+            try:
+                display_symbol = get_symbol_resolver().format_symbol(worst.symbol, refresh=False)
+            except Exception:
+                display_symbol = f"UNKNOWN({worst.symbol})"
             summaries.append(
-                f"최대 손실 거래: {worst.symbol} "
+                f"최대 손실 거래: {display_symbol} "
                 f"({worst.pnl:,.0f}원, {worst.loss_pct:.1f}%)"
             )
         

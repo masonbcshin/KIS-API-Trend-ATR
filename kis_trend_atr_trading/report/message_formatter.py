@@ -14,6 +14,7 @@ from typing import Optional
 from report.report_calculator import DailyReport, ReportCalculator
 
 from utils.logger import get_logger
+from utils.symbol_resolver import get_symbol_resolver
 
 logger = get_logger("message_formatter")
 
@@ -190,9 +191,13 @@ class MessageFormatter(BaseFormatter):
         # 최악의 거래 상세
         if report.worst_trade:
             worst = report.worst_trade
+            try:
+                display_symbol = get_symbol_resolver().format_symbol(worst.symbol, refresh=False)
+            except Exception:
+                display_symbol = f"UNKNOWN({worst.symbol})"
             details.append(
                 f"\n[최대 손실 거래 상세]\n"
-                f"• 종목: {worst.symbol}\n"
+                f"• 종목: {display_symbol}\n"
                 f"• 진입가: {worst.entry_price:,.0f}원\n"
                 f"• 청산가: {worst.exit_price:,.0f}원\n"
                 f"• 손실액: {worst.pnl:,.0f}원 ({worst.loss_pct:.1f}%)\n"

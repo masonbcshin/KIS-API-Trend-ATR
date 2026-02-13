@@ -20,6 +20,7 @@ KIS Trend-ATR Trading System - 텔레그램 알림 모듈
 """
 
 import os
+import re
 import time
 from datetime import datetime
 from typing import Optional, Dict, Any
@@ -31,6 +32,7 @@ from requests.exceptions import RequestException, Timeout
 
 from .logger import get_logger
 from .market_hours import KST
+from .symbol_resolver import SymbolResolver, get_symbol_resolver
 
 logger = get_logger("telegram_notifier")
 
@@ -429,7 +431,8 @@ class TelegramNotifier:
         enabled: bool = True,
         timeout: int = DEFAULT_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
-        retry_delay: float = DEFAULT_RETRY_DELAY
+        retry_delay: float = DEFAULT_RETRY_DELAY,
+        symbol_resolver: Optional[SymbolResolver] = None,
     ):
         """
         텔레그램 알림기 초기화
@@ -457,6 +460,9 @@ class TelegramNotifier:
         
         # API URL
         self._api_url = f"{TELEGRAM_API_BASE_URL}{self._bot_token}"
+
+        # 종목명 Resolver (알림 포맷 전용)
+        self._symbol_resolver = symbol_resolver or get_symbol_resolver()
         
         # 설정 검증
         self._validate_config()
@@ -506,6 +512,36 @@ class TelegramNotifier:
         """알림 비활성화"""
         self._enabled = False
         logger.info("[TELEGRAM] 텔레그램 알림 비활성화됨")
+
+    def _format_symbol(self, stock_code: str) -> str:
+        """종목코드를 `종목명(종목코드)` 형태로 포맷합니다."""
+        try:
+            return self._symbol_resolver.format_symbol(stock_code)
+        except Exception as e:
+            code = str(stock_code or "").strip()
+            logger.warning(f"[TELEGRAM] 종목명 포맷 실패: code={code}, err={e}")
+            return f"UNKNOWN({code})"
+
+    def _format_symbol_codes_in_text(self, text: str) -> str:
+        """
+        문자열 내 6자리 종목코드를 `종목명(코드)`로 변환합니다.
+        (system_start 등 복수 코드 문자열 처리용)
+        """
+        raw = str(text or "")
+        pattern = re.compile(r"\b\d{6}\b")
+        return pattern.sub(lambda m: self._format_symbol(m.group(0)), raw)
+
+    def _format_symbol_label_lines(self, text: str) -> str:
+        """
+        직접 구성된 메시지에서 `• 종목:` 라인의 코드만 안전하게 포맷합니다.
+        """
+        if not text:
+            return text
+        pattern = re.compile(r"(•\s*종목(?:코드)?\s*:\s*`?)(\d{6})(`?)")
+        return pattern.sub(
+            lambda m: f"{m.group(1)}{self._format_symbol(m.group(2))}{m.group(3)}",
+            text,
+        )
     
     # ════════════════════════════════════════════════════════════════
     # 핵심 전송 메서드
@@ -531,6 +567,9 @@ class TelegramNotifier:
         if not self._enabled:
             logger.debug("[TELEGRAM] 알림 비활성화 상태 - 전송 건너뜀")
             return False
+
+        # 엔진에서 직접 구성한 메시지(• 종목: 005930)도 알림 전송 시점에 보정
+        text = self._format_symbol_label_lines(text)
         
         # 메시지 길이 제한 (텔레그램 최대 4096자)
         if len(text) > 4096:
@@ -630,9 +669,10 @@ class TelegramNotifier:
         Returns:
             bool: 전송 성공 여부
         """
+        display_symbol = self._format_symbol(stock_code)
         try:
             message = MESSAGE_TEMPLATES["buy_order"].format(
-                stock_code=stock_code,
+                stock_code=display_symbol,
                 price=int(float(price)),
                 quantity=int(quantity),
                 stop_loss=int(float(stop_loss)),
@@ -644,7 +684,7 @@ class TelegramNotifier:
             logger.error(f"[TELEGRAM] 매수 알림 포맷 실패: {e}")
             # 포맷 실패 시 단순 텍스트로 폴백
             fallback = (
-                f"[BUY] {stock_code} {quantity}주 체결 "
+                f"[BUY] {display_symbol} {quantity}주 체결 "
                 f"price={price}, stop={stop_loss}, take={take_profit}, "
                 f"time={self._get_timestamp()}"
             )
@@ -673,8 +713,9 @@ class TelegramNotifier:
         Returns:
             bool: 전송 성공 여부
         """
+        display_symbol = self._format_symbol(stock_code)
         message = MESSAGE_TEMPLATES["sell_order"].format(
-            stock_code=stock_code,
+            stock_code=display_symbol,
             price=int(price),
             quantity=quantity,
             reason=reason,
@@ -705,8 +746,9 @@ class TelegramNotifier:
         Returns:
             bool: 전송 성공 여부
         """
+        display_symbol = self._format_symbol(stock_code)
         message = MESSAGE_TEMPLATES["stop_loss"].format(
-            stock_code=stock_code,
+            stock_code=display_symbol,
             entry_price=int(entry_price),
             exit_price=int(exit_price),
             pnl=int(pnl),
@@ -736,8 +778,9 @@ class TelegramNotifier:
         Returns:
             bool: 전송 성공 여부
         """
+        display_symbol = self._format_symbol(stock_code)
         message = MESSAGE_TEMPLATES["take_profit"].format(
-            stock_code=stock_code,
+            stock_code=display_symbol,
             entry_price=int(entry_price),
             exit_price=int(exit_price),
             pnl=int(pnl),
@@ -814,8 +857,9 @@ class TelegramNotifier:
         Returns:
             bool: 전송 성공 여부
         """
+        display_symbols = self._format_symbol_codes_in_text(stock_code)
         message = MESSAGE_TEMPLATES["system_start"].format(
-            stock_code=stock_code,
+            stock_code=display_symbols,
             order_quantity=order_quantity,
             interval=interval,
             mode=mode,
@@ -982,9 +1026,10 @@ class TelegramNotifier:
             bool: 전송 성공 여부
         """
         tp_str = f"{int(take_profit):,}원" if take_profit else "트레일링만"
+        display_symbol = self._format_symbol(stock_code)
         
         message = MESSAGE_TEMPLATES["position_restored"].format(
-            stock_code=stock_code,
+            stock_code=display_symbol,
             entry_price=int(entry_price),
             quantity=quantity,
             entry_date=entry_date,
@@ -1023,9 +1068,10 @@ class TelegramNotifier:
             bool: 전송 성공 여부
         """
         remaining = current_price - stop_loss
+        display_symbol = self._format_symbol(stock_code)
         
         message = MESSAGE_TEMPLATES["near_stop_loss"].format(
-            stock_code=stock_code,
+            stock_code=display_symbol,
             current_price=int(current_price),
             stop_loss=int(stop_loss),
             progress=progress,
@@ -1063,9 +1109,10 @@ class TelegramNotifier:
             bool: 전송 성공 여부
         """
         remaining = take_profit - current_price
+        display_symbol = self._format_symbol(stock_code)
         
         message = MESSAGE_TEMPLATES["near_take_profit"].format(
-            stock_code=stock_code,
+            stock_code=display_symbol,
             current_price=int(current_price),
             take_profit=int(take_profit),
             progress=progress,
@@ -1100,8 +1147,9 @@ class TelegramNotifier:
         Returns:
             bool: 전송 성공 여부
         """
+        display_symbol = self._format_symbol(stock_code)
         message = MESSAGE_TEMPLATES["trailing_stop_updated"].format(
-            stock_code=stock_code,
+            stock_code=display_symbol,
             highest_price=int(highest_price),
             trailing_stop=int(trailing_stop),
             entry_price=int(entry_price),
@@ -1139,10 +1187,11 @@ class TelegramNotifier:
             bool: 전송 성공 여부
         """
         tp_str = f"{int(take_profit):,}원" if take_profit else "트레일링만"
+        display_symbol = self._format_symbol(stock_code)
         
         message = MESSAGE_TEMPLATES["cbt_signal"].format(
             signal_type=signal_type,
-            stock_code=stock_code,
+            stock_code=display_symbol,
             price=int(price),
             stop_loss=int(stop_loss),
             take_profit=tp_str,
@@ -1186,8 +1235,9 @@ class TelegramNotifier:
         Returns:
             bool: 전송 성공 여부
         """
+        display_symbol = self._format_symbol(stock_code)
         message = MESSAGE_TEMPLATES["gap_protection"].format(
-            stock_code=stock_code,
+            stock_code=display_symbol,
             open_price=int(open_price),
             reference_price=int(reference_price),
             reference_type=str(reference_type),
@@ -1290,8 +1340,9 @@ class TelegramNotifier:
         Returns:
             bool: 전송 성공 여부
         """
+        display_symbol = self._format_symbol(stock_code)
         message = MESSAGE_TEMPLATES["cbt_trade_complete"].format(
-            stock_code=stock_code,
+            stock_code=display_symbol,
             trade_type=trade_type,
             entry_price=int(entry_price),
             exit_price=int(exit_price),
