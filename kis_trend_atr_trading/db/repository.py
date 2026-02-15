@@ -332,10 +332,14 @@ class PositionRepository:
             )
             if not row:
                 return False, False
-            data_type = str(row.get("data_type") or "").lower()
-            is_nullable = str(row.get("is_nullable") or "").upper()
-            column_default = row.get("column_default")
-            extra = str(row.get("extra") or "").lower()
+            data_type = str(row.get("data_type") or row.get("DATA_TYPE") or "").lower()
+            is_nullable = str(row.get("is_nullable") or row.get("IS_NULLABLE") or "").upper()
+            column_default = (
+                row.get("column_default")
+                if "column_default" in row
+                else row.get("COLUMN_DEFAULT")
+            )
+            extra = str(row.get("extra") or row.get("EXTRA") or "").lower()
 
             is_numeric = data_type in {
                 "tinyint", "smallint", "mediumint", "int", "integer", "bigint"
@@ -355,8 +359,20 @@ class PositionRepository:
                 "SELECT COALESCE(MAX(position_id), 0) + 1 AS next_id FROM positions",
                 fetch_one=True,
             )
-            return int((row or {}).get("next_id", 1))
+            next_id = (row or {}).get("next_id")
+            if next_id is None:
+                next_id = (row or {}).get("NEXT_ID", 1)
+            return int(next_id)
         return f"P{entry_time.strftime('%Y%m%d%H%M%S%f')}_{symbol}"
+
+    @staticmethod
+    def _is_position_id_required_error(error: Exception) -> bool:
+        """position_id 기본값 누락 오류인지 판별합니다."""
+        msg = str(error).lower()
+        return (
+            "position_id" in msg
+            and ("doesn't have a default value" in msg or "field 'position_id'" in msg)
+        )
 
     def _update_position_row(
         self,
@@ -495,35 +511,41 @@ class PositionRepository:
         highest_price = highest_price or entry_price
         trailing_stop = trailing_stop or stop_price
         
-        try:
-            # 이미 열린 포지션이 있는지 확인
-            existing = self.get_by_symbol(symbol)
-            if existing and existing.status == "OPEN":
-                logger.warning(f"[REPO] 이미 열린 포지션 존재: {symbol}")
+        for attempt in range(2):
+            try:
+                # 이미 열린 포지션이 있는지 확인
+                existing = self.get_by_symbol(symbol)
+                if existing and existing.status == "OPEN":
+                    logger.warning(f"[REPO] 이미 열린 포지션 존재: {symbol}")
+                    return None
+                self._insert_position_row(
+                    symbol=symbol,
+                    entry_price=entry_price,
+                    quantity=quantity,
+                    entry_time=entry_time,
+                    atr_at_entry=atr_at_entry,
+                    stop_price=stop_price,
+                    take_profit_price=take_profit_price,
+                    trailing_stop=trailing_stop,
+                    highest_price=highest_price,
+                )
+
+                # 저장된 데이터 조회 (RETURNING 대체)
+                result = self.get_by_symbol(symbol)
+
+                if result:
+                    logger.info(f"[REPO] 포지션 저장: {symbol} @ {entry_price:,.0f}원 x {quantity}주")
+                    return result
                 return None
-            self._insert_position_row(
-                symbol=symbol,
-                entry_price=entry_price,
-                quantity=quantity,
-                entry_time=entry_time,
-                atr_at_entry=atr_at_entry,
-                stop_price=stop_price,
-                take_profit_price=take_profit_price,
-                trailing_stop=trailing_stop,
-                highest_price=highest_price,
-            )
-            
-            # 저장된 데이터 조회 (RETURNING 대체)
-            result = self.get_by_symbol(symbol)
-            
-            if result:
-                logger.info(f"[REPO] 포지션 저장: {symbol} @ {entry_price:,.0f}원 x {quantity}주")
-                return result
-            return None
-            
-        except QueryError as e:
-            logger.error(f"[REPO] 포지션 저장 실패: {e}")
-            return None
+            except QueryError as e:
+                if attempt == 0 and self._is_position_id_required_error(e):
+                    _, is_numeric = self._detect_position_id_requirements()
+                    self._position_id_required = True
+                    self._position_id_is_numeric = is_numeric
+                    logger.warning("[REPO] position_id 필수 스키마 감지, save 재시도")
+                    continue
+                logger.error(f"[REPO] 포지션 저장 실패: {e}")
+                return None
 
     def upsert_from_account_holding(
         self,
@@ -548,37 +570,44 @@ class PositionRepository:
         highest_price = highest_price or entry_price
         trailing_stop = trailing_stop or stop_price
 
-        try:
-            existing = self.get_by_symbol(symbol) if self._position_id_required else None
-            if self._position_id_required and existing:
-                self._update_position_row(
-                    existing=existing,
-                    symbol=symbol,
-                    entry_price=entry_price,
-                    quantity=quantity,
-                    entry_time=entry_time,
-                    atr_at_entry=atr_at_entry,
-                    stop_price=stop_price,
-                    take_profit_price=take_profit_price,
-                    trailing_stop=trailing_stop,
-                    highest_price=highest_price,
-                )
-            else:
-                self._insert_position_row(
-                    symbol=symbol,
-                    entry_price=entry_price,
-                    quantity=quantity,
-                    entry_time=entry_time,
-                    atr_at_entry=atr_at_entry,
-                    stop_price=stop_price,
-                    take_profit_price=take_profit_price,
-                    trailing_stop=trailing_stop,
-                    highest_price=highest_price,
-                )
-            return self.get_by_symbol(symbol)
-        except QueryError as e:
-            logger.error(f"[REPO] 실계좌 기준 upsert 실패: {e}")
-            return None
+        for attempt in range(2):
+            try:
+                existing = self.get_by_symbol(symbol) if self._position_id_required else None
+                if self._position_id_required and existing:
+                    self._update_position_row(
+                        existing=existing,
+                        symbol=symbol,
+                        entry_price=entry_price,
+                        quantity=quantity,
+                        entry_time=entry_time,
+                        atr_at_entry=atr_at_entry,
+                        stop_price=stop_price,
+                        take_profit_price=take_profit_price,
+                        trailing_stop=trailing_stop,
+                        highest_price=highest_price,
+                    )
+                else:
+                    self._insert_position_row(
+                        symbol=symbol,
+                        entry_price=entry_price,
+                        quantity=quantity,
+                        entry_time=entry_time,
+                        atr_at_entry=atr_at_entry,
+                        stop_price=stop_price,
+                        take_profit_price=take_profit_price,
+                        trailing_stop=trailing_stop,
+                        highest_price=highest_price,
+                    )
+                return self.get_by_symbol(symbol)
+            except QueryError as e:
+                if attempt == 0 and self._is_position_id_required_error(e):
+                    _, is_numeric = self._detect_position_id_requirements()
+                    self._position_id_required = True
+                    self._position_id_is_numeric = is_numeric
+                    logger.warning("[REPO] position_id 필수 스키마 감지, upsert 재시도")
+                    continue
+                logger.error(f"[REPO] 실계좌 기준 upsert 실패: {e}")
+                return None
     
     def get_by_symbol(self, symbol: str) -> Optional[PositionRecord]:
         """

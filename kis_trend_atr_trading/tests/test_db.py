@@ -19,7 +19,7 @@ from unittest.mock import Mock, patch, MagicMock
 # DB_ENABLED를 false로 설정하여 실제 연결 방지
 os.environ["DB_ENABLED"] = "false"
 
-from db.mysql import DatabaseConfig, MySQLManager, get_db_manager
+from db.mysql import DatabaseConfig, MySQLManager, get_db_manager, QueryError
 from db.repository import (
     PositionRepository,
     TradeRepository,
@@ -284,6 +284,74 @@ class TestPositionRepositoryCompatibility:
         insert_params = mock_db.execute_command.call_args[0][1]
         assert "position_id" in insert_sql
         assert str(insert_params[0]).startswith("P")
+
+    def test_detect_position_id_requirement_with_uppercase_metadata(self):
+        mock_db = Mock()
+        mock_db.config = Mock(database="kis_trading")
+        mock_db.execute_query.side_effect = [
+            [{"column_name": "stock_code"}],  # 컬럼 탐지
+            {
+                "DATA_TYPE": "varchar",
+                "IS_NULLABLE": "NO",
+                "COLUMN_DEFAULT": None,
+                "EXTRA": "",
+            },
+        ]
+
+        repo = PositionRepository(db=mock_db)
+        assert repo._position_id_required is True
+        assert repo._position_id_is_numeric is False
+
+    def test_upsert_retries_when_position_id_default_error_occurs(self):
+        mock_db = Mock()
+        mock_db.config = Mock(database="kis_trading")
+        mock_db.execute_query.side_effect = [
+            [{"column_name": "stock_code"}],  # __init__: symbol 컬럼 탐지
+            None,  # __init__: position_id 메타 탐지 실패(미탐지)
+            {  # retry 시 position_id 메타 탐지(대문자 키)
+                "DATA_TYPE": "varchar",
+                "IS_NULLABLE": "NO",
+                "COLUMN_DEFAULT": None,
+                "EXTRA": "",
+            },
+            None,  # retry attempt: existing 조회
+            {  # 최종 get_by_symbol
+                "position_id": "P20250115093000000000_005930",
+                "stock_code": "005930",
+                "entry_price": 70000,
+                "quantity": 10,
+                "entry_time": datetime(2025, 1, 15, 9, 30, 0),
+                "atr_at_entry": 1500,
+                "stop_price": 67000,
+                "take_profit_price": 75000,
+                "trailing_stop": 67500,
+                "highest_price": 71000,
+                "mode": "PAPER",
+                "status": "OPEN",
+            },
+        ]
+        mock_db.execute_command.side_effect = [
+            QueryError("1364 (HY000): Field 'position_id' doesn't have a default value"),
+            1,
+        ]
+
+        repo = PositionRepository(db=mock_db)
+        result = repo.upsert_from_account_holding(
+            symbol="005930",
+            entry_price=70000,
+            quantity=10,
+            atr_at_entry=1500,
+            stop_price=67000,
+            take_profit_price=75000,
+            trailing_stop=67500,
+            highest_price=71000,
+            entry_time=datetime(2025, 1, 15, 9, 30, 0),
+        )
+
+        assert result is not None
+        assert mock_db.execute_command.call_count == 2
+        second_sql = mock_db.execute_command.call_args_list[1][0][0]
+        assert "position_id" in second_sql
 
 
 class TestTradeRecord:
