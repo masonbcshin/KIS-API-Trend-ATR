@@ -196,6 +196,8 @@ class MultidayExecutor:
             30,
         )
         self._last_report_snapshot_at: Optional[datetime] = None
+        self._risk_start_capital_sync_date: Optional[str] = None
+        self._risk_start_capital_synced: bool = False
         
         # ★ 신규: 주문 동기화 컴포넌트 (감사 보고서 지적 해결)
         self.market_checker = get_market_checker()
@@ -283,10 +285,70 @@ class MultidayExecutor:
         self._save_position_on_exit()
         sys.exit(0)
 
+    def _build_dry_run_virtual_snapshot(self) -> Dict[str, Any]:
+        """DRY_RUN 모드용 가상 계좌 스냅샷을 생성합니다."""
+        fallback_capital = float(getattr(settings, "BACKTEST_INITIAL_CAPITAL", 10_000_000))
+        snapshot: Dict[str, Any] = {
+            "success": True,
+            "total_eval": fallback_capital,
+            "cash_balance": fallback_capital,
+            "total_pnl": 0.0,
+            "holdings": [],
+        }
+        try:
+            from cbt.virtual_account import VirtualAccount
+
+            account = VirtualAccount(load_existing=True)
+            summary = account.get_account_summary()
+            total_equity = float(summary.get("total_equity") or 0.0)
+            cash_balance = float(summary.get("cash") or 0.0)
+            total_pnl = float(summary.get("total_pnl") or 0.0)
+            has_position = bool(summary.get("has_position"))
+
+            if total_equity > 0:
+                snapshot["total_eval"] = total_equity
+            if cash_balance >= 0:
+                snapshot["cash_balance"] = cash_balance
+            snapshot["total_pnl"] = total_pnl
+            snapshot["holdings"] = [{}] if has_position else []
+        except Exception as e:
+            logger.warning(f"[RISK][DRY_RUN] 가상 계좌 스냅샷 로드 실패(기본값 사용): {e}")
+
+        return snapshot
+
+    def _sync_risk_starting_capital_from_equity(
+        self,
+        total_equity: float,
+        source: str,
+    ) -> None:
+        """당일 시작 자본금을 1회 동기화합니다."""
+        try:
+            equity = float(total_equity)
+        except (TypeError, ValueError):
+            return
+        if equity <= 0:
+            return
+
+        today = datetime.now(KST).date().isoformat()
+        if getattr(self, "_risk_start_capital_sync_date", None) != today:
+            self._risk_start_capital_sync_date = today
+            self._risk_start_capital_synced = False
+
+        if getattr(self, "_risk_start_capital_synced", False):
+            return
+
+        self.risk_manager.set_starting_capital(equity)
+        self._risk_start_capital_synced = True
+        logger.info(
+            f"[RISK] 당일 시작 자본금 동기화: {equity:,.0f}원 "
+            f"(source={source}, mode={getattr(self, '_report_mode', 'PAPER')})"
+        )
+
     def _sync_risk_account_snapshot(self) -> None:
         """리스크 패널용 계좌 스냅샷 동기화 (짧은 TTL 캐시 적용)."""
         ttl_sec = int(getattr(settings, "RISK_ACCOUNT_SNAPSHOT_TTL_SEC", 60))
         now = datetime.now(KST)
+        report_mode = str(getattr(self, "_report_mode", "PAPER")).upper()
 
         cached_snapshot = self.__class__._shared_account_snapshot
         cached_ts = self.__class__._shared_account_snapshot_ts
@@ -296,16 +358,28 @@ class MultidayExecutor:
             and (now - cached_ts).total_seconds() < ttl_sec
         ):
             self.risk_manager.update_account_snapshot(cached_snapshot)
+            cached_total_equity = float(
+                cached_snapshot.get("total_eval")
+                or cached_snapshot.get("total_equity")
+                or 0.0
+            )
+            self._sync_risk_starting_capital_from_equity(
+                cached_total_equity,
+                source="SNAPSHOT_CACHE",
+            )
             logger.info(
                 f"[RISK] 계좌 스냅샷 캐시 사용: age={(now - cached_ts).total_seconds():.1f}s"
             )
             return
 
-        try:
-            snapshot = self.api.get_account_balance()
-        except Exception as e:
-            logger.warning(f"[RISK] 계좌 스냅샷 조회 실패: {e}")
-            return
+        if report_mode == "DRY_RUN":
+            snapshot = self._build_dry_run_virtual_snapshot()
+        else:
+            try:
+                snapshot = self.api.get_account_balance()
+            except Exception as e:
+                logger.warning(f"[RISK] 계좌 스냅샷 조회 실패: {e}")
+                return
 
         if not snapshot or not snapshot.get("success"):
             logger.warning("[RISK] 계좌 스냅샷 조회 결과가 비어있어 상태 반영을 건너뜁니다.")
@@ -314,6 +388,11 @@ class MultidayExecutor:
         self.__class__._shared_account_snapshot = snapshot
         self.__class__._shared_account_snapshot_ts = now
         self.risk_manager.update_account_snapshot(snapshot)
+        total_equity = float(snapshot.get("total_eval") or snapshot.get("total_equity") or 0.0)
+        self._sync_risk_starting_capital_from_equity(
+            total_equity,
+            source="LIVE_SNAPSHOT" if report_mode != "DRY_RUN" else "DRY_RUN_VIRTUAL",
+        )
         total_pnl = float(snapshot.get("total_pnl", 0.0))
         logger.info(
             "[RISK] 계좌 스냅샷 반영: "
@@ -325,7 +404,7 @@ class MultidayExecutor:
     # ════════════════════════════════════════════════════════════════
 
     def _report_db_available(self) -> bool:
-        return self._report_db is not None
+        return getattr(self, "_report_db", None) is not None
 
     def _to_db_datetime(self, value: Optional[datetime] = None) -> datetime:
         dt = value or datetime.now(KST)
@@ -467,17 +546,24 @@ class MultidayExecutor:
         if not columns or "snapshot_time" not in columns:
             return
 
-        try:
-            snapshot = self.api.get_account_balance()
-        except Exception as err:
-            logger.warning(f"[REPORT_DB] 계좌 스냅샷 조회 실패(무시): {err}")
-            return
+        if self._report_mode == "DRY_RUN":
+            snapshot = self._build_dry_run_virtual_snapshot()
+        else:
+            try:
+                snapshot = self.api.get_account_balance()
+            except Exception as err:
+                logger.warning(f"[REPORT_DB] 계좌 스냅샷 조회 실패(무시): {err}")
+                return
 
         if not snapshot or not snapshot.get("success"):
             return
 
         holdings = snapshot.get("holdings") or []
         total_equity = float(snapshot.get("total_eval") or snapshot.get("total_equity") or 0.0)
+        self._sync_risk_starting_capital_from_equity(
+            total_equity,
+            source="REPORT_DB_SNAPSHOT" if self._report_mode != "DRY_RUN" else "DRY_RUN_VIRTUAL",
+        )
         cash_balance = float(snapshot.get("cash_balance") or snapshot.get("cash") or 0.0)
         unrealized_pnl = float(
             sum(float(item.get("pnl_amount") or 0.0) for item in holdings)
@@ -1472,6 +1558,9 @@ class MultidayExecutor:
         """
         logger.info("=" * 50)
         logger.info(f"[{self.trading_mode}] 전략 실행")
+
+        # 리스크 패널 및 당일 시작 자본금 기준 동기화
+        self._sync_risk_account_snapshot()
         
         # 킬 스위치 체크
         kill_check = self.risk_manager.check_kill_switch()
