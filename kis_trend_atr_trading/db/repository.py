@@ -275,6 +275,8 @@ class PositionRepository:
         self._positions_has_take_profit_column = self._detect_positions_take_profit_column()
         self._positions_has_atr_value_column = self._detect_positions_atr_value_column()
         self._positions_has_atr_column = self._detect_positions_atr_column()
+        self._positions_has_created_at_column = self._detect_positions_created_at_column()
+        self._positions_has_updated_at_column = self._detect_positions_updated_at_column()
 
     def _detect_positions_symbol_column(self) -> str:
         """
@@ -400,6 +402,20 @@ class PositionRepository:
             "[REPO] positions.atr 컬럼 감지: legacy atr 동기화 활성화",
         )
 
+    def _detect_positions_created_at_column(self) -> bool:
+        """positions 테이블의 created_at 컬럼 존재 여부를 탐지합니다."""
+        return self._detect_positions_legacy_column(
+            "created_at",
+            "[REPO] positions.created_at 컬럼 감지: created_at 동기화 활성화",
+        )
+
+    def _detect_positions_updated_at_column(self) -> bool:
+        """positions 테이블의 updated_at 컬럼 존재 여부를 탐지합니다."""
+        return self._detect_positions_legacy_column(
+            "updated_at",
+            "[REPO] positions.updated_at 컬럼 감지: updated_at 동기화 활성화",
+        )
+
     def _detect_positions_legacy_column(self, column_name: str, found_log: str) -> bool:
         """positions 테이블의 특정 레거시 컬럼 존재 여부를 탐지합니다."""
         try:
@@ -507,6 +523,9 @@ class PositionRepository:
         if self._positions_has_atr_column:
             set_clauses.append("atr = %s")
             params.append(atr_at_entry)
+        if self._positions_has_updated_at_column:
+            set_clauses.append("updated_at = %s")
+            params.append(datetime.now(KST))
 
         return self.db.execute_command(
             f"""
@@ -532,6 +551,7 @@ class PositionRepository:
         """신규 포지션 row를 삽입합니다."""
         entry_date = entry_time.date().isoformat()
         take_profit_legacy = take_profit_price if take_profit_price is not None else stop_price
+        now_ts = datetime.now(KST)
 
         def _append_legacy_columns(columns: List[str], params: List[Any]) -> None:
             if self._positions_has_state_column:
@@ -552,6 +572,12 @@ class PositionRepository:
             if self._positions_has_atr_column:
                 columns.append("atr")
                 params.append(atr_at_entry)
+            if self._positions_has_created_at_column:
+                columns.append("created_at")
+                params.append(entry_time or now_ts)
+            if self._positions_has_updated_at_column:
+                columns.append("updated_at")
+                params.append(now_ts)
 
         if self._position_id_required:
             position_id = self._generate_position_id(symbol, entry_time)
@@ -633,6 +659,8 @@ class PositionRepository:
             update_assignments.append("atr_value = VALUES(atr_value)")
         if self._positions_has_atr_column:
             update_assignments.append("atr = VALUES(atr)")
+        if self._positions_has_updated_at_column:
+            update_assignments.append("updated_at = VALUES(updated_at)")
         return self.db.execute_command(
             f"""
             INSERT INTO positions (

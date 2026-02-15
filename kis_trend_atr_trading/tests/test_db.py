@@ -207,6 +207,8 @@ class TestPositionRepositoryCompatibility:
             {"cnt": 0},  # take_profit 컬럼 미존재
             {"cnt": 0},  # atr_value 컬럼 미존재
             {"cnt": 0},  # atr 컬럼 미존재
+            {"cnt": 0},  # created_at 컬럼 미존재
+            {"cnt": 0},  # updated_at 컬럼 미존재
             {
                 "stock_code": "005930",
                 "entry_price": 70000,
@@ -260,6 +262,8 @@ class TestPositionRepositoryCompatibility:
             {"cnt": 0},  # take_profit 컬럼 미존재
             {"cnt": 0},  # atr_value 컬럼 미존재
             {"cnt": 0},  # atr 컬럼 미존재
+            {"cnt": 0},  # created_at 컬럼 미존재
+            {"cnt": 0},  # updated_at 컬럼 미존재
             None,  # existing 조회: 없음
             {  # 최종 get_by_symbol 결과
                 "position_id": "P20250115093000000000_005930",
@@ -316,6 +320,8 @@ class TestPositionRepositoryCompatibility:
             {"cnt": 1},  # take_profit 컬럼 존재
             {"cnt": 1},  # atr_value 컬럼 존재
             {"cnt": 0},  # atr 컬럼 미존재
+            {"cnt": 1},  # created_at 컬럼 존재
+            {"cnt": 1},  # updated_at 컬럼 존재
             None,  # existing 조회: 없음
             {  # 최종 get_by_symbol 결과
                 "position_id": "P20250115093000000000_005930",
@@ -356,6 +362,8 @@ class TestPositionRepositoryCompatibility:
         assert "stop_loss" in insert_sql
         assert "take_profit" in insert_sql
         assert "atr_value" in insert_sql
+        assert "created_at" in insert_sql
+        assert "updated_at" in insert_sql
         assert "2025-01-15" in insert_params
         assert "ENTERED" in insert_params
 
@@ -370,6 +378,8 @@ class TestPositionRepositoryCompatibility:
                 "COLUMN_DEFAULT": None,
                 "EXTRA": "",
             },
+            {"cnt": 0},
+            {"cnt": 0},
             {"cnt": 0},
             {"cnt": 0},
             {"cnt": 0},
@@ -394,6 +404,8 @@ class TestPositionRepositoryCompatibility:
             {"cnt": 0},  # __init__: take_profit 컬럼 미존재
             {"cnt": 0},  # __init__: atr_value 컬럼 미존재
             {"cnt": 0},  # __init__: atr 컬럼 미존재
+            {"cnt": 0},  # __init__: created_at 컬럼 미존재
+            {"cnt": 0},  # __init__: updated_at 컬럼 미존재
             {  # retry 시 position_id 메타 탐지(대문자 키)
                 "DATA_TYPE": "varchar",
                 "IS_NULLABLE": "NO",
