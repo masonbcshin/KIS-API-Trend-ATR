@@ -1,387 +1,253 @@
-# KIS Trend-ATR Trading System 사용 가이드
+# KIS Trend-ATR Trading System 사용 가이드 (최신)
 
-> **⚠️ 이 문서는 중학생도 이해할 수 있도록 작성되었습니다.**
+이 문서는 `2026-02` 기준 최신 실행 흐름을 설명합니다.
 
-이 가이드는 KIS Trend-ATR 자동매매 시스템을 **안전하게** 사용하는 방법을 설명합니다.
-
----
-
-## 📋 목차
-
-1. [실행 모드 3단계](#1-실행-모드-3단계)
-2. [각 단계별 검증 내용](#2-각-단계별-검증-내용)
-3. [설정 방법](#3-설정-방법)
-4. [실행 방법](#4-실행-방법)
-5. [성과 확인 방법](#5-성과-확인-방법)
-6. [실계좌 투입 전 체크리스트](#6-실계좌-투입-전-체크리스트)
-7. [긴급 상황 대응](#7-긴급-상황-대응)
-8. [절대 하면 안 되는 것들](#8-절대-하면-안-되는-것들)
+## 1. 빠른 개요
+- 표준 실행 엔트리포인트: `python -m kis_trend_atr_trading.apps.kr_trade`
+- 전략 엔진: 멀티데이 Trend + ATR
+- 권장 진행 순서: `DRY_RUN -> PAPER -> REAL`
+- Deprecated 래퍼(`main_multiday.py`, `main_v2.py` 등)는 하위호환용으로만 유지
 
 ---
 
-## 1. 실행 모드 3단계
+## 2. 실행 모드 정리
 
-시스템은 세 가지 모드로 실행됩니다. **반드시 순서대로 진행**해야 합니다.
+### 2-1. EXECUTION_MODE (설정 로딩 기준)
+- `DRY_RUN`: 가상 체결 중심 (가장 안전)
+- `PAPER`: 모의투자 API 사용
+- `REAL`: 실계좌 설정 로드
 
-### 🟢 DRY_RUN (가장 안전)
+### 2-2. TRADING_MODE (런타임 계좌 경로 기준)
+- `PAPER`: 모의투자 계좌 경로
+- `REAL`: 실계좌 경로
 
-```
-"연습 모드"
-```
-
-| 항목 | 설명 |
-|------|------|
-| **실제 주문** | ❌ 절대 발생 안 함 |
-| **API 호출** | 시세 조회만 |
-| **체결 방식** | 가상 체결 (현재가 기준) |
-| **손익 계산** | ✅ 가능 |
-| **텔레그램** | 판단 결과만 전송 |
-| **목적** | 전략 논리 검증 |
-
-**이 단계에서 검증하는 것:**
-- 전략이 매수/매도 신호를 제대로 내는가?
-- 손절가와 익절가가 적절한가?
-- 가상으로 거래했을 때 수익이 나는가?
-
-### 🟡 PAPER (모의투자)
-
-```
-"실전 연습 모드"
-```
-
-| 항목 | 설명 |
-|------|------|
-| **실제 주문** | ✅ 모의투자 서버에 전송 |
-| **API 호출** | 모의투자 API |
-| **체결 방식** | 실제 체결 (가상 자금) |
-| **손익 계산** | ✅ 가능 |
-| **텔레그램** | 전체 알림 |
-| **목적** | 실전과 동일한 환경에서 테스트 |
-
-**이 단계에서 검증하는 것:**
-- API 연동이 제대로 되는가?
-- 실제 체결 지연은 어느 정도인가?
-- 미체결 상황에서 시스템이 어떻게 동작하는가?
-
-### 🔴 REAL (실계좌) ⚠️
-
-```
-"진짜 돈으로 거래"
-```
-
-| 항목 | 설명 |
-|------|------|
-| **실제 주문** | ✅ 실계좌 서버에 전송 |
-| **API 호출** | 실계좌 API |
-| **체결 방식** | 실제 체결 (진짜 돈) |
-| **손익 계산** | ✅ 가능 |
-| **텔레그램** | 전체 알림 |
-| **목적** | 실계좌 운용 |
-
-**⚠️ 중요:**
-- 이 모드는 **이중 승인**이 필요합니다
-- DRY_RUN과 PAPER를 충분히 거친 후에만 사용하세요
+### 2-3. 권장 원칙
+- 혼선 방지를 위해 두 값을 같은 의미로 맞추세요.
+- 예시:
+  - 모의투자: `EXECUTION_MODE=PAPER`, `TRADING_MODE=PAPER`
+  - 실계좌: `EXECUTION_MODE=REAL`, `TRADING_MODE=REAL`
 
 ---
 
-## 2. 각 단계별 검증 내용
+## 3. 설치 및 초기 준비
 
-### DRY_RUN에서 확인할 것 (최소 2주)
-
-- [ ] 매수 신호가 적절한 시점에 발생하는가?
-- [ ] 매도 신호가 적절한 시점에 발생하는가?
-- [ ] 손절이 제대로 동작하는가?
-- [ ] 익절이 제대로 동작하는가?
-- [ ] 트레일링 스탑이 수익을 보호하는가?
-- [ ] 가상 손익이 플러스인가?
-- [ ] 텔레그램 알림이 잘 오는가?
-
-### PAPER에서 확인할 것 (최소 1주)
-
-- [ ] API 연결이 안정적인가?
-- [ ] 주문이 실제로 체결되는가?
-- [ ] 체결 가격이 예상과 비슷한가?
-- [ ] 미체결 상황에서 취소가 되는가?
-- [ ] 일일 손실 한도가 잘 작동하는가?
-- [ ] Kill Switch가 잘 작동하는가?
-
-### REAL 투입 전 최종 확인
-
-- [ ] PAPER 모드에서 승률 50% 이상인가?
-- [ ] PAPER 모드에서 Profit Factor 1.0 이상인가?
-- [ ] 모든 안전장치가 테스트되었는가?
-- [ ] 텔레그램 알림이 정상적으로 오는가?
-- [ ] 긴급 상황 대응 방법을 알고 있는가?
-
----
-
-## 3. 설정 방법
-
-### Step 1: .env 파일 생성
-
+### 3-1. 의존성 설치
 ```bash
-# 프로젝트 폴더에서
+cd /home/deploy/KIS-API-Trend-ATR/kis_trend_atr_trading
+python3 -m pip install -r requirements.txt
+```
+
+### 3-2. .env 생성
+```bash
+cd /home/deploy/KIS-API-Trend-ATR/kis_trend_atr_trading
 cp .env.example .env
 ```
 
-### Step 2: .env 파일 수정
+### 3-3. 최소 필수 환경변수
+```env
+# 실행 모드
+EXECUTION_MODE=PAPER
+TRADING_MODE=PAPER
 
-필수 설정 항목:
-
-```bash
-# 1. 실행 모드 (처음에는 반드시 DRY_RUN으로 시작!)
-EXECUTION_MODE=DRY_RUN
-
-# 2. 한국투자증권 API 키 (apiportal.koreainvestment.com에서 발급)
-KIS_APP_KEY=여기에_앱키_입력
-KIS_APP_SECRET=여기에_시크릿_입력
-
-# 3. 계좌 정보
+# KIS API
+KIS_APP_KEY=...
+KIS_APP_SECRET=...
 KIS_ACCOUNT_NO=12345678
 KIS_ACCOUNT_PRODUCT_CODE=01
 
-# 4. 텔레그램 봇 (선택, 하지만 강력 권장!)
-TELEGRAM_BOT_TOKEN=봇토큰
-TELEGRAM_CHAT_ID=채팅ID
+# 텔레그램(선택)
 TELEGRAM_ENABLED=true
-```
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
 
-### Step 3: 모드 변경 방법
-
-**DRY_RUN → PAPER:**
-```bash
-EXECUTION_MODE=PAPER
-```
-
-**PAPER → REAL (이중 승인 필요):**
-1. `.env` 파일:
-```bash
-EXECUTION_MODE=REAL
-ENABLE_REAL_TRADING=true
-```
-
-2. `config/settings_real.py` 파일:
-```python
-REAL_TRADING_CONFIRMED = True  # False → True로 변경
+# DB(권장)
+DB_ENABLED=true
+DB_TYPE=mysql
+DB_HOST=localhost
+DB_PORT=3306
+DB_NAME=kis_trading
+DB_USER=root
+DB_PASSWORD=...
 ```
 
 ---
 
-## 4. 실행 방법
+## 4. 표준 실행 명령
 
-### DRY_RUN 모드 실행
-
+### 4-1. 거래 실행 (REST)
 ```bash
-# 가장 안전한 방법
-EXECUTION_MODE=DRY_RUN python main_multiday.py --mode trade
+cd /home/deploy/KIS-API-Trend-ATR
+python3 -m kis_trend_atr_trading.apps.kr_trade --mode trade --feed rest --interval 60
 ```
 
-### PAPER 모드 실행
-
+### 4-2. 거래 실행 (WebSocket)
 ```bash
-# 모의투자 테스트
-EXECUTION_MODE=PAPER python main_multiday.py --mode trade
+cd /home/deploy/KIS-API-Trend-ATR
+python3 -m kis_trend_atr_trading.apps.kr_trade --mode trade --feed ws --interval 60
 ```
 
-### REAL 모드 실행 (주의!)
-
+### 4-3. 종목/수량/반복 횟수 지정
 ```bash
-# 실계좌 - 모든 조건 충족 후에만!
-# 이중 승인 필수!
-EXECUTION_MODE=REAL ENABLE_REAL_TRADING=true python main_multiday.py --mode trade
+cd /home/deploy/KIS-API-Trend-ATR
+python3 -m kis_trend_atr_trading.apps.kr_trade \
+  --mode trade \
+  --feed rest \
+  --stock 005930 \
+  --order-quantity 1 \
+  --interval 60 \
+  --max-runs 10
 ```
 
-### 성과 리포트 전송
-
+### 4-4. CBT 앱 실행
 ```bash
-python report_sender.py
+cd /home/deploy/KIS-API-Trend-ATR
+python3 -m kis_trend_atr_trading.apps.kr_cbt --mode cbt --stock 005930 --interval 60
+```
+
+도움말:
+```bash
+python3 -m kis_trend_atr_trading.apps.kr_trade --help
+python3 -m kis_trend_atr_trading.apps.kr_cbt --help
 ```
 
 ---
 
-## 5. 성과 확인 방법
+## 5. Universe 설정 (종목선정)
+파일: `kis_trend_atr_trading/config/universe.yaml`
 
-### 방법 1: 텔레그램 명령
+핵심 키:
+- `universe.selection_method`: `fixed | volume_top | atr_filter | combined`
+- `universe.max_stocks`, `universe.universe_size`, `universe.max_positions`
+- `universe.candidate_pool_mode`: `yaml | market | kospi200 | volume_top`
+- `stocks`: 고정 종목 리스트
 
-봇에게 다음 명령을 보내세요:
+권장 시작값:
+- `selection_method: fixed`
+- `max_positions: 1`
+- 종목 1~2개로 충분히 검증
 
-| 명령 | 설명 |
-|------|------|
-| `/performance` | 전체 성과 요약 |
-| `/positions` | 현재 보유 포지션 |
-| `/status` | 시스템 상태 |
-| `/help` | 도움말 |
+---
 
-### 방법 2: 성과 파일 확인
+## 6. 로그와 알림 해석
 
+### 6-1. 정상 로그 예시
+- `[RESYNC][DB] 실계좌 기준 반영: ...`
+- `시그널: HOLD | ...`
+- `[MULTI] 다음 실행까지 60초 대기`
+
+### 6-2. 자주 보는 정상 메시지
+- `kis_api | [KIS][BAL] 캐시 재사용: age=1.93s`
+- 의미: 최근 잔고 조회 결과를 재사용 (API 호출 절약), 오류 아님
+
+### 6-3. 텔레그램 알림 규칙
+- 발송: 시스템/전략 예외, 주문 실패, 주요 복원/청산 이벤트
+- 미발송(현재 설계): 시작 시 계좌→DB 재동기화 중 개별 upsert 실패
+  - 이 경우 경고 로그(`포지션 저장 실패/보류`)만 남고 Telegram ERROR는 보내지 않음
+
+상세 배경: `kis_trend_atr_trading/LEGACY_DB_COMPATIBILITY.md`
+
+---
+
+## 7. 리스크 관리 기본값
+- 손절/익절: ATR 기반
+- 갭 보호: 기본 ON
+- Kill switch: 환경변수 `KILL_SWITCH=true` 시 신규 주문 차단
+- 일일 손실 한도 초과 시 거래 차단 경로 존재 (`risk_manager`)
+
+실계좌 전환 전 최소 조건:
+1. DRY_RUN/PAPER에서 충분한 기간 검증
+2. 소량(`ORDER_QUANTITY=1`)으로 시작
+3. 로그/텔레그램/복원 동작 사전 점검
+
+---
+
+## 8. 일일 리포트 실행
+
+### 8-1. 수동 실행
 ```bash
-# 거래 기록
-cat data/performance_trades.json
-
-# Equity Curve
-cat data/equity_curve.json
+cd /home/deploy/KIS-API-Trend-ATR
+python3 tools/daily_report.py --test-telegram
+python3 tools/daily_report.py --dry-run
+python3 tools/daily_report.py --yesterday
 ```
 
-### 방법 3: Python 코드
-
-```python
-from performance import get_performance_tracker
-
-tracker = get_performance_tracker()
-tracker.print_summary()
+### 8-2. cron 자동 실행 (월~금 16:05 KST)
+```cron
+5 16 * * 1-5 cd /home/deploy/KIS-API-Trend-ATR && /usr/bin/python3 tools/daily_report.py >> /home/deploy/KIS-API-Trend-ATR/logs/report.log 2>&1
 ```
+
+주의:
+- crontab에는 반드시 한 줄로 입력
+- 터미널에 직접 치면 `5: command not found`가 나는 것이 정상
 
 ---
 
-## 6. 실계좌 투입 전 체크리스트
+## 9. 재부팅 시 동작
+- `crontab` 등록 항목은 유지됩니다.
+- `cron` 서비스가 올라오면 스케줄은 계속 실행됩니다.
 
-**⚠️ 모든 항목을 완료해야 합니다!**
-
-### 전략 검증 (DRY_RUN)
-
-- [ ] 최소 2주 이상 DRY_RUN 테스트 완료
-- [ ] 가상 체결 기준 승률 확인 (목표: 50% 이상)
-- [ ] 가상 체결 기준 손익 확인 (목표: 플러스)
-- [ ] 손절/익절 로직 정상 동작 확인
-
-### 실전 테스트 (PAPER)
-
-- [ ] 최소 1주 이상 PAPER 테스트 완료
-- [ ] 실제 체결 지연 확인
-- [ ] 미체결 상황 대응 확인
-- [ ] API 안정성 확인
-
-### 안전장치 테스트
-
-- [ ] Kill Switch 테스트 완료 (`/halt` 명령)
-- [ ] 일일 손실 한도 테스트 완료
-- [ ] 누적 드로다운 한도 테스트 완료
-- [ ] 갭 보호 활성화 확인
-
-### 알림 테스트
-
-- [ ] 텔레그램 봇 연결 확인
-- [ ] 매수/매도 알림 수신 확인
-- [ ] 손절/익절 알림 수신 확인
-- [ ] 오류 알림 수신 확인
-
-### 최종 확인
-
-- [ ] settings_real.py 설정 검토
-- [ ] 손실 한도가 적절한지 확인
-- [ ] 주문 수량이 적절한지 확인 (소량으로 시작!)
-- [ ] 긴급 상황 대응 방법 숙지
-
----
-
-## 7. 긴급 상황 대응
-
-### 🚨 모든 거래 즉시 중단하기
-
-**방법 1: 텔레그램 명령**
-```
-/halt
-```
-
-**방법 2: 환경변수**
+점검 명령:
 ```bash
-KILL_SWITCH=true
+systemctl status cron
+crontab -l
+mkdir -p /home/deploy/KIS-API-Trend-ATR/logs
 ```
 
-**방법 3: Kill Switch 파일 생성**
+---
+
+## 10. 자주 발생하는 문제와 대응
+
+### 10-1. `ModuleNotFoundError: yaml`
+- 원인: `PyYAML` 미설치
+- 조치:
 ```bash
-echo "긴급 중단" > data/KILL_SWITCH
+python3 -m pip install -r kis_trend_atr_trading/requirements.txt
 ```
 
-### 🔄 거래 재개하기
+### 10-2. `INVALID_CHECK_ACNO`
+- 원인: 계좌정보/상품코드/모드 불일치
+- 조치:
+  - `KIS_ACCOUNT_NO`, `KIS_ACCOUNT_PRODUCT_CODE` 확인
+  - PAPER/REAL 계좌-모드 일치 확인
 
-```
-/resume CONFIRM
-```
+### 10-3. `Unknown column ...` / `Field ... doesn't have a default value`
+- 원인: 레거시 DB 스키마 불일치
+- 조치:
+  - 최신 `main`으로 업데이트
+  - 시작 로그의 레거시 컬럼 감지 메시지 확인
+  - 상세 문서: `LEGACY_DB_COMPATIBILITY.md`
 
-⚠️ "CONFIRM"을 반드시 입력해야 합니다!
-
-### 📊 현재 상태 확인
-
-```
-/status
-```
+### 10-4. cron 미실행
+- `crontab -l` 확인
+- 절대경로 사용 여부 확인
+- `logs/report.log` 경로/권한 확인
+- 필요 시 `CRON_TZ=Asia/Seoul` 적용
 
 ---
 
-## 8. 절대 하면 안 되는 것들
+## 11. 운영 체크리스트
 
-### ❌ 하면 안 되는 것
+실행 전:
+1. `.env`의 모드/계정/API 키 재확인
+2. `--help` 정상 출력 확인
+3. 텔레그램 테스트
+4. Universe/수량/손실한도 보수 설정
 
-1. **DRY_RUN/PAPER 단계 건너뛰기**
-   - 반드시 순서대로 충분히 테스트하세요
+운영 중:
+1. `ERROR` 급증 여부 확인
+2. `RISK MANAGER STATUS` 확인
+3. 재시작 후 복원 로그 확인
 
-2. **손실 한도 과도하게 완화**
-   - `DAILY_MAX_LOSS_PERCENT`를 5% 이상으로 올리지 마세요
-   - `MAX_CUMULATIVE_DRAWDOWN_PCT`를 20% 이상으로 올리지 마세요
-
-3. **갭 보호 비활성화**
-   - `ENABLE_GAP_PROTECTION = True`는 절대 변경하지 마세요
-   - 멀티데이 전략에서 갭 보호 OFF는 매우 위험합니다
-
-4. **대량 자금으로 바로 시작**
-   - 처음에는 1주로 시작하세요
-   - 한 달 후 문제 없으면 점진적으로 증가
-
-5. **API Key 코드에 직접 입력**
-   - 반드시 `.env` 파일이나 환경변수로 관리하세요
-   - `.env` 파일은 절대 Git에 커밋하지 마세요
-
-6. **단일 인스턴스 강제 비활성화**
-   - 중복 실행은 이중 매수를 유발합니다
-
-7. **장 운영시간 강제 비활성화**
-   - 장외 주문은 실패하거나 예상치 못한 결과를 유발합니다
-
-### ✅ 해야 하는 것
-
-1. **항상 텔레그램 알림 활성화**
-2. **정기적으로 성과 리포트 확인**
-3. **긴급 상황 대응 방법 숙지**
-4. **소량으로 시작하고 점진적으로 증가**
+실계좌 전환 전:
+1. 충분한 모의 검증
+2. 단계적 규모 확대
+3. 비상 중단 절차 숙지
 
 ---
 
-## 💡 요약
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                    안전한 사용 순서                       │
-├─────────────────────────────────────────────────────────┤
-│                                                         │
-│  1️⃣ DRY_RUN (2주 이상)                                  │
-│     ↓                                                   │
-│  2️⃣ PAPER (1주 이상)                                    │
-│     ↓                                                   │
-│  3️⃣ REAL (소량으로 시작)                                 │
-│                                                         │
-├─────────────────────────────────────────────────────────┤
-│                    핵심 안전장치                          │
-├─────────────────────────────────────────────────────────┤
-│                                                         │
-│  🔴 Kill Switch: /halt                                  │
-│  📉 일일 손실 한도: 2%                                   │
-│  📊 누적 드로다운 한도: 10~15%                           │
-│  🛡️ 갭 보호: 항상 ON                                     │
-│                                                         │
-└─────────────────────────────────────────────────────────┘
-```
-
----
-
-## 🆘 도움이 필요하면
-
-1. 텔레그램에서 `/help` 명령
-2. `README.md` 파일 참고
-3. `BEGINNER_GUIDE.md` 파일 참고
-
----
-
-**마지막 업데이트:** 2026-01-30
-
-**버전:** 2.0.0
+## 12. 관련 문서
+- 운영 기준: `kis_trend_atr_trading/README.md`
+- 구현 상세: `kis_trend_atr_trading/IMPLEMENTATION_GUIDE.md`
+- 초보자 중심: `kis_trend_atr_trading/BEGINNER_GUIDE.md`
+- 레거시 DB 호환: `kis_trend_atr_trading/LEGACY_DB_COMPATIBILITY.md`
+- 리포트 자동화: `REPORT_AUTOMATION.md`
