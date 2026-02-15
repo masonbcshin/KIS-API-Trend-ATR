@@ -805,7 +805,13 @@ class MySQLManager:
             """,
             (self.config.database, table_name),
         )
-        return [row["column_name"] for row in rows]
+        result: List[str] = []
+        for row in rows or []:
+            # 일부 환경에서 키가 대문자로 반환되는 경우를 방어합니다.
+            column_name = row.get("column_name") or row.get("COLUMN_NAME")
+            if column_name:
+                result.append(str(column_name))
+        return result
 
     def _has_duplicate_composite_key(self, table_name: str, key_columns: List[str]) -> bool:
         """복합 키 기준 중복 레코드 존재 여부를 확인합니다."""

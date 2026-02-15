@@ -337,9 +337,9 @@ class DailyReportService:
 
     def _get_unrealized_pnl(self) -> Optional[float]:
         if not self._db.table_exists("positions"):
-            return None
+            return self._get_unrealized_from_snapshots()
         if not self._positions_has_unrealized_columns():
-            return None
+            return self._get_unrealized_from_snapshots()
 
         position_columns = self._get_table_columns("positions")
         where_clauses: List[str] = []
@@ -366,13 +366,42 @@ class DailyReportService:
         )
         rows = rows or []
         if not rows:
-            return 0.0
+            snapshot_value = self._get_unrealized_from_snapshots()
+            return snapshot_value if snapshot_value is not None else 0.0
 
         values = [self._to_float_or_none(row.get("unrealized_pnl")) for row in rows]
         values = [value for value in values if value is not None]
         if not values:
-            return None
+            return self._get_unrealized_from_snapshots()
         return float(sum(values))
+
+    def _get_unrealized_from_snapshots(self) -> Optional[float]:
+        if not self._db.table_exists("account_snapshots"):
+            return None
+        snapshot_columns = self._get_table_columns("account_snapshots")
+        if "mode" in snapshot_columns:
+            row = self._db.execute_query(
+                """
+                SELECT unrealized_pnl
+                FROM account_snapshots
+                WHERE mode = %s
+                ORDER BY snapshot_time DESC
+                LIMIT 1
+                """,
+                (self._mode,),
+                fetch_one=True,
+            )
+        else:
+            row = self._db.execute_query(
+                """
+                SELECT unrealized_pnl
+                FROM account_snapshots
+                ORDER BY snapshot_time DESC
+                LIMIT 1
+                """,
+                fetch_one=True,
+            )
+        return self._to_float_or_none((row or {}).get("unrealized_pnl"))
 
     def _positions_has_unrealized_columns(self) -> bool:
         db_name = self._get_db_name()
@@ -399,7 +428,10 @@ class DailyReportService:
             """,
             (db_name, table_name),
         )
-        return {str(row.get("column_name") or "").lower() for row in (rows or [])}
+        return {
+            str(row.get("column_name") or row.get("COLUMN_NAME") or "").lower()
+            for row in (rows or [])
+        }
 
     def _load_risk_events(self, trade_date: date) -> List[str]:
         events: List[str] = []
@@ -482,7 +514,10 @@ class DailyReportService:
             """,
             (db_name,),
         )
-        pk_columns = [str(row.get("column_name") or "").lower() for row in (pk_rows or [])]
+        pk_columns = [
+            str(row.get("column_name") or row.get("COLUMN_NAME") or "").lower()
+            for row in (pk_rows or [])
+        ]
         return pk_columns == ["trade_date", "mode"]
 
     def _get_daily_summary_row(self, trade_date: date) -> Optional[Dict[str, Any]]:

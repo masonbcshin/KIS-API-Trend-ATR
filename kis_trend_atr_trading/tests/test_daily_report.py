@@ -55,6 +55,12 @@ class DummyDB:
             result = self.snapshot_first
         elif "from account_snapshots" in q and "order by snapshot_time desc" in q:
             result = self.snapshot_last
+        elif "from account_snapshots" in q and "unrealized_pnl" in q:
+            result = (
+                {"unrealized_pnl": None}
+                if self.snapshot_last is None
+                else {"unrealized_pnl": self.snapshot_last.get("unrealized_pnl")}
+            )
         elif "from daily_summary" in q:
             result = self.daily_summary_row
         elif "from information_schema.columns" in q and "table_name = 'positions'" in q:
@@ -190,3 +196,23 @@ def test_unrealized_query_does_not_require_symbol_column():
     report = service.build_report(date(2026, 2, 15))
 
     assert report.unrealized_pnl == 1234.5
+
+
+def test_unrealized_falls_back_to_latest_account_snapshot():
+    db = DummyDB(
+        trades=[{"symbol": "005930", "side": "SELL", "pnl": 10000, "reason": "TAKE_PROFIT"}],
+        snapshot_first={"total_equity": 1_000_000},
+        snapshot_last={"total_equity": 1_010_000, "unrealized_pnl": 4321.0},
+        positions_column_count=0,
+        table_exists_map={
+            "daily_summary": False,
+            "positions": False,
+            "order_state": False,
+            "account_snapshots": True,
+        },
+    )
+    service = _create_service(db)
+
+    report = service.build_report(date(2026, 2, 15))
+
+    assert report.unrealized_pnl == 4321.0

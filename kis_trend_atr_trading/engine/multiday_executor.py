@@ -20,6 +20,7 @@ KIS Trend-ATR Trading System - 멀티데이 거래 실행 엔진
 import time
 import signal
 import sys
+import hashlib
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Any
 import pandas as pd
@@ -55,9 +56,11 @@ from utils.position_store import (
     get_position_store
 )
 from db.repository import get_position_repository
+from db.mysql import get_db_manager, QueryError
 from utils.telegram_notifier import TelegramNotifier, get_telegram_notifier
 from utils.logger import get_logger, TradeLogger
 from utils.market_hours import KST
+from env import get_db_namespace_mode
 
 logger = get_logger("multiday_executor")
 trade_logger = TradeLogger("multiday_executor")
@@ -170,6 +173,26 @@ class MultidayExecutor:
             self.db_position_repo = get_position_repository()
         except Exception:
             self.db_position_repo = None
+
+        # 리포트용 DB 성과 적재 (실패 시 매매 로직에는 영향 없음)
+        try:
+            self._report_db = get_db_manager()
+        except Exception as e:
+            logger.warning(f"[REPORT_DB] DB 매니저 초기화 실패 (성과 적재 비활성): {e}")
+            self._report_db = None
+        self._report_table_columns: Dict[str, set] = {}
+        try:
+            self._report_mode = get_db_namespace_mode()
+        except Exception:
+            self._report_mode = (
+                "REAL" if self.trading_mode in ("REAL", "LIVE")
+                else ("DRY_RUN" if self.trading_mode == "CBT" else "PAPER")
+            )
+        self._report_snapshot_interval_sec = max(
+            int(getattr(settings, "REPORT_SNAPSHOT_INTERVAL_SEC", 300)),
+            30,
+        )
+        self._last_report_snapshot_at: Optional[datetime] = None
         
         # ★ 신규: 주문 동기화 컴포넌트 (감사 보고서 지적 해결)
         self.market_checker = get_market_checker()
@@ -293,6 +316,224 @@ class MultidayExecutor:
             "[RISK] 계좌 스냅샷 반영: "
             f"holdings={len(snapshot.get('holdings', []))}, total_pnl={total_pnl:+,.0f}원"
         )
+
+    # ════════════════════════════════════════════════════════════════
+    # 리포트 DB 적재 (매매 로직과 분리된 보조 기능)
+    # ════════════════════════════════════════════════════════════════
+
+    def _report_db_available(self) -> bool:
+        return self._report_db is not None
+
+    def _to_db_datetime(self, value: Optional[datetime] = None) -> datetime:
+        dt = value or datetime.now(KST)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(KST).replace(tzinfo=None)
+        return dt
+
+    def _get_report_table_columns(self, table_name: str) -> set:
+        cached = self._report_table_columns.get(table_name)
+        if cached is not None:
+            return cached
+
+        if not self._report_db_available():
+            self._report_table_columns[table_name] = set()
+            return set()
+
+        try:
+            rows = self._report_db.execute_query(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = %s AND table_name = %s
+                """,
+                (self._report_db.config.database, table_name),
+            )
+            cols = {
+                str(row.get("column_name") or row.get("COLUMN_NAME") or "").lower()
+                for row in (rows or [])
+            }
+            self._report_table_columns[table_name] = cols
+            return cols
+        except Exception as err:
+            logger.warning(f"[REPORT_DB] 컬럼 조회 실패: table={table_name}, err={err}")
+            self._report_table_columns[table_name] = set()
+            return set()
+
+    @staticmethod
+    def _pick_first_column(columns: set, *candidates: str) -> Optional[str]:
+        for candidate in candidates:
+            if candidate in columns:
+                return candidate
+        return None
+
+    def _persist_trade_record(
+        self,
+        *,
+        side: str,
+        price: float,
+        quantity: int,
+        order_no: Optional[str],
+        reason: Optional[str] = None,
+        pnl: Optional[float] = None,
+        pnl_pct: Optional[float] = None,
+        entry_price: Optional[float] = None,
+        holding_days: Optional[int] = None,
+        executed_at: Optional[datetime] = None,
+    ) -> None:
+        if not self._report_db_available():
+            return
+
+        columns = self._get_report_table_columns("trades")
+        if not columns:
+            return
+
+        symbol_col = self._pick_first_column(columns, "symbol", "stock_code")
+        if not symbol_col or "side" not in columns or "price" not in columns:
+            return
+
+        executed_time = self._to_db_datetime(executed_at)
+        col_values: Dict[str, Any] = {
+            symbol_col: self.stock_code,
+            "side": side.upper(),
+            "price": float(price),
+        }
+        if "quantity" in columns:
+            col_values["quantity"] = int(quantity)
+        if "executed_at" in columns:
+            col_values["executed_at"] = executed_time
+        if "reason" in columns and reason is not None:
+            col_values["reason"] = str(reason)
+        if "pnl" in columns and pnl is not None:
+            col_values["pnl"] = float(pnl)
+        if "pnl_percent" in columns and pnl_pct is not None:
+            col_values["pnl_percent"] = float(pnl_pct)
+        if "entry_price" in columns and entry_price is not None:
+            col_values["entry_price"] = float(entry_price)
+        if "holding_days" in columns and holding_days is not None:
+            col_values["holding_days"] = int(holding_days)
+        if "order_no" in columns and order_no:
+            col_values["order_no"] = str(order_no)
+        if "mode" in columns:
+            col_values["mode"] = self._report_mode
+
+        has_idempotency = "idempotency_key" in columns
+        if has_idempotency:
+            idem_source = (
+                f"{self._report_mode}|{side.upper()}|{self.stock_code}|{price:.4f}|"
+                f"{int(quantity)}|{order_no or ''}|{executed_time.isoformat()}|{reason or ''}"
+            )
+            col_values["idempotency_key"] = hashlib.sha256(
+                idem_source.encode("utf-8")
+            ).hexdigest()
+
+        insert_columns = list(col_values.keys())
+        placeholders = ", ".join(["%s"] * len(insert_columns))
+        col_sql = ", ".join(insert_columns)
+        sql = f"INSERT INTO trades ({col_sql}) VALUES ({placeholders})"
+        if has_idempotency:
+            sql += " ON DUPLICATE KEY UPDATE idempotency_key = VALUES(idempotency_key)"
+
+        try:
+            self._report_db.execute_command(
+                sql,
+                tuple(col_values[column] for column in insert_columns),
+            )
+        except QueryError as err:
+            logger.warning(
+                f"[REPORT_DB] 거래 적재 실패(무시): side={side}, symbol={self.stock_code}, err={err}"
+            )
+        except Exception as err:
+            logger.warning(
+                f"[REPORT_DB] 거래 적재 예외(무시): side={side}, symbol={self.stock_code}, err={err}"
+            )
+
+    def _persist_account_snapshot(self, force: bool = False) -> None:
+        if not self._report_db_available():
+            return
+
+        now = datetime.now(KST)
+        if (
+            not force
+            and self._last_report_snapshot_at is not None
+            and (now - self._last_report_snapshot_at).total_seconds()
+            < self._report_snapshot_interval_sec
+        ):
+            return
+
+        columns = self._get_report_table_columns("account_snapshots")
+        if not columns or "snapshot_time" not in columns:
+            return
+
+        try:
+            snapshot = self.api.get_account_balance()
+        except Exception as err:
+            logger.warning(f"[REPORT_DB] 계좌 스냅샷 조회 실패(무시): {err}")
+            return
+
+        if not snapshot or not snapshot.get("success"):
+            return
+
+        holdings = snapshot.get("holdings") or []
+        total_equity = float(snapshot.get("total_eval") or snapshot.get("total_equity") or 0.0)
+        cash_balance = float(snapshot.get("cash_balance") or snapshot.get("cash") or 0.0)
+        unrealized_pnl = float(
+            sum(float(item.get("pnl_amount") or 0.0) for item in holdings)
+        )
+        realized_pnl = 0.0
+        try:
+            pnl_summary = self.risk_manager.get_daily_pnl_summary()
+            realized_pnl = float((pnl_summary or {}).get("realized_pnl") or 0.0)
+        except Exception:
+            realized_pnl = 0.0
+
+        col_values: Dict[str, Any] = {
+            "snapshot_time": self._to_db_datetime(now),
+        }
+        if "total_equity" in columns:
+            col_values["total_equity"] = total_equity
+        if "cash" in columns:
+            col_values["cash"] = cash_balance
+        if "unrealized_pnl" in columns:
+            col_values["unrealized_pnl"] = unrealized_pnl
+        if "realized_pnl" in columns:
+            col_values["realized_pnl"] = realized_pnl
+        if "position_count" in columns:
+            col_values["position_count"] = int(len(holdings))
+        if "mode" in columns:
+            col_values["mode"] = self._report_mode
+
+        insert_columns = list(col_values.keys())
+        placeholders = ", ".join(["%s"] * len(insert_columns))
+        col_sql = ", ".join(insert_columns)
+        update_candidates = [
+            "total_equity",
+            "cash",
+            "unrealized_pnl",
+            "realized_pnl",
+            "position_count",
+            "mode",
+        ]
+        update_sql = ", ".join(
+            f"{name} = VALUES({name})" for name in update_candidates if name in col_values
+        )
+        if update_sql:
+            sql = (
+                f"INSERT INTO account_snapshots ({col_sql}) VALUES ({placeholders}) "
+                f"ON DUPLICATE KEY UPDATE {update_sql}"
+            )
+        else:
+            sql = f"INSERT INTO account_snapshots ({col_sql}) VALUES ({placeholders})"
+
+        try:
+            self._report_db.execute_command(
+                sql,
+                tuple(col_values[column] for column in insert_columns),
+            )
+            self._last_report_snapshot_at = now
+        except QueryError as err:
+            logger.warning(f"[REPORT_DB] 계좌 스냅샷 적재 실패(무시): {err}")
+        except Exception as err:
+            logger.warning(f"[REPORT_DB] 계좌 스냅샷 적재 예외(무시): {err}")
     
     # ════════════════════════════════════════════════════════════════
     # 포지션 영속화
@@ -690,6 +931,14 @@ class MultidayExecutor:
                 stop_loss=signal.stop_loss,
                 take_profit=signal.take_profit
             )
+            self._persist_trade_record(
+                side="BUY",
+                price=signal.price,
+                quantity=self.order_quantity,
+                order_no="CBT-VIRTUAL",
+                reason="CBT_VIRTUAL_BUY",
+            )
+            self._persist_account_snapshot(force=True)
             
             return {"success": True, "message": "[CBT] 가상 매수", "order_no": "CBT-VIRTUAL"}
         
@@ -736,6 +985,14 @@ class MultidayExecutor:
                     "order_no": sync_result.order_no,
                     "signal_price": signal.price  # 신호가도 기록
                 })
+                self._persist_trade_record(
+                    side="BUY",
+                    price=actual_price,
+                    quantity=actual_qty,
+                    order_no=sync_result.order_no,
+                    reason="BUY_FILLED",
+                )
+                self._persist_account_snapshot(force=True)
                 
                 # 텔레그램 알림 실패가 주문 성공 흐름을 깨지 않도록 분리
                 try:
@@ -774,6 +1031,14 @@ class MultidayExecutor:
                     )
                     
                     self._save_position_on_exit()
+                    self._persist_trade_record(
+                        side="BUY",
+                        price=actual_price,
+                        quantity=sync_result.exec_qty,
+                        order_no=sync_result.order_no,
+                        reason="BUY_PARTIAL",
+                    )
+                    self._persist_account_snapshot(force=True)
                     
                     try:
                         self.telegram.notify_warning(
@@ -858,6 +1123,18 @@ class MultidayExecutor:
             if result:
                 # 리스크 매니저에 손익 기록
                 self.risk_manager.record_trade_pnl(result["pnl"])
+                self._persist_trade_record(
+                    side="SELL",
+                    price=signal.price,
+                    quantity=int(result.get("quantity") or pos.quantity or 0),
+                    order_no="CBT-VIRTUAL",
+                    reason=exit_reason.value,
+                    pnl=float(result.get("pnl") or 0.0),
+                    pnl_pct=float(result.get("pnl_pct") or 0.0),
+                    entry_price=float(result.get("entry_price") or pos.entry_price),
+                    holding_days=int(result.get("holding_days") or 0),
+                )
+                self._persist_account_snapshot(force=True)
             
             # 포지션 저장 파일 클리어
             self.position_store.clear_position()
@@ -900,6 +1177,18 @@ class MultidayExecutor:
                         "exit_reason": exit_reason.value,
                         "signal_price": signal.price  # 신호가도 기록
                     })
+                    self._persist_trade_record(
+                        side="SELL",
+                        price=actual_price,
+                        quantity=int(sync_result.exec_qty or close_result.get("quantity") or 0),
+                        order_no=sync_result.order_no,
+                        reason=exit_reason.value,
+                        pnl=float(close_result.get("pnl") or 0.0),
+                        pnl_pct=float(close_result.get("pnl_pct") or 0.0),
+                        entry_price=float(close_result.get("entry_price") or pos.entry_price),
+                        holding_days=int(close_result.get("holding_days") or 0),
+                    )
+                    self._persist_account_snapshot(force=True)
                     
                     # 텔레그램 알림 (청산 유형별)
                     self._send_exit_notification(
@@ -932,6 +1221,17 @@ class MultidayExecutor:
                     # 부분 청산 손익 계산
                     partial_pnl = (actual_price - pos.entry_price) * sync_result.exec_qty
                     partial_pnl_pct = (actual_price - pos.entry_price) / pos.entry_price * 100
+                    self._persist_trade_record(
+                        side="SELL",
+                        price=actual_price,
+                        quantity=int(sync_result.exec_qty),
+                        order_no=sync_result.order_no,
+                        reason=f"{exit_reason.value}_PARTIAL",
+                        pnl=float(partial_pnl),
+                        pnl_pct=float(partial_pnl_pct),
+                        entry_price=float(pos.entry_price),
+                    )
+                    self._persist_account_snapshot(force=True)
                     
                     # 남은 수량으로 포지션 축소 (전략 상태는 유지)
                     remaining_qty = pos.quantity - sync_result.exec_qty
@@ -1163,6 +1463,9 @@ class MultidayExecutor:
             "position": None,
             "error": None
         }
+
+        # 리포트용 계좌 스냅샷은 주기적으로만 저장합니다.
+        self._persist_account_snapshot(force=False)
 
         try:
             tradeable_now, market_reason = self.market_checker.is_tradeable()

@@ -197,6 +197,22 @@ class TestSendMessage:
             assert result is False
             assert mock_post.call_count == 2
 
+    def test_send_message_client_error_stops_retry(self, mock_telegram_notifier):
+        """4xx 오류는 즉시 실패 처리(재시도 안 함) 테스트"""
+        with patch('utils.telegram_notifier.requests.post') as mock_post:
+            mock_response = MagicMock()
+            mock_response.status_code = 400
+            mock_response.json.return_value = {"description": "Bad Request: chat not found"}
+            mock_post.return_value = mock_response
+
+            mock_telegram_notifier._retry_delay = 0.01
+            mock_telegram_notifier._max_retries = 3
+
+            result = mock_telegram_notifier.send_message("테스트")
+
+            assert result is False
+            assert mock_post.call_count == 1
+
     def test_send_message_formats_direct_symbol_label(self, mock_telegram_notifier, mock_requests_post):
         """엔진 직접 메시지의 종목 라벨 포맷 보정 테스트"""
         direct_message = "• 종목: `005930`\n• 진입가: 70,000원"

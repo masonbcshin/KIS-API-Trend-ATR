@@ -554,7 +554,7 @@ class TelegramNotifier:
     def send_message(
         self,
         text: str,
-        parse_mode: str = "Markdown",
+        parse_mode: Optional[str] = "Markdown",
         disable_notification: bool = False
     ) -> bool:
         """
@@ -583,9 +583,10 @@ class TelegramNotifier:
         payload = {
             "chat_id": self._chat_id,
             "text": text,
-            "parse_mode": parse_mode,
             "disable_notification": disable_notification
         }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         
         return self._send_request("sendMessage", payload)
     
@@ -624,9 +625,18 @@ class TelegramNotifier:
                             f"[TELEGRAM] API 응답 오류: {result.get('description')}"
                         )
                 else:
+                    response_desc = ""
+                    try:
+                        response_desc = str((response.json() or {}).get("description") or "")
+                    except Exception:
+                        response_desc = (response.text or "").strip()
                     logger.error(
                         f"[TELEGRAM] HTTP 오류: {response.status_code}"
+                        + (f" | {response_desc}" if response_desc else "")
                     )
+                    # 4xx는 설정/요청 포맷 문제 가능성이 높아 재시도 이득이 거의 없습니다.
+                    if 400 <= response.status_code < 500:
+                        return False
                     
             except Timeout:
                 logger.warning(
