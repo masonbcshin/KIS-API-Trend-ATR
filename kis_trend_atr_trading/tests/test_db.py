@@ -201,6 +201,7 @@ class TestPositionRepositoryCompatibility:
         mock_db.execute_query.side_effect = [
             [{"column_name": "stock_code"}],  # 컬럼 탐지
             None,  # position_id 메타(없음)
+            {"cnt": 0},  # state 컬럼 미존재
             {
                 "stock_code": "005930",
                 "entry_price": 70000,
@@ -234,7 +235,7 @@ class TestPositionRepositoryCompatibility:
         assert result.symbol == "005930"
         insert_sql = mock_db.execute_command.call_args[0][0]
         assert "`stock_code`" in insert_sql
-        select_sql = mock_db.execute_query.call_args_list[2][0][0]
+        select_sql = mock_db.execute_query.call_args_list[3][0][0]
         assert "`stock_code`" in select_sql
 
     def test_upsert_generates_position_id_when_required(self):
@@ -248,6 +249,7 @@ class TestPositionRepositoryCompatibility:
                 "column_default": None,
                 "extra": "",
             },
+            {"cnt": 1},  # state 컬럼 존재
             None,  # existing 조회: 없음
             {  # 최종 get_by_symbol 결과
                 "position_id": "P20250115093000000000_005930",
@@ -283,7 +285,9 @@ class TestPositionRepositoryCompatibility:
         insert_sql = mock_db.execute_command.call_args[0][0]
         insert_params = mock_db.execute_command.call_args[0][1]
         assert "position_id" in insert_sql
+        assert "state" in insert_sql
         assert str(insert_params[0]).startswith("P")
+        assert insert_params[-1] == "ENTERED"
 
     def test_detect_position_id_requirement_with_uppercase_metadata(self):
         mock_db = Mock()
@@ -296,6 +300,7 @@ class TestPositionRepositoryCompatibility:
                 "COLUMN_DEFAULT": None,
                 "EXTRA": "",
             },
+            {"cnt": 0},
         ]
 
         repo = PositionRepository(db=mock_db)
@@ -308,6 +313,7 @@ class TestPositionRepositoryCompatibility:
         mock_db.execute_query.side_effect = [
             [{"column_name": "stock_code"}],  # __init__: symbol 컬럼 탐지
             None,  # __init__: position_id 메타 탐지 실패(미탐지)
+            {"cnt": 0},  # __init__: state 컬럼 미존재
             {  # retry 시 position_id 메타 탐지(대문자 키)
                 "DATA_TYPE": "varchar",
                 "IS_NULLABLE": "NO",

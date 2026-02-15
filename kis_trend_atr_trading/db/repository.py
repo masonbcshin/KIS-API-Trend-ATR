@@ -269,6 +269,7 @@ class PositionRepository:
         self.mode = _get_namespace_mode()
         self._positions_symbol_column = self._detect_positions_symbol_column()
         self._position_id_required, self._position_id_is_numeric = self._detect_position_id_requirements()
+        self._positions_has_state_column = self._detect_positions_state_column()
 
     def _detect_positions_symbol_column(self) -> str:
         """
@@ -352,6 +353,34 @@ class PositionRepository:
             logger.warning(f"[REPO] position_id 컬럼 탐지 실패: {e}")
             return False, False
 
+    def _detect_positions_state_column(self) -> bool:
+        """positions 테이블의 legacy state 컬럼 존재 여부를 탐지합니다."""
+        try:
+            database_name = getattr(getattr(self.db, "config", None), "database", None)
+            if not database_name:
+                return False
+            row = self.db.execute_query(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM information_schema.columns
+                WHERE table_schema = %s
+                  AND table_name = 'positions'
+                  AND column_name = 'state'
+                """,
+                (database_name,),
+                fetch_one=True,
+            )
+            cnt = 0
+            if row:
+                cnt = row.get("cnt", row.get("CNT", 0)) or 0
+            has_state = int(cnt) > 0
+            if has_state:
+                logger.warning("[REPO] positions.state 컬럼 감지: legacy state 동기화 활성화")
+            return has_state
+        except Exception as e:
+            logger.warning(f"[REPO] positions.state 컬럼 탐지 실패: {e}")
+            return False
+
     def _generate_position_id(self, symbol: str, entry_time: datetime) -> Any:
         """position_id 값을 생성합니다 (정수/문자열 컬럼 자동 대응)."""
         if self._position_id_is_numeric:
@@ -394,6 +423,7 @@ class PositionRepository:
             where_sql = "position_id = %s AND mode = %s"
             where_params = (existing.position_id, self.mode)
 
+        set_state_sql = ", state = 'ENTERED'" if self._positions_has_state_column else ""
         return self.db.execute_command(
             f"""
             UPDATE positions
@@ -407,6 +437,7 @@ class PositionRepository:
                 highest_price = %s,
                 mode = %s,
                 status = 'OPEN'
+                {set_state_sql}
             WHERE {where_sql}
             """,
             (
@@ -432,6 +463,16 @@ class PositionRepository:
         """신규 포지션 row를 삽입합니다."""
         if self._position_id_required:
             position_id = self._generate_position_id(symbol, entry_time)
+            state_cols_sql = ", state" if self._positions_has_state_column else ""
+            state_vals_sql = ", %s" if self._positions_has_state_column else ""
+            params: List[Any] = [
+                position_id, symbol,
+                entry_price, quantity, entry_time,
+                atr_at_entry, stop_price, take_profit_price,
+                trailing_stop, highest_price, self.mode,
+            ]
+            if self._positions_has_state_column:
+                params.append("ENTERED")
             return self.db.execute_command(
                 f"""
                 INSERT INTO positions (
@@ -439,23 +480,30 @@ class PositionRepository:
                     entry_price, quantity, entry_time,
                     atr_at_entry, stop_price, take_profit_price,
                     trailing_stop, highest_price, mode, status
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN')
+                    {state_cols_sql}
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN'{state_vals_sql})
                 """,
-                (
-                    position_id, symbol,
-                    entry_price, quantity, entry_time,
-                    atr_at_entry, stop_price, take_profit_price,
-                    trailing_stop, highest_price, self.mode,
-                ),
+                tuple(params),
             )
 
+        state_cols_sql = ", state" if self._positions_has_state_column else ""
+        state_vals_sql = ", %s" if self._positions_has_state_column else ""
+        state_update_sql = ",\n                state = VALUES(state)" if self._positions_has_state_column else ""
+        params: List[Any] = [
+            symbol, entry_price, quantity, entry_time,
+            atr_at_entry, stop_price, take_profit_price,
+            trailing_stop, highest_price, self.mode,
+        ]
+        if self._positions_has_state_column:
+            params.append("ENTERED")
         return self.db.execute_command(
             f"""
             INSERT INTO positions (
                 `{self._positions_symbol_column}`, entry_price, quantity, entry_time,
                 atr_at_entry, stop_price, take_profit_price,
                 trailing_stop, highest_price, mode, status
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN')
+                {state_cols_sql}
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN'{state_vals_sql})
             ON DUPLICATE KEY UPDATE
                 entry_price = VALUES(entry_price),
                 quantity = VALUES(quantity),
@@ -467,12 +515,9 @@ class PositionRepository:
                 highest_price = VALUES(highest_price),
                 mode = VALUES(mode),
                 status = 'OPEN'
+                {state_update_sql}
             """,
-            (
-                symbol, entry_price, quantity, entry_time,
-                atr_at_entry, stop_price, take_profit_price,
-                trailing_stop, highest_price, self.mode,
-            ),
+            tuple(params),
         )
 
     def save(
@@ -732,10 +777,12 @@ class PositionRepository:
             bool: 청산 성공 여부
         """
         try:
+            set_state_sql = ", state = 'EXITED'" if self._positions_has_state_column else ""
             affected = self.db.execute_command(
                 f"""
                 UPDATE positions 
                 SET status = 'CLOSED'
+                    {set_state_sql}
                 WHERE `{self._positions_symbol_column}` = %s AND status = 'OPEN' AND mode = %s
                 """,
                 (symbol, self.mode)
