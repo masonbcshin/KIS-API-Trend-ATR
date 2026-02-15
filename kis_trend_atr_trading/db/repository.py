@@ -84,6 +84,7 @@ class PositionRecord:
     take_profit_price: Optional[float]
     trailing_stop: Optional[float]
     highest_price: Optional[float]
+    position_id: Optional[Any] = None
     mode: str = "PAPER"
     status: str = "OPEN"
     created_at: Optional[datetime] = None
@@ -101,6 +102,7 @@ class PositionRecord:
             "take_profit_price": float(self.take_profit_price) if self.take_profit_price else None,
             "trailing_stop": float(self.trailing_stop) if self.trailing_stop else None,
             "highest_price": float(self.highest_price) if self.highest_price else None,
+            "position_id": self.position_id,
             "mode": self.mode,
             "status": self.status
         }
@@ -121,6 +123,7 @@ class PositionRecord:
             take_profit_price=float(data["take_profit_price"]) if data.get("take_profit_price") else None,
             trailing_stop=float(data["trailing_stop"]) if data.get("trailing_stop") else None,
             highest_price=float(data["highest_price"]) if data.get("highest_price") else None,
+            position_id=data.get("position_id"),
             mode=data.get("mode", "PAPER"),
             status=data.get("status", "OPEN"),
             created_at=data.get("created_at"),
@@ -265,6 +268,7 @@ class PositionRepository:
         self.db = db or get_db_manager()
         self.mode = _get_namespace_mode()
         self._positions_symbol_column = self._detect_positions_symbol_column()
+        self._position_id_required, self._position_id_is_numeric = self._detect_position_id_requirements()
 
     def _detect_positions_symbol_column(self) -> str:
         """
@@ -302,6 +306,158 @@ class PositionRepository:
         except Exception as e:
             logger.warning(f"[REPO] positions 컬럼 탐지 실패(기본 symbol 사용): {e}")
         return default_col
+
+    def _detect_position_id_requirements(self) -> Tuple[bool, bool]:
+        """
+        position_id 컬럼의 필수 입력 여부를 탐지합니다.
+
+        Returns:
+            (is_required, is_numeric)
+        """
+        try:
+            database_name = getattr(getattr(self.db, "config", None), "database", None)
+            if not database_name:
+                return False, False
+            row = self.db.execute_query(
+                """
+                SELECT data_type, is_nullable, column_default, extra
+                FROM information_schema.columns
+                WHERE table_schema = %s
+                  AND table_name = 'positions'
+                  AND column_name = 'position_id'
+                LIMIT 1
+                """,
+                (database_name,),
+                fetch_one=True,
+            )
+            if not row:
+                return False, False
+            data_type = str(row.get("data_type") or "").lower()
+            is_nullable = str(row.get("is_nullable") or "").upper()
+            column_default = row.get("column_default")
+            extra = str(row.get("extra") or "").lower()
+
+            is_numeric = data_type in {
+                "tinyint", "smallint", "mediumint", "int", "integer", "bigint"
+            }
+            is_required = is_nullable == "NO" and column_default is None and "auto_increment" not in extra
+            if is_required:
+                logger.warning("[REPO] positions.position_id 필수 입력 컬럼 감지: 호환 모드 활성화")
+            return is_required, is_numeric
+        except Exception as e:
+            logger.warning(f"[REPO] position_id 컬럼 탐지 실패: {e}")
+            return False, False
+
+    def _generate_position_id(self, symbol: str, entry_time: datetime) -> Any:
+        """position_id 값을 생성합니다 (정수/문자열 컬럼 자동 대응)."""
+        if self._position_id_is_numeric:
+            row = self.db.execute_query(
+                "SELECT COALESCE(MAX(position_id), 0) + 1 AS next_id FROM positions",
+                fetch_one=True,
+            )
+            return int((row or {}).get("next_id", 1))
+        return f"P{entry_time.strftime('%Y%m%d%H%M%S%f')}_{symbol}"
+
+    def _update_position_row(
+        self,
+        existing: Optional[PositionRecord],
+        symbol: str,
+        entry_price: float,
+        quantity: int,
+        entry_time: datetime,
+        atr_at_entry: float,
+        stop_price: float,
+        take_profit_price: Optional[float],
+        trailing_stop: float,
+        highest_price: float,
+    ) -> int:
+        """기존 포지션 row를 업데이트합니다."""
+        where_sql = f"`{self._positions_symbol_column}` = %s AND mode = %s"
+        where_params: Tuple[Any, Any] = (symbol, self.mode)
+        if existing and existing.position_id is not None:
+            where_sql = "position_id = %s AND mode = %s"
+            where_params = (existing.position_id, self.mode)
+
+        return self.db.execute_command(
+            f"""
+            UPDATE positions
+            SET entry_price = %s,
+                quantity = %s,
+                entry_time = %s,
+                atr_at_entry = %s,
+                stop_price = %s,
+                take_profit_price = %s,
+                trailing_stop = %s,
+                highest_price = %s,
+                mode = %s,
+                status = 'OPEN'
+            WHERE {where_sql}
+            """,
+            (
+                entry_price, quantity, entry_time,
+                atr_at_entry, stop_price, take_profit_price,
+                trailing_stop, highest_price, self.mode,
+                *where_params,
+            ),
+        )
+
+    def _insert_position_row(
+        self,
+        symbol: str,
+        entry_price: float,
+        quantity: int,
+        entry_time: datetime,
+        atr_at_entry: float,
+        stop_price: float,
+        take_profit_price: Optional[float],
+        trailing_stop: float,
+        highest_price: float,
+    ) -> int:
+        """신규 포지션 row를 삽입합니다."""
+        if self._position_id_required:
+            position_id = self._generate_position_id(symbol, entry_time)
+            return self.db.execute_command(
+                f"""
+                INSERT INTO positions (
+                    position_id, `{self._positions_symbol_column}`,
+                    entry_price, quantity, entry_time,
+                    atr_at_entry, stop_price, take_profit_price,
+                    trailing_stop, highest_price, mode, status
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN')
+                """,
+                (
+                    position_id, symbol,
+                    entry_price, quantity, entry_time,
+                    atr_at_entry, stop_price, take_profit_price,
+                    trailing_stop, highest_price, self.mode,
+                ),
+            )
+
+        return self.db.execute_command(
+            f"""
+            INSERT INTO positions (
+                `{self._positions_symbol_column}`, entry_price, quantity, entry_time,
+                atr_at_entry, stop_price, take_profit_price,
+                trailing_stop, highest_price, mode, status
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN')
+            ON DUPLICATE KEY UPDATE
+                entry_price = VALUES(entry_price),
+                quantity = VALUES(quantity),
+                entry_time = VALUES(entry_time),
+                atr_at_entry = VALUES(atr_at_entry),
+                stop_price = VALUES(stop_price),
+                take_profit_price = VALUES(take_profit_price),
+                trailing_stop = VALUES(trailing_stop),
+                highest_price = VALUES(highest_price),
+                mode = VALUES(mode),
+                status = 'OPEN'
+            """,
+            (
+                symbol, entry_price, quantity, entry_time,
+                atr_at_entry, stop_price, take_profit_price,
+                trailing_stop, highest_price, self.mode,
+            ),
+        )
 
     def save(
         self,
@@ -345,33 +501,16 @@ class PositionRepository:
             if existing and existing.status == "OPEN":
                 logger.warning(f"[REPO] 이미 열린 포지션 존재: {symbol}")
                 return None
-            
-            # MySQL INSERT ... ON DUPLICATE KEY UPDATE
-            # ★ PostgreSQL의 ON CONFLICT 대체
-            self.db.execute_command(
-                f"""
-                INSERT INTO positions (
-                    `{self._positions_symbol_column}`, entry_price, quantity, entry_time,
-                    atr_at_entry, stop_price, take_profit_price,
-                    trailing_stop, highest_price, mode, status
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN')
-                ON DUPLICATE KEY UPDATE
-                    entry_price = VALUES(entry_price),
-                    quantity = VALUES(quantity),
-                    entry_time = VALUES(entry_time),
-                    atr_at_entry = VALUES(atr_at_entry),
-                    stop_price = VALUES(stop_price),
-                    take_profit_price = VALUES(take_profit_price),
-                    trailing_stop = VALUES(trailing_stop),
-                    highest_price = VALUES(highest_price),
-                    mode = VALUES(mode),
-                    status = 'OPEN'
-                """,
-                (
-                    symbol, entry_price, quantity, entry_time,
-                    atr_at_entry, stop_price, take_profit_price,
-                    trailing_stop, highest_price, self.mode
-                )
+            self._insert_position_row(
+                symbol=symbol,
+                entry_price=entry_price,
+                quantity=quantity,
+                entry_time=entry_time,
+                atr_at_entry=atr_at_entry,
+                stop_price=stop_price,
+                take_profit_price=take_profit_price,
+                trailing_stop=trailing_stop,
+                highest_price=highest_price,
             )
             
             # 저장된 데이터 조회 (RETURNING 대체)
@@ -410,31 +549,32 @@ class PositionRepository:
         trailing_stop = trailing_stop or stop_price
 
         try:
-            self.db.execute_command(
-                f"""
-                INSERT INTO positions (
-                    `{self._positions_symbol_column}`, entry_price, quantity, entry_time,
-                    atr_at_entry, stop_price, take_profit_price,
-                    trailing_stop, highest_price, mode, status
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN')
-                ON DUPLICATE KEY UPDATE
-                    entry_price = VALUES(entry_price),
-                    quantity = VALUES(quantity),
-                    entry_time = VALUES(entry_time),
-                    atr_at_entry = VALUES(atr_at_entry),
-                    stop_price = VALUES(stop_price),
-                    take_profit_price = VALUES(take_profit_price),
-                    trailing_stop = VALUES(trailing_stop),
-                    highest_price = VALUES(highest_price),
-                    mode = VALUES(mode),
-                    status = 'OPEN'
-                """,
-                (
-                    symbol, entry_price, quantity, entry_time,
-                    atr_at_entry, stop_price, take_profit_price,
-                    trailing_stop, highest_price, self.mode
+            existing = self.get_by_symbol(symbol) if self._position_id_required else None
+            if self._position_id_required and existing:
+                self._update_position_row(
+                    existing=existing,
+                    symbol=symbol,
+                    entry_price=entry_price,
+                    quantity=quantity,
+                    entry_time=entry_time,
+                    atr_at_entry=atr_at_entry,
+                    stop_price=stop_price,
+                    take_profit_price=take_profit_price,
+                    trailing_stop=trailing_stop,
+                    highest_price=highest_price,
                 )
-            )
+            else:
+                self._insert_position_row(
+                    symbol=symbol,
+                    entry_price=entry_price,
+                    quantity=quantity,
+                    entry_time=entry_time,
+                    atr_at_entry=atr_at_entry,
+                    stop_price=stop_price,
+                    take_profit_price=take_profit_price,
+                    trailing_stop=trailing_stop,
+                    highest_price=highest_price,
+                )
             return self.get_by_symbol(symbol)
         except QueryError as e:
             logger.error(f"[REPO] 실계좌 기준 upsert 실패: {e}")
@@ -451,7 +591,13 @@ class PositionRepository:
             PositionRecord: 포지션 (없으면 None)
         """
         result = self.db.execute_query(
-            f"SELECT * FROM positions WHERE `{self._positions_symbol_column}` = %s AND mode = %s",
+            f"""
+            SELECT *
+            FROM positions
+            WHERE `{self._positions_symbol_column}` = %s AND mode = %s
+            ORDER BY CASE WHEN status = 'OPEN' THEN 0 ELSE 1 END, entry_time DESC
+            LIMIT 1
+            """,
             (symbol, self.mode),
             fetch_one=True
         )

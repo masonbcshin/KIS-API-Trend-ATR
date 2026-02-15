@@ -200,6 +200,7 @@ class TestPositionRepositoryCompatibility:
         mock_db.config = Mock(database="kis_trading")
         mock_db.execute_query.side_effect = [
             [{"column_name": "stock_code"}],  # 컬럼 탐지
+            None,  # position_id 메타(없음)
             {
                 "stock_code": "005930",
                 "entry_price": 70000,
@@ -233,8 +234,56 @@ class TestPositionRepositoryCompatibility:
         assert result.symbol == "005930"
         insert_sql = mock_db.execute_command.call_args[0][0]
         assert "`stock_code`" in insert_sql
-        select_sql = mock_db.execute_query.call_args_list[1][0][0]
+        select_sql = mock_db.execute_query.call_args_list[2][0][0]
         assert "`stock_code`" in select_sql
+
+    def test_upsert_generates_position_id_when_required(self):
+        mock_db = Mock()
+        mock_db.config = Mock(database="kis_trading")
+        mock_db.execute_query.side_effect = [
+            [{"column_name": "stock_code"}],  # 컬럼 탐지
+            {  # position_id 메타(필수, 문자열)
+                "data_type": "varchar",
+                "is_nullable": "NO",
+                "column_default": None,
+                "extra": "",
+            },
+            None,  # existing 조회: 없음
+            {  # 최종 get_by_symbol 결과
+                "position_id": "P20250115093000000000_005930",
+                "stock_code": "005930",
+                "entry_price": 70000,
+                "quantity": 10,
+                "entry_time": datetime(2025, 1, 15, 9, 30, 0),
+                "atr_at_entry": 1500,
+                "stop_price": 67000,
+                "take_profit_price": 75000,
+                "trailing_stop": 67500,
+                "highest_price": 71000,
+                "mode": "PAPER",
+                "status": "OPEN",
+            },
+        ]
+        mock_db.execute_command.return_value = 1
+
+        repo = PositionRepository(db=mock_db)
+        result = repo.upsert_from_account_holding(
+            symbol="005930",
+            entry_price=70000,
+            quantity=10,
+            atr_at_entry=1500,
+            stop_price=67000,
+            take_profit_price=75000,
+            trailing_stop=67500,
+            highest_price=71000,
+            entry_time=datetime(2025, 1, 15, 9, 30, 0),
+        )
+
+        assert result is not None
+        insert_sql = mock_db.execute_command.call_args[0][0]
+        insert_params = mock_db.execute_command.call_args[0][1]
+        assert "position_id" in insert_sql
+        assert str(insert_params[0]).startswith("P")
 
 
 class TestTradeRecord:
