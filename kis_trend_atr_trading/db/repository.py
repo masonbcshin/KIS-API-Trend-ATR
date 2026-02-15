@@ -270,6 +270,11 @@ class PositionRepository:
         self._positions_symbol_column = self._detect_positions_symbol_column()
         self._position_id_required, self._position_id_is_numeric = self._detect_position_id_requirements()
         self._positions_has_state_column = self._detect_positions_state_column()
+        self._positions_has_entry_date_column = self._detect_positions_entry_date_column()
+        self._positions_has_stop_loss_column = self._detect_positions_stop_loss_column()
+        self._positions_has_take_profit_column = self._detect_positions_take_profit_column()
+        self._positions_has_atr_value_column = self._detect_positions_atr_value_column()
+        self._positions_has_atr_column = self._detect_positions_atr_column()
 
     def _detect_positions_symbol_column(self) -> str:
         """
@@ -355,6 +360,48 @@ class PositionRepository:
 
     def _detect_positions_state_column(self) -> bool:
         """positions 테이블의 legacy state 컬럼 존재 여부를 탐지합니다."""
+        return self._detect_positions_legacy_column(
+            "state",
+            "[REPO] positions.state 컬럼 감지: legacy state 동기화 활성화",
+        )
+
+    def _detect_positions_entry_date_column(self) -> bool:
+        """positions 테이블의 legacy entry_date 컬럼 존재 여부를 탐지합니다."""
+        return self._detect_positions_legacy_column(
+            "entry_date",
+            "[REPO] positions.entry_date 컬럼 감지: legacy entry_date 동기화 활성화",
+        )
+
+    def _detect_positions_stop_loss_column(self) -> bool:
+        """positions 테이블의 legacy stop_loss 컬럼 존재 여부를 탐지합니다."""
+        return self._detect_positions_legacy_column(
+            "stop_loss",
+            "[REPO] positions.stop_loss 컬럼 감지: legacy stop_loss 동기화 활성화",
+        )
+
+    def _detect_positions_take_profit_column(self) -> bool:
+        """positions 테이블의 legacy take_profit 컬럼 존재 여부를 탐지합니다."""
+        return self._detect_positions_legacy_column(
+            "take_profit",
+            "[REPO] positions.take_profit 컬럼 감지: legacy take_profit 동기화 활성화",
+        )
+
+    def _detect_positions_atr_value_column(self) -> bool:
+        """positions 테이블의 legacy atr_value 컬럼 존재 여부를 탐지합니다."""
+        return self._detect_positions_legacy_column(
+            "atr_value",
+            "[REPO] positions.atr_value 컬럼 감지: legacy atr_value 동기화 활성화",
+        )
+
+    def _detect_positions_atr_column(self) -> bool:
+        """positions 테이블의 legacy atr 컬럼 존재 여부를 탐지합니다."""
+        return self._detect_positions_legacy_column(
+            "atr",
+            "[REPO] positions.atr 컬럼 감지: legacy atr 동기화 활성화",
+        )
+
+    def _detect_positions_legacy_column(self, column_name: str, found_log: str) -> bool:
+        """positions 테이블의 특정 레거시 컬럼 존재 여부를 탐지합니다."""
         try:
             database_name = getattr(getattr(self.db, "config", None), "database", None)
             if not database_name:
@@ -365,20 +412,20 @@ class PositionRepository:
                 FROM information_schema.columns
                 WHERE table_schema = %s
                   AND table_name = 'positions'
-                  AND column_name = 'state'
+                  AND column_name = %s
                 """,
-                (database_name,),
+                (database_name, column_name),
                 fetch_one=True,
             )
             cnt = 0
             if row:
                 cnt = row.get("cnt", row.get("CNT", 0)) or 0
-            has_state = int(cnt) > 0
-            if has_state:
-                logger.warning("[REPO] positions.state 컬럼 감지: legacy state 동기화 활성화")
-            return has_state
+            has_column = int(cnt) > 0
+            if has_column:
+                logger.warning(found_log)
+            return has_column
         except Exception as e:
-            logger.warning(f"[REPO] positions.state 컬럼 탐지 실패: {e}")
+            logger.warning(f"[REPO] positions.{column_name} 컬럼 탐지 실패: {e}")
             return False
 
     def _generate_position_id(self, symbol: str, entry_time: datetime) -> Any:
@@ -423,29 +470,51 @@ class PositionRepository:
             where_sql = "position_id = %s AND mode = %s"
             where_params = (existing.position_id, self.mode)
 
-        set_state_sql = ", state = 'ENTERED'" if self._positions_has_state_column else ""
+        set_clauses = [
+            "entry_price = %s",
+            "quantity = %s",
+            "entry_time = %s",
+            "atr_at_entry = %s",
+            "stop_price = %s",
+            "take_profit_price = %s",
+            "trailing_stop = %s",
+            "highest_price = %s",
+            "mode = %s",
+            "status = 'OPEN'",
+        ]
+        params: List[Any] = [
+            entry_price, quantity, entry_time,
+            atr_at_entry, stop_price, take_profit_price,
+            trailing_stop, highest_price, self.mode,
+        ]
+
+        if self._positions_has_state_column:
+            set_clauses.append("state = 'ENTERED'")
+        if self._positions_has_entry_date_column:
+            set_clauses.append("entry_date = %s")
+            params.append(entry_time.date().isoformat())
+        if self._positions_has_stop_loss_column:
+            set_clauses.append("stop_loss = %s")
+            params.append(stop_price)
+        if self._positions_has_take_profit_column:
+            set_clauses.append("take_profit = %s")
+            params.append(
+                take_profit_price if take_profit_price is not None else stop_price
+            )
+        if self._positions_has_atr_value_column:
+            set_clauses.append("atr_value = %s")
+            params.append(atr_at_entry)
+        if self._positions_has_atr_column:
+            set_clauses.append("atr = %s")
+            params.append(atr_at_entry)
+
         return self.db.execute_command(
             f"""
             UPDATE positions
-            SET entry_price = %s,
-                quantity = %s,
-                entry_time = %s,
-                atr_at_entry = %s,
-                stop_price = %s,
-                take_profit_price = %s,
-                trailing_stop = %s,
-                highest_price = %s,
-                mode = %s,
-                status = 'OPEN'
-                {set_state_sql}
+            SET {", ".join(set_clauses)}
             WHERE {where_sql}
             """,
-            (
-                entry_price, quantity, entry_time,
-                atr_at_entry, stop_price, take_profit_price,
-                trailing_stop, highest_price, self.mode,
-                *where_params,
-            ),
+            tuple(params) + tuple(where_params),
         )
 
     def _insert_position_row(
@@ -461,61 +530,116 @@ class PositionRepository:
         highest_price: float,
     ) -> int:
         """신규 포지션 row를 삽입합니다."""
+        entry_date = entry_time.date().isoformat()
+        take_profit_legacy = take_profit_price if take_profit_price is not None else stop_price
+
+        def _append_legacy_columns(columns: List[str], params: List[Any]) -> None:
+            if self._positions_has_state_column:
+                columns.append("state")
+                params.append("ENTERED")
+            if self._positions_has_entry_date_column:
+                columns.append("entry_date")
+                params.append(entry_date)
+            if self._positions_has_stop_loss_column:
+                columns.append("stop_loss")
+                params.append(stop_price)
+            if self._positions_has_take_profit_column:
+                columns.append("take_profit")
+                params.append(take_profit_legacy)
+            if self._positions_has_atr_value_column:
+                columns.append("atr_value")
+                params.append(atr_at_entry)
+            if self._positions_has_atr_column:
+                columns.append("atr")
+                params.append(atr_at_entry)
+
         if self._position_id_required:
             position_id = self._generate_position_id(symbol, entry_time)
-            state_cols_sql = ", state" if self._positions_has_state_column else ""
-            state_vals_sql = ", %s" if self._positions_has_state_column else ""
+            columns = [
+                "position_id",
+                self._positions_symbol_column,
+                "entry_price",
+                "quantity",
+                "entry_time",
+                "atr_at_entry",
+                "stop_price",
+                "take_profit_price",
+                "trailing_stop",
+                "highest_price",
+                "mode",
+                "status",
+            ]
             params: List[Any] = [
                 position_id, symbol,
                 entry_price, quantity, entry_time,
                 atr_at_entry, stop_price, take_profit_price,
-                trailing_stop, highest_price, self.mode,
+                trailing_stop, highest_price, self.mode, "OPEN",
             ]
-            if self._positions_has_state_column:
-                params.append("ENTERED")
+            _append_legacy_columns(columns, params)
+            columns_sql = ", ".join(f"`{col}`" for col in columns)
+            values_sql = ", ".join(["%s"] * len(columns))
             return self.db.execute_command(
                 f"""
                 INSERT INTO positions (
-                    position_id, `{self._positions_symbol_column}`,
-                    entry_price, quantity, entry_time,
-                    atr_at_entry, stop_price, take_profit_price,
-                    trailing_stop, highest_price, mode, status
-                    {state_cols_sql}
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN'{state_vals_sql})
+                    {columns_sql}
+                ) VALUES ({values_sql})
                 """,
                 tuple(params),
             )
 
-        state_cols_sql = ", state" if self._positions_has_state_column else ""
-        state_vals_sql = ", %s" if self._positions_has_state_column else ""
-        state_update_sql = ",\n                state = VALUES(state)" if self._positions_has_state_column else ""
+        columns = [
+            self._positions_symbol_column,
+            "entry_price",
+            "quantity",
+            "entry_time",
+            "atr_at_entry",
+            "stop_price",
+            "take_profit_price",
+            "trailing_stop",
+            "highest_price",
+            "mode",
+            "status",
+        ]
         params: List[Any] = [
             symbol, entry_price, quantity, entry_time,
             atr_at_entry, stop_price, take_profit_price,
-            trailing_stop, highest_price, self.mode,
+            trailing_stop, highest_price, self.mode, "OPEN",
+        ]
+        _append_legacy_columns(columns, params)
+        columns_sql = ", ".join(f"`{col}`" for col in columns)
+        values_sql = ", ".join(["%s"] * len(columns))
+
+        update_assignments = [
+            "entry_price = VALUES(entry_price)",
+            "quantity = VALUES(quantity)",
+            "entry_time = VALUES(entry_time)",
+            "atr_at_entry = VALUES(atr_at_entry)",
+            "stop_price = VALUES(stop_price)",
+            "take_profit_price = VALUES(take_profit_price)",
+            "trailing_stop = VALUES(trailing_stop)",
+            "highest_price = VALUES(highest_price)",
+            "mode = VALUES(mode)",
+            "status = 'OPEN'",
         ]
         if self._positions_has_state_column:
-            params.append("ENTERED")
+            update_assignments.append("state = VALUES(state)")
+        if self._positions_has_entry_date_column:
+            update_assignments.append("entry_date = VALUES(entry_date)")
+        if self._positions_has_stop_loss_column:
+            update_assignments.append("stop_loss = VALUES(stop_loss)")
+        if self._positions_has_take_profit_column:
+            update_assignments.append("take_profit = VALUES(take_profit)")
+        if self._positions_has_atr_value_column:
+            update_assignments.append("atr_value = VALUES(atr_value)")
+        if self._positions_has_atr_column:
+            update_assignments.append("atr = VALUES(atr)")
         return self.db.execute_command(
             f"""
             INSERT INTO positions (
-                `{self._positions_symbol_column}`, entry_price, quantity, entry_time,
-                atr_at_entry, stop_price, take_profit_price,
-                trailing_stop, highest_price, mode, status
-                {state_cols_sql}
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN'{state_vals_sql})
+                {columns_sql}
+            ) VALUES ({values_sql})
             ON DUPLICATE KEY UPDATE
-                entry_price = VALUES(entry_price),
-                quantity = VALUES(quantity),
-                entry_time = VALUES(entry_time),
-                atr_at_entry = VALUES(atr_at_entry),
-                stop_price = VALUES(stop_price),
-                take_profit_price = VALUES(take_profit_price),
-                trailing_stop = VALUES(trailing_stop),
-                highest_price = VALUES(highest_price),
-                mode = VALUES(mode),
-                status = 'OPEN'
-                {state_update_sql}
+                {", ".join(update_assignments)}
             """,
             tuple(params),
         )

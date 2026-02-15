@@ -202,6 +202,11 @@ class TestPositionRepositoryCompatibility:
             [{"column_name": "stock_code"}],  # 컬럼 탐지
             None,  # position_id 메타(없음)
             {"cnt": 0},  # state 컬럼 미존재
+            {"cnt": 0},  # entry_date 컬럼 미존재
+            {"cnt": 0},  # stop_loss 컬럼 미존재
+            {"cnt": 0},  # take_profit 컬럼 미존재
+            {"cnt": 0},  # atr_value 컬럼 미존재
+            {"cnt": 0},  # atr 컬럼 미존재
             {
                 "stock_code": "005930",
                 "entry_price": 70000,
@@ -235,7 +240,7 @@ class TestPositionRepositoryCompatibility:
         assert result.symbol == "005930"
         insert_sql = mock_db.execute_command.call_args[0][0]
         assert "`stock_code`" in insert_sql
-        select_sql = mock_db.execute_query.call_args_list[3][0][0]
+        select_sql = mock_db.execute_query.call_args_list[-1][0][0]
         assert "`stock_code`" in select_sql
 
     def test_upsert_generates_position_id_when_required(self):
@@ -250,6 +255,11 @@ class TestPositionRepositoryCompatibility:
                 "extra": "",
             },
             {"cnt": 1},  # state 컬럼 존재
+            {"cnt": 0},  # entry_date 컬럼 미존재
+            {"cnt": 0},  # stop_loss 컬럼 미존재
+            {"cnt": 0},  # take_profit 컬럼 미존재
+            {"cnt": 0},  # atr_value 컬럼 미존재
+            {"cnt": 0},  # atr 컬럼 미존재
             None,  # existing 조회: 없음
             {  # 최종 get_by_symbol 결과
                 "position_id": "P20250115093000000000_005930",
@@ -289,6 +299,66 @@ class TestPositionRepositoryCompatibility:
         assert str(insert_params[0]).startswith("P")
         assert insert_params[-1] == "ENTERED"
 
+    def test_upsert_includes_detected_legacy_required_columns(self):
+        mock_db = Mock()
+        mock_db.config = Mock(database="kis_trading")
+        mock_db.execute_query.side_effect = [
+            [{"column_name": "stock_code"}],  # 컬럼 탐지
+            {  # position_id 메타(필수, 문자열)
+                "data_type": "varchar",
+                "is_nullable": "NO",
+                "column_default": None,
+                "extra": "",
+            },
+            {"cnt": 1},  # state 컬럼 존재
+            {"cnt": 1},  # entry_date 컬럼 존재
+            {"cnt": 1},  # stop_loss 컬럼 존재
+            {"cnt": 1},  # take_profit 컬럼 존재
+            {"cnt": 1},  # atr_value 컬럼 존재
+            {"cnt": 0},  # atr 컬럼 미존재
+            None,  # existing 조회: 없음
+            {  # 최종 get_by_symbol 결과
+                "position_id": "P20250115093000000000_005930",
+                "stock_code": "005930",
+                "entry_price": 70000,
+                "quantity": 10,
+                "entry_time": datetime(2025, 1, 15, 9, 30, 0),
+                "atr_at_entry": 1500,
+                "stop_price": 67000,
+                "take_profit_price": 75000,
+                "trailing_stop": 67500,
+                "highest_price": 71000,
+                "mode": "PAPER",
+                "status": "OPEN",
+            },
+        ]
+        mock_db.execute_command.return_value = 1
+
+        repo = PositionRepository(db=mock_db)
+        result = repo.upsert_from_account_holding(
+            symbol="005930",
+            entry_price=70000,
+            quantity=10,
+            atr_at_entry=1500,
+            stop_price=67000,
+            take_profit_price=75000,
+            trailing_stop=67500,
+            highest_price=71000,
+            entry_time=datetime(2025, 1, 15, 9, 30, 0),
+        )
+
+        assert result is not None
+        insert_sql = mock_db.execute_command.call_args[0][0]
+        insert_params = mock_db.execute_command.call_args[0][1]
+        assert "position_id" in insert_sql
+        assert "state" in insert_sql
+        assert "entry_date" in insert_sql
+        assert "stop_loss" in insert_sql
+        assert "take_profit" in insert_sql
+        assert "atr_value" in insert_sql
+        assert "2025-01-15" in insert_params
+        assert "ENTERED" in insert_params
+
     def test_detect_position_id_requirement_with_uppercase_metadata(self):
         mock_db = Mock()
         mock_db.config = Mock(database="kis_trading")
@@ -300,6 +370,11 @@ class TestPositionRepositoryCompatibility:
                 "COLUMN_DEFAULT": None,
                 "EXTRA": "",
             },
+            {"cnt": 0},
+            {"cnt": 0},
+            {"cnt": 0},
+            {"cnt": 0},
+            {"cnt": 0},
             {"cnt": 0},
         ]
 
@@ -314,6 +389,11 @@ class TestPositionRepositoryCompatibility:
             [{"column_name": "stock_code"}],  # __init__: symbol 컬럼 탐지
             None,  # __init__: position_id 메타 탐지 실패(미탐지)
             {"cnt": 0},  # __init__: state 컬럼 미존재
+            {"cnt": 0},  # __init__: entry_date 컬럼 미존재
+            {"cnt": 0},  # __init__: stop_loss 컬럼 미존재
+            {"cnt": 0},  # __init__: take_profit 컬럼 미존재
+            {"cnt": 0},  # __init__: atr_value 컬럼 미존재
+            {"cnt": 0},  # __init__: atr 컬럼 미존재
             {  # retry 시 position_id 메타 탐지(대문자 키)
                 "DATA_TYPE": "varchar",
                 "IS_NULLABLE": "NO",
