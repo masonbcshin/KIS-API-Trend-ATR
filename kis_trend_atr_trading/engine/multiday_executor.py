@@ -57,6 +57,7 @@ from utils.position_store import (
 )
 from db.repository import get_position_repository
 from db.mysql import get_db_manager, QueryError
+from core.market_data import MarketDataProvider
 from utils.telegram_notifier import TelegramNotifier, get_telegram_notifier
 from utils.logger import get_logger, TradeLogger
 from utils.market_hours import KST
@@ -123,7 +124,8 @@ class MultidayExecutor:
         order_quantity: int = None,
         risk_manager: RiskManager = None,
         telegram: TelegramNotifier = None,
-        position_store: PositionStore = None
+        position_store: PositionStore = None,
+        market_data_provider: Optional[MarketDataProvider] = None,
     ):
         """
         멀티데이 실행 엔진 초기화
@@ -158,6 +160,7 @@ class MultidayExecutor:
         # 기본 설정
         self.stock_code = stock_code or settings.DEFAULT_STOCK_CODE
         self.order_quantity = order_quantity or settings.ORDER_QUANTITY
+        self.market_data_provider = market_data_provider
         
         # 리스크 매니저
         self.risk_manager = risk_manager or create_risk_manager_from_settings()
@@ -718,6 +721,20 @@ class MultidayExecutor:
     def fetch_market_data(self) -> pd.DataFrame:
         """시장 데이터 조회"""
         try:
+            if self.market_data_provider is not None:
+                bars = self.market_data_provider.get_recent_bars(
+                    stock_code=self.stock_code,
+                    n=100,
+                    timeframe="D",
+                )
+                if not bars:
+                    logger.warning(f"시장 데이터 없음(provider): {self.stock_code}")
+                    return pd.DataFrame()
+                df = pd.DataFrame(bars)
+                if "date" in df.columns:
+                    df = df.sort_values("date").reset_index(drop=True)
+                return df
+
             df = self.api.get_daily_ohlcv(
                 stock_code=self.stock_code,
                 period_type="D"
@@ -740,6 +757,16 @@ class MultidayExecutor:
             tuple: (현재가, 시가)
         """
         try:
+            if self.market_data_provider is not None:
+                current = float(
+                    self.market_data_provider.get_latest_price(self.stock_code) or 0.0
+                )
+                # 멀티데이 전략은 갭 보호를 위해 시가가 필요하므로 provider-only 모드에서는
+                # REST 현재가 응답에서 시가를 보강합니다(전략/주문 파라미터 불변).
+                price_data = self.api.get_current_price(self.stock_code)
+                open_price = float(price_data.get("open_price", 0.0) or 0.0)
+                return current, open_price
+
             price_data = self.api.get_current_price(self.stock_code)
             current = price_data.get("current_price", 0)
             open_price = price_data.get("open_price", 0)

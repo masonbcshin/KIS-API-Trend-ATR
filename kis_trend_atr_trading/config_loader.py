@@ -89,6 +89,13 @@ class BacktestConfig:
 
 
 @dataclass
+class MarketDataConfig:
+    """시장데이터 피드 설정"""
+    data_feed: str = "rest"  # rest|ws
+    ws_timeframe: str = "1m"
+
+
+@dataclass
 class CredentialsConfig:
     """
     인증 정보 설정
@@ -118,6 +125,7 @@ class Config:
     logging: LoggingConfig
     backtest: BacktestConfig
     credentials: CredentialsConfig
+    market_data: MarketDataConfig = field(default_factory=MarketDataConfig)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -260,6 +268,13 @@ class ConfigLoader:
             initial_capital=backtest_raw.get("initial_capital", 10_000_000),
             commission_rate=backtest_raw.get("commission_rate", 0.00015)
         )
+
+        # 시장데이터 피드 설정
+        market_data_raw = raw.get("market_data", {})
+        market_data_config = MarketDataConfig(
+            data_feed=str(market_data_raw.get("data_feed", "rest")),
+            ws_timeframe=str(market_data_raw.get("ws_timeframe", "1m")),
+        )
         
         # ★ 인증 정보는 환경변수에서만 로드 (보안)
         credentials_config = CredentialsConfig(
@@ -278,7 +293,8 @@ class ConfigLoader:
             risk=risk_config,
             logging=logging_config,
             backtest=backtest_config,
-            credentials=credentials_config
+            credentials=credentials_config,
+            market_data=market_data_config,
         )
     
     def _validate_config(self, config: Config) -> None:

@@ -15,6 +15,7 @@ import pandas as pd
 from config import settings
 from api.kis_api import KISApi, KISApiError
 from strategy.trend_atr import TrendATRStrategy, Signal, SignalType
+from core.market_data import MarketDataProvider
 from utils.logger import get_logger, TradeLogger
 from utils.telegram_notifier import TelegramNotifier, get_telegram_notifier
 from engine.risk_manager import (
@@ -56,7 +57,8 @@ class TradingExecutor:
         stock_code: str = None,
         order_quantity: int = None,
         risk_manager: RiskManager = None,
-        telegram_notifier: TelegramNotifier = None
+        telegram_notifier: TelegramNotifier = None,
+        market_data_provider: Optional[MarketDataProvider] = None,
     ):
         """
         거래 실행 엔진 초기화
@@ -73,6 +75,7 @@ class TradingExecutor:
         self.strategy = strategy or TrendATRStrategy()
         self.stock_code = stock_code or settings.DEFAULT_STOCK_CODE
         self.order_quantity = order_quantity or settings.ORDER_QUANTITY
+        self.market_data_provider = market_data_provider
         
         # 리스크 매니저 초기화 (필수!)
         self.risk_manager = risk_manager or create_risk_manager_from_settings()
@@ -113,6 +116,21 @@ class TradingExecutor:
             pd.DataFrame: OHLCV 데이터
         """
         try:
+            if self.market_data_provider is not None:
+                bars = self.market_data_provider.get_recent_bars(
+                    stock_code=self.stock_code,
+                    n=days,
+                    timeframe="D",
+                )
+                if not bars:
+                    logger.warning(f"시장 데이터 없음(provider): {self.stock_code}")
+                    return pd.DataFrame()
+                df = pd.DataFrame(bars)
+                if "date" in df.columns:
+                    df = df.sort_values("date").reset_index(drop=True)
+                logger.debug(f"시장 데이터(provider) 조회 완료: {len(df)}개")
+                return df
+
             df = self.api.get_daily_ohlcv(
                 stock_code=self.stock_code,
                 period_type="D"
@@ -137,6 +155,13 @@ class TradingExecutor:
             float: 현재가 (조회 실패 시 0)
         """
         try:
+            if self.market_data_provider is not None:
+                current_price = float(
+                    self.market_data_provider.get_latest_price(self.stock_code) or 0.0
+                )
+                logger.debug(f"현재가(provider) 조회: {self.stock_code} = {current_price:,.0f}원")
+                return current_price
+
             price_data = self.api.get_current_price(self.stock_code)
             current_price = price_data.get("current_price", 0)
             
