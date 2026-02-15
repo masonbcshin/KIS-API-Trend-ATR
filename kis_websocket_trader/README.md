@@ -1,5 +1,11 @@
 # KIS WebSocket 자동매매 시스템
 
+> DEPRECATED (adapter-only migration)
+>
+> 이 폴더의 독립 실행 경로는 단계적으로 중단됩니다.
+> 한국 주식 트레이딩 실행은 `kis_trend_atr_trading.apps.kr_trade`를 사용하고,
+> WebSocket 기능은 `kis_trend_atr_trading/adapters/kis_ws/`로 흡수되었습니다.
+
 한국투자증권(KIS) WebSocket API를 활용한 실시간 자동매매 시스템입니다.
 
 ## 시스템 개요
