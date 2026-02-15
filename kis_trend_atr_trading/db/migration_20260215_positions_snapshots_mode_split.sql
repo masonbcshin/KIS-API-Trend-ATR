@@ -22,7 +22,14 @@ WHERE table_schema = DATABASE()
 
 SET @sql_positions_mode := CASE
   WHEN @has_positions = 0 THEN "SELECT 'SKIP positions table not found'"
-  WHEN @has_positions_mode = 0 THEN "ALTER TABLE positions ADD COLUMN mode VARCHAR(16) NOT NULL DEFAULT 'PAPER' AFTER highest_price"
+  WHEN @has_positions_mode = 0 AND EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = DATABASE()
+      AND table_name = 'positions'
+      AND column_name = 'highest_price'
+  ) THEN "ALTER TABLE positions ADD COLUMN mode VARCHAR(16) NOT NULL DEFAULT 'PAPER' AFTER highest_price"
+  WHEN @has_positions_mode = 0 THEN "ALTER TABLE positions ADD COLUMN mode VARCHAR(16) NOT NULL DEFAULT 'PAPER'"
   ELSE "SELECT 'SKIP positions.mode already exists'"
 END;
 PREPARE stmt FROM @sql_positions_mode;
@@ -30,7 +37,7 @@ EXECUTE stmt;
 DEALLOCATE PREPARE stmt;
 
 -- =========================
--- 2) positions PK -> (symbol, mode)
+-- 2) positions PK -> (position_id, mode) 또는 (symbol, mode)
 -- =========================
 SELECT GROUP_CONCAT(column_name ORDER BY seq_in_index) INTO @positions_pk_cols
 FROM information_schema.statistics
@@ -38,11 +45,27 @@ WHERE table_schema = DATABASE()
   AND table_name = 'positions'
   AND index_name = 'PRIMARY';
 
+SELECT COUNT(*) INTO @has_positions_position_id
+FROM information_schema.columns
+WHERE table_schema = DATABASE()
+  AND table_name = 'positions'
+  AND column_name = 'position_id';
+
+SELECT COUNT(*) INTO @has_positions_symbol
+FROM information_schema.columns
+WHERE table_schema = DATABASE()
+  AND table_name = 'positions'
+  AND column_name = 'symbol';
+
 SET @sql_positions_pk := CASE
   WHEN @has_positions = 0 THEN "SELECT 'SKIP positions table not found'"
-  WHEN @positions_pk_cols = 'symbol,mode' THEN "SELECT 'SKIP positions PK already (symbol,mode)'"
-  WHEN @positions_pk_cols = 'symbol' THEN "ALTER TABLE positions DROP PRIMARY KEY, ADD PRIMARY KEY (symbol, mode)"
-  WHEN @positions_pk_cols IS NULL THEN "ALTER TABLE positions ADD PRIMARY KEY (symbol, mode)"
+  WHEN @has_positions_position_id > 0 AND @positions_pk_cols = 'position_id,mode' THEN "SELECT 'SKIP positions PK already (position_id,mode)'"
+  WHEN @has_positions_position_id > 0 AND @positions_pk_cols = 'position_id' THEN "ALTER TABLE positions DROP PRIMARY KEY, ADD PRIMARY KEY (position_id, mode)"
+  WHEN @has_positions_position_id > 0 AND @positions_pk_cols IS NULL THEN "ALTER TABLE positions ADD PRIMARY KEY (position_id, mode)"
+  WHEN @has_positions_symbol > 0 AND @positions_pk_cols = 'symbol,mode' THEN "SELECT 'SKIP positions PK already (symbol,mode)'"
+  WHEN @has_positions_symbol > 0 AND @positions_pk_cols = 'symbol' THEN "ALTER TABLE positions DROP PRIMARY KEY, ADD PRIMARY KEY (symbol, mode)"
+  WHEN @has_positions_symbol > 0 AND @positions_pk_cols IS NULL THEN "ALTER TABLE positions ADD PRIMARY KEY (symbol, mode)"
+  WHEN @has_positions_position_id = 0 AND @has_positions_symbol = 0 THEN "SELECT 'SKIP positions target PK columns not found'"
   ELSE "SELECT 'SKIP positions has unexpected PK definition - manual check required'"
 END;
 PREPARE stmt FROM @sql_positions_pk;

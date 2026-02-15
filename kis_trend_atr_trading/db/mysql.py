@@ -824,20 +824,27 @@ class MySQLManager:
 
     def _ensure_primary_keys(self, cursor) -> None:
         """실행 모드 분리를 위한 복합 기본 키를 안전하게 보정합니다."""
-        pk_specs: List[Tuple[str, List[str]]] = [
-            ("positions", ["symbol", "mode"]),
-            ("account_snapshots", ["snapshot_time", "mode"]),
-            ("daily_summary", ["trade_date", "mode"]),
+        pk_specs: List[Tuple[str, List[List[str]]]] = [
+            ("positions", [["position_id", "mode"], ["symbol", "mode"]]),
+            ("account_snapshots", [["snapshot_time", "mode"]]),
+            ("daily_summary", [["trade_date", "mode"]]),
         ]
 
-        for table_name, target_pk_columns in pk_specs:
+        for table_name, target_pk_candidates in pk_specs:
             try:
                 if not self.table_exists(table_name):
                     continue
 
-                if any(not self._column_exists(table_name, col) for col in target_pk_columns):
+                target_pk_columns: Optional[List[str]] = None
+                for candidate in target_pk_candidates:
+                    if all(self._column_exists(table_name, col) for col in candidate):
+                        target_pk_columns = candidate
+                        break
+
+                if not target_pk_columns:
                     logger.warning(
-                        f"[DB] PK 마이그레이션 건너뜀: {table_name} (필수 컬럼 누락: {target_pk_columns})"
+                        f"[DB] PK 마이그레이션 건너뜀: {table_name} "
+                        f"(필수 컬럼 누락: {target_pk_candidates})"
                     )
                     continue
 

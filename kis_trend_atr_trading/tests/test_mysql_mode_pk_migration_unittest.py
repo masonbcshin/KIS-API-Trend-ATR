@@ -20,7 +20,11 @@ def test_ensure_primary_keys_updates_legacy_single_pk_tables():
     cursor = Mock()
 
     manager.table_exists = Mock(return_value=True)
-    manager._column_exists = Mock(return_value=True)
+    manager._column_exists = Mock(
+        side_effect=lambda table_name, column_name: not (
+            table_name == "positions" and column_name == "position_id"
+        )
+    )
     manager._has_duplicate_composite_key = Mock(return_value=False)
     manager._get_primary_key_columns = Mock(
         side_effect=lambda table_name: {
@@ -39,6 +43,28 @@ def test_ensure_primary_keys_updates_legacy_single_pk_tables():
         for sql in executed_sql
     )
     assert all("daily_summary" not in sql for sql in executed_sql)
+
+
+def test_ensure_primary_keys_uses_position_id_when_available():
+    manager = _new_manager()
+    cursor = Mock()
+
+    manager.table_exists = Mock(side_effect=lambda table_name: table_name == "positions")
+    manager._column_exists = Mock(
+        side_effect=lambda table_name, column_name: (
+            table_name == "positions" and column_name in {"position_id", "mode"}
+        )
+    )
+    manager._get_primary_key_columns = Mock(return_value=["position_id"])
+    manager._has_duplicate_composite_key = Mock(return_value=False)
+
+    manager._ensure_primary_keys(cursor)
+
+    executed_sql = [args[0] for args, _ in cursor.execute.call_args_list]
+    assert any(
+        "ALTER TABLE `positions` DROP PRIMARY KEY, ADD PRIMARY KEY (`position_id`, `mode`)" in sql
+        for sql in executed_sql
+    )
 
 
 def test_ensure_primary_keys_skips_when_duplicate_composite_key_exists():
