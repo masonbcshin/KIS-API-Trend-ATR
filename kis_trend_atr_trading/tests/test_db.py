@@ -170,6 +170,72 @@ class TestPositionRecord:
         assert record.entry_price == 70000.0
         assert record.quantity == 10
 
+    def test_from_dict_with_stock_code(self):
+        """구스키마(stock_code) 딕셔너리 생성 테스트"""
+        data = {
+            "stock_code": "005930",
+            "entry_price": 70000,
+            "quantity": 10,
+            "entry_time": datetime(2025, 1, 15, 9, 30, 0),
+            "atr_at_entry": 1500,
+            "stop_price": 67000,
+            "take_profit_price": 75000,
+            "trailing_stop": 67500,
+            "highest_price": 71000,
+            "status": "OPEN"
+        }
+
+        record = PositionRecord.from_dict(data)
+
+        assert record.symbol == "005930"
+        assert record.entry_price == 70000.0
+        assert record.quantity == 10
+
+
+class TestPositionRepositoryCompatibility:
+    """positions symbol/stock_code 호환 테스트"""
+
+    def test_upsert_uses_stock_code_when_symbol_missing(self):
+        mock_db = Mock()
+        mock_db.config = Mock(database="kis_trading")
+        mock_db.execute_query.side_effect = [
+            [{"column_name": "stock_code"}],  # 컬럼 탐지
+            {
+                "stock_code": "005930",
+                "entry_price": 70000,
+                "quantity": 10,
+                "entry_time": datetime(2025, 1, 15, 9, 30, 0),
+                "atr_at_entry": 1500,
+                "stop_price": 67000,
+                "take_profit_price": 75000,
+                "trailing_stop": 67500,
+                "highest_price": 71000,
+                "mode": "PAPER",
+                "status": "OPEN",
+            },
+        ]
+        mock_db.execute_command.return_value = 1
+
+        repo = PositionRepository(db=mock_db)
+        result = repo.upsert_from_account_holding(
+            symbol="005930",
+            entry_price=70000,
+            quantity=10,
+            atr_at_entry=1500,
+            stop_price=67000,
+            take_profit_price=75000,
+            trailing_stop=67500,
+            highest_price=71000,
+            entry_time=datetime(2025, 1, 15, 9, 30, 0),
+        )
+
+        assert result is not None
+        assert result.symbol == "005930"
+        insert_sql = mock_db.execute_command.call_args[0][0]
+        assert "`stock_code`" in insert_sql
+        select_sql = mock_db.execute_query.call_args_list[1][0][0]
+        assert "`stock_code`" in select_sql
+
 
 class TestTradeRecord:
     """TradeRecord 테스트"""

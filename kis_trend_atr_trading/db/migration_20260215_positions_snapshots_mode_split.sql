@@ -57,6 +57,12 @@ WHERE table_schema = DATABASE()
   AND table_name = 'positions'
   AND column_name = 'symbol';
 
+SELECT COUNT(*) INTO @has_positions_stock_code
+FROM information_schema.columns
+WHERE table_schema = DATABASE()
+  AND table_name = 'positions'
+  AND column_name = 'stock_code';
+
 SET @sql_positions_pk := CASE
   WHEN @has_positions = 0 THEN "SELECT 'SKIP positions table not found'"
   WHEN @has_positions_position_id > 0 AND @positions_pk_cols = 'position_id,mode' THEN "SELECT 'SKIP positions PK already (position_id,mode)'"
@@ -65,7 +71,10 @@ SET @sql_positions_pk := CASE
   WHEN @has_positions_symbol > 0 AND @positions_pk_cols = 'symbol,mode' THEN "SELECT 'SKIP positions PK already (symbol,mode)'"
   WHEN @has_positions_symbol > 0 AND @positions_pk_cols = 'symbol' THEN "ALTER TABLE positions DROP PRIMARY KEY, ADD PRIMARY KEY (symbol, mode)"
   WHEN @has_positions_symbol > 0 AND @positions_pk_cols IS NULL THEN "ALTER TABLE positions ADD PRIMARY KEY (symbol, mode)"
-  WHEN @has_positions_position_id = 0 AND @has_positions_symbol = 0 THEN "SELECT 'SKIP positions target PK columns not found'"
+  WHEN @has_positions_stock_code > 0 AND @positions_pk_cols = 'stock_code,mode' THEN "SELECT 'SKIP positions PK already (stock_code,mode)'"
+  WHEN @has_positions_stock_code > 0 AND @positions_pk_cols = 'stock_code' THEN "ALTER TABLE positions DROP PRIMARY KEY, ADD PRIMARY KEY (stock_code, mode)"
+  WHEN @has_positions_stock_code > 0 AND @positions_pk_cols IS NULL THEN "ALTER TABLE positions ADD PRIMARY KEY (stock_code, mode)"
+  WHEN @has_positions_position_id = 0 AND @has_positions_symbol = 0 AND @has_positions_stock_code = 0 THEN "SELECT 'SKIP positions target PK columns not found'"
   ELSE "SELECT 'SKIP positions has unexpected PK definition - manual check required'"
 END;
 PREPARE stmt FROM @sql_positions_pk;

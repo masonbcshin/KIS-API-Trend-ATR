@@ -831,7 +831,7 @@ class MySQLManager:
     def _ensure_primary_keys(self, cursor) -> None:
         """실행 모드 분리를 위한 복합 기본 키를 안전하게 보정합니다."""
         pk_specs: List[Tuple[str, List[List[str]]]] = [
-            ("positions", [["position_id", "mode"], ["symbol", "mode"]]),
+            ("positions", [["position_id", "mode"], ["symbol", "mode"], ["stock_code", "mode"]]),
             ("account_snapshots", [["snapshot_time", "mode"]]),
             ("daily_summary", [["trade_date", "mode"]]),
         ]

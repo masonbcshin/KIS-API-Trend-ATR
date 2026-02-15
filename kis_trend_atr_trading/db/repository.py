@@ -108,8 +108,11 @@ class PositionRecord:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "PositionRecord":
         """딕셔너리에서 생성"""
+        symbol = data.get("symbol")
+        if symbol is None:
+            symbol = data.get("stock_code")
         return cls(
-            symbol=data["symbol"],
+            symbol=str(symbol or ""),
             entry_price=float(data["entry_price"]),
             quantity=int(data["quantity"]),
             entry_time=data["entry_time"],
@@ -261,7 +264,45 @@ class PositionRepository:
         """
         self.db = db or get_db_manager()
         self.mode = _get_namespace_mode()
-    
+        self._positions_symbol_column = self._detect_positions_symbol_column()
+
+    def _detect_positions_symbol_column(self) -> str:
+        """
+        positions 테이블의 종목 컬럼을 탐지합니다.
+
+        우선순위:
+            1) symbol (현행)
+            2) stock_code (구스키마 호환)
+        """
+        default_col = "symbol"
+        try:
+            database_name = getattr(getattr(self.db, "config", None), "database", None)
+            if not database_name:
+                return default_col
+
+            rows = self.db.execute_query(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = %s
+                  AND table_name = 'positions'
+                  AND column_name IN ('symbol', 'stock_code')
+                """,
+                (database_name,),
+            )
+            names = {
+                str(row.get("column_name") or row.get("COLUMN_NAME")).lower()
+                for row in (rows or [])
+            }
+            if "symbol" in names:
+                return "symbol"
+            if "stock_code" in names:
+                logger.warning("[REPO] positions 컬럼 호환 모드 활성화: stock_code 사용")
+                return "stock_code"
+        except Exception as e:
+            logger.warning(f"[REPO] positions 컬럼 탐지 실패(기본 symbol 사용): {e}")
+        return default_col
+
     def save(
         self,
         symbol: str,
@@ -308,9 +349,9 @@ class PositionRepository:
             # MySQL INSERT ... ON DUPLICATE KEY UPDATE
             # ★ PostgreSQL의 ON CONFLICT 대체
             self.db.execute_command(
-                """
+                f"""
                 INSERT INTO positions (
-                    symbol, entry_price, quantity, entry_time,
+                    `{self._positions_symbol_column}`, entry_price, quantity, entry_time,
                     atr_at_entry, stop_price, take_profit_price,
                     trailing_stop, highest_price, mode, status
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN')
@@ -370,9 +411,9 @@ class PositionRepository:
 
         try:
             self.db.execute_command(
-                """
+                f"""
                 INSERT INTO positions (
-                    symbol, entry_price, quantity, entry_time,
+                    `{self._positions_symbol_column}`, entry_price, quantity, entry_time,
                     atr_at_entry, stop_price, take_profit_price,
                     trailing_stop, highest_price, mode, status
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN')
@@ -410,7 +451,7 @@ class PositionRepository:
             PositionRecord: 포지션 (없으면 None)
         """
         result = self.db.execute_query(
-            "SELECT * FROM positions WHERE symbol = %s AND mode = %s",
+            f"SELECT * FROM positions WHERE `{self._positions_symbol_column}` = %s AND mode = %s",
             (symbol, self.mode),
             fetch_one=True
         )
@@ -453,7 +494,7 @@ class PositionRepository:
         """
         if symbol:
             result = self.db.execute_query(
-                "SELECT COUNT(*) as cnt FROM positions WHERE symbol = %s AND status = 'OPEN' AND mode = %s",
+                f"SELECT COUNT(*) as cnt FROM positions WHERE `{self._positions_symbol_column}` = %s AND status = 'OPEN' AND mode = %s",
                 (symbol, self.mode),
                 fetch_one=True
             )
@@ -485,10 +526,10 @@ class PositionRepository:
         """
         try:
             affected = self.db.execute_command(
-                """
+                f"""
                 UPDATE positions 
                 SET trailing_stop = %s, highest_price = %s
-                WHERE symbol = %s AND status = 'OPEN' AND mode = %s
+                WHERE `{self._positions_symbol_column}` = %s AND status = 'OPEN' AND mode = %s
                 """,
                 (trailing_stop, highest_price, symbol, self.mode)
             )
@@ -517,10 +558,10 @@ class PositionRepository:
         """
         try:
             affected = self.db.execute_command(
-                """
+                f"""
                 UPDATE positions 
                 SET status = 'CLOSED'
-                WHERE symbol = %s AND status = 'OPEN' AND mode = %s
+                WHERE `{self._positions_symbol_column}` = %s AND status = 'OPEN' AND mode = %s
                 """,
                 (symbol, self.mode)
             )
@@ -548,7 +589,7 @@ class PositionRepository:
         """
         try:
             affected = self.db.execute_command(
-                "DELETE FROM positions WHERE symbol = %s AND mode = %s",
+                f"DELETE FROM positions WHERE `{self._positions_symbol_column}` = %s AND mode = %s",
                 (symbol, self.mode)
             )
             return affected > 0
