@@ -14,6 +14,20 @@
 
 ---
 
+## 통합 엔트리포인트 (신규)
+
+- 운영: `python -m kis_trend_atr_trading.apps.kr_trade --mode trade --feed rest`
+- 운영(WS): `python -m kis_trend_atr_trading.apps.kr_trade --mode trade --feed ws`
+- CBT: `python -m kis_trend_atr_trading.apps.kr_cbt --mode cbt`
+
+호환성 유지:
+
+- 기존 `main.py`, `main_v2.py`, `main_v3.py`, `main_multiday.py`, `main_cbt.py`는
+  deprecated thin wrapper로 유지되며 기존 커맨드는 계속 실행 가능합니다.
+- 내부 구현은 `deprecated/legacy_main*.py`로 보존됩니다.
+
+---
+
 ## 1️⃣ 시스템 개요
 
 ### 전략 개요 (Trend + ATR)
@@ -115,8 +129,9 @@ selection_method:
 - 단일 인스턴스 락 확인
 - `order_state`에서 `PENDING/SUBMITTED/PARTIAL` 조회
 - 포지션 복원:
-  - PAPER: 저장 파일(`positions.json`) 기준
+  - PAPER: 모의계좌 보유 조회 + 저장 데이터 대조 + DB 포지션 동기화
   - REAL: 실계좌 보유 조회 + 저장 데이터 대조 + DB 포지션 동기화
+  - 불일치 발생 시 API 계좌 기준 자동복구(저장 보정/정리) 후 텔레그램 알림
 
 ---
 
