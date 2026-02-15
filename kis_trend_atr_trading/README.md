@@ -143,13 +143,14 @@ selection_method:
 
 - 구현 상태: 사용 중
 - 동작: `stocks` 목록에서 순서 유지, `max_stocks`까지만 사용
+- 설정 위치: `universe.stocks` 권장, 하위호환으로 루트 `stocks`도 지원(동시 존재 시 `universe.stocks` 우선)
 - 회귀 테스트: `tests/test_universe_selector_unittest.py`
 
 ### volume_top
 
 - 구현 상태: 사용 중
 - 풀 모드:
-  - `candidate_pool_mode=yaml`(restricted): `candidate_stocks` 또는 `stocks` 내부에서만 정렬
+  - `candidate_pool_mode=yaml`(restricted): `candidate_stocks` 또는 `stocks` 내부에서만 정렬 (`universe.stocks` 우선, 루트 `stocks` 하위호환)
 - `candidate_pool_mode=market`: 시장 후보군 스캔(가능하면 API universe, 없으면 KOSPI200 대체)
 - `market_scan_size`: market 모드에서 실제 스캔할 후보군 상한 (combined 1차에도 동일 적용)
 - 1차 후보: 풀 모드별 후보군
@@ -364,6 +365,7 @@ selection_method:
 ### 에러 알림
 
 - ERROR 경로에서 Telegram 알림 전송 (`notify_error`)
+- 예외: 시작 시 `positions` 계좌→DB 재동기화 중 개별 upsert 실패는 소프트 실패로 처리되어 로그 경고(`포지션 저장 실패/보류`)만 남고 Telegram ERROR는 전송하지 않음
 - Slack 연동은 현재 코드 경로에 없음
 
 ### 종목명 해석/캐시 (Telegram)
