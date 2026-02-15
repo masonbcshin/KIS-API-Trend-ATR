@@ -766,6 +766,109 @@ class MySQLManager:
                     f"[DB] 컬럼 마이그레이션 건너뜀: {table_name}.{column_name} ({e})"
                 )
 
+        # 구버전 positions 스키마(stock_code/stop_loss/take_profit 등) 호환 보정
+        self._ensure_positions_compat_columns(cursor)
+
+    def _ensure_positions_compat_columns(self, cursor) -> None:
+        """구버전 positions 컬럼을 최신 컬럼명으로 보정합니다."""
+        try:
+            if not self.table_exists("positions"):
+                return
+        except Exception:
+            return
+
+        compat_column_specs = [
+            ("entry_time", "DATETIME NULL"),
+            ("atr_at_entry", "DECIMAL(15, 2) NULL"),
+            ("stop_price", "DECIMAL(15, 2) NULL"),
+            ("take_profit_price", "DECIMAL(15, 2) NULL"),
+            ("trailing_stop", "DECIMAL(15, 2) NULL"),
+            ("highest_price", "DECIMAL(15, 2) NULL"),
+        ]
+
+        for column_name, column_ddl in compat_column_specs:
+            try:
+                if self._column_exists("positions", column_name):
+                    continue
+                cursor.execute(
+                    f"ALTER TABLE positions ADD COLUMN {column_name} {column_ddl}"
+                )
+                logger.info(f"[DB] positions 호환 컬럼 추가: {column_name}")
+            except MySQLError as e:
+                logger.warning(f"[DB] positions 호환 컬럼 추가 건너뜀: {column_name} ({e})")
+
+        # legacy -> latest 컬럼 값 복사 (존재하는 경우에만 수행)
+        self._copy_positions_column(cursor, "stop_price", "stop_loss")
+        self._copy_positions_column(cursor, "take_profit_price", "take_profit")
+        self._copy_positions_column(cursor, "atr_at_entry", "atr")
+        self._copy_positions_column(cursor, "atr_at_entry", "atr_value")
+        self._copy_positions_entry_time(cursor)
+
+        # 기본값 보강 (legacy 스키마에서 파생 불가한 경우)
+        try:
+            if self._column_exists("positions", "highest_price") and self._column_exists("positions", "entry_price"):
+                cursor.execute(
+                    """
+                    UPDATE positions
+                    SET highest_price = entry_price
+                    WHERE highest_price IS NULL
+                      AND entry_price IS NOT NULL
+                    """
+                )
+        except MySQLError as e:
+            logger.warning(f"[DB] positions highest_price 기본값 보강 건너뜀: {e}")
+
+        try:
+            if self._column_exists("positions", "trailing_stop") and self._column_exists("positions", "stop_price"):
+                cursor.execute(
+                    """
+                    UPDATE positions
+                    SET trailing_stop = stop_price
+                    WHERE trailing_stop IS NULL
+                      AND stop_price IS NOT NULL
+                    """
+                )
+        except MySQLError as e:
+            logger.warning(f"[DB] positions trailing_stop 기본값 보강 건너뜀: {e}")
+
+    def _copy_positions_column(self, cursor, target_col: str, source_col: str) -> None:
+        """positions의 legacy 컬럼 값을 최신 컬럼으로 복사합니다."""
+        try:
+            if not self._column_exists("positions", target_col):
+                return
+            if not self._column_exists("positions", source_col):
+                return
+            cursor.execute(
+                f"""
+                UPDATE positions
+                SET `{target_col}` = `{source_col}`
+                WHERE `{target_col}` IS NULL
+                  AND `{source_col}` IS NOT NULL
+                """
+            )
+        except MySQLError as e:
+            logger.warning(f"[DB] positions 컬럼 복사 건너뜀: {source_col} -> {target_col} ({e})")
+
+    def _copy_positions_entry_time(self, cursor) -> None:
+        """entry_date(legacy) 값을 entry_time(latest)으로 복사합니다."""
+        try:
+            if not self._column_exists("positions", "entry_time"):
+                return
+            if not self._column_exists("positions", "entry_date"):
+                return
+            cursor.execute(
+                """
+                UPDATE positions
+                SET entry_time = CASE
+                    WHEN entry_date IS NULL THEN entry_time
+                    ELSE CONCAT(entry_date, ' 09:00:00')
+                END
+                WHERE entry_time IS NULL
+                """
+            )
+        except MySQLError as e:
+            logger.warning(f"[DB] positions 컬럼 복사 건너뜀: entry_date -> entry_time ({e})")
+
     def _ensure_indexes(self, cursor) -> None:
         """필수 인덱스를 존재할 때만 안전하게 생성합니다."""
         index_specs = [

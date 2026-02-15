@@ -459,6 +459,45 @@ class TestMySQLSpecificFeatures:
         
         assert config.autocommit == False
 
+    def test_positions_compat_columns_migrate_stop_loss(self):
+        """구스키마 stop_loss -> stop_price 보정 SQL 실행 테스트"""
+        manager = MySQLManager()
+        manager.table_exists = Mock(return_value=True)
+
+        existing_cols = {
+            "stop_loss",
+            "take_profit",
+            "entry_date",
+            "entry_price",
+            "atr_value",
+        }
+
+        def _column_exists(table_name, column_name):
+            return table_name == "positions" and column_name in existing_cols
+
+        manager._column_exists = Mock(side_effect=_column_exists)
+
+        executed_sql = []
+        cursor = Mock()
+
+        def _execute(sql):
+            executed_sql.append(sql)
+            sql_upper = " ".join(str(sql).upper().split())
+            if "ALTER TABLE POSITIONS ADD COLUMN" in sql_upper:
+                # "ADD COLUMN <name> ..." 패턴에서 컬럼명 추출
+                parts = str(sql).replace("\n", " ").split()
+                if "COLUMN" in parts:
+                    idx = parts.index("COLUMN")
+                    if idx + 1 < len(parts):
+                        existing_cols.add(parts[idx + 1].strip("`"))
+
+        cursor.execute.side_effect = _execute
+
+        manager._ensure_positions_compat_columns(cursor)
+
+        assert any("ADD COLUMN stop_price" in sql for sql in executed_sql)
+        assert any("SET `stop_price` = `stop_loss`" in sql for sql in executed_sql)
+
 
 # 실행 시 환경 복원
 @pytest.fixture(autouse=True)
