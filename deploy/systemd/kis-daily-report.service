@@ -1,0 +1,15 @@
+[Unit]
+Description=KIS Trend-ATR Daily Report Sender
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/path/to/repo
+EnvironmentFile=/path/to/repo/.env
+ExecStart=/path/to/repo/.venv/bin/python /path/to/repo/tools/daily_report.py --timezone Asia/Seoul
+StandardOutput=append:/path/to/repo/logs/report.log
+StandardError=append:/path/to/repo/logs/report.log
+
+[Install]
+WantedBy=multi-user.target

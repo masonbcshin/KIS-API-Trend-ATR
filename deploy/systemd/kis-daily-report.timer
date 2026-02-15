@@ -1,0 +1,10 @@
+[Unit]
+Description=Run KIS daily report at 16:05 (Mon-Fri)
+
+[Timer]
+OnCalendar=Mon..Fri 16:05:00
+Persistent=true
+Unit=kis-daily-report.service
+
+[Install]
+WantedBy=timers.target
