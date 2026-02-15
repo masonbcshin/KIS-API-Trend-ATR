@@ -45,8 +45,8 @@
 --    - status: OPEN(들고있음) / CLOSED(다 팔았음)
 --
 CREATE TABLE IF NOT EXISTS positions (
-    -- 기본 키: 종목 코드 (한 종목에 하나의 포지션만 가질 수 있음)
-    symbol VARCHAR(20) NOT NULL PRIMARY KEY COMMENT '종목 코드',
+    -- 기본 키: 종목 코드 + 모드 (DRY_RUN/PAPER/REAL 분리)
+    symbol VARCHAR(20) NOT NULL COMMENT '종목 코드',
     
     -- 진입 정보 ────────────────────────────────────────
     entry_price DECIMAL(15, 2) NOT NULL COMMENT '매수 평균가',
@@ -63,7 +63,7 @@ CREATE TABLE IF NOT EXISTS positions (
     take_profit_price DECIMAL(15, 2) NULL COMMENT '익절가 (이 가격 이상이면 익절, NULL 가능)',
     trailing_stop DECIMAL(15, 2) NULL COMMENT '트레일링 스탑 (최고가 기준으로 움직임)',
     highest_price DECIMAL(15, 2) NULL COMMENT '보유 중 최고가 (트레일링 계산용)',
-    mode VARCHAR(16) NOT NULL DEFAULT 'PAPER' COMMENT '실행 모드 네임스페이스 (PAPER/REAL)',
+    mode VARCHAR(16) NOT NULL DEFAULT 'PAPER' COMMENT '실행 모드 네임스페이스 (DRY_RUN/PAPER/REAL)',
     
     -- 상태 ─────────────────────────────────────────────
     -- OPEN: 현재 보유 중
@@ -72,7 +72,8 @@ CREATE TABLE IF NOT EXISTS positions (
     
     -- 메타 정보 ─────────────────────────────────────────
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '생성 시간',
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '수정 시간'
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '수정 시간',
+    PRIMARY KEY (symbol, mode)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='현재 보유 중인 포지션 정보. 서버 재시작 시 복구용.';
 
 -- 상태별 조회를 빠르게 하기 위한 인덱스
@@ -126,7 +127,7 @@ CREATE TABLE IF NOT EXISTS trades (
     
     -- 메타 정보 ─────────────────────────────────────────
     order_no VARCHAR(50) NULL COMMENT '주문번호 (KIS API 응답값)',
-    mode VARCHAR(16) NOT NULL DEFAULT 'PAPER' COMMENT '실행 모드 네임스페이스 (PAPER/REAL)',
+    mode VARCHAR(16) NOT NULL DEFAULT 'PAPER' COMMENT '실행 모드 네임스페이스 (DRY_RUN/PAPER/REAL)',
     idempotency_key VARCHAR(128) NOT NULL COMMENT '중복 주문 방지 키',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '생성 시간'
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='모든 매수/매도 거래 기록. 성과 분석 및 히스토리 추적용.';
@@ -159,21 +160,22 @@ CREATE INDEX idx_trades_date ON trades((DATE(executed_at)));
 --    - realized_pnl: 실현 손익 (판 주식의 손익 합계)
 --
 CREATE TABLE IF NOT EXISTS account_snapshots (
-    -- 기본 키: 스냅샷 시간 (1분에 하나씩만)
-    snapshot_time DATETIME NOT NULL PRIMARY KEY COMMENT '스냅샷 시간',
+    -- 기본 키: 스냅샷 시간 + 모드 (DRY_RUN/PAPER/REAL 분리)
+    snapshot_time DATETIME NOT NULL COMMENT '스냅샷 시간',
     
     -- 자산 정보 ────────────────────────────────────────
     total_equity DECIMAL(15, 2) NOT NULL COMMENT '총 평가금액',
     cash DECIMAL(15, 2) NOT NULL COMMENT '현금',
     unrealized_pnl DECIMAL(15, 2) DEFAULT 0 COMMENT '미실현 손익',
     realized_pnl DECIMAL(15, 2) DEFAULT 0 COMMENT '실현 손익 (누적)',
-    mode VARCHAR(16) NOT NULL DEFAULT 'PAPER' COMMENT '실행 모드 네임스페이스 (PAPER/REAL)',
+    mode VARCHAR(16) NOT NULL DEFAULT 'PAPER' COMMENT '실행 모드 네임스페이스 (DRY_RUN/PAPER/REAL)',
     
     -- 포지션 정보 ───────────────────────────────────────
     position_count INT DEFAULT 0 COMMENT '보유 포지션 수',
     
     -- 메타 정보 ─────────────────────────────────────────
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '생성 시간'
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '생성 시간',
+    PRIMARY KEY (snapshot_time, mode)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='특정 시점의 계좌 상태 기록. 자산 변화 추적 및 성과 분석용.';
 
 -- 날짜별 조회를 위한 인덱스
@@ -232,8 +234,9 @@ CREATE INDEX idx_order_state_order_no ON order_state(order_no);
 --    - 텔레그램 일일 리포트 전송용
 --
 CREATE TABLE IF NOT EXISTS daily_summary (
-    -- 기본 키: 날짜
-    trade_date DATE NOT NULL PRIMARY KEY COMMENT '거래 날짜',
+    -- 기본 키: 날짜 + 모드 (DRY_RUN/PAPER/REAL 분리)
+    trade_date DATE NOT NULL COMMENT '거래 날짜',
+    mode VARCHAR(16) NOT NULL DEFAULT 'PAPER' COMMENT 'DB 네임스페이스 모드 (DRY_RUN/PAPER/REAL)',
     
     -- 거래 요약 ────────────────────────────────────────
     total_trades INT DEFAULT 0 COMMENT '총 거래 횟수',
@@ -256,8 +259,11 @@ CREATE TABLE IF NOT EXISTS daily_summary (
     
     -- 메타 정보 ─────────────────────────────────────────
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '생성 시간',
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '수정 시간'
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '수정 시간',
+    PRIMARY KEY (trade_date, mode)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='일별 거래 요약. 빠른 리포트 생성용.';
+
+CREATE INDEX idx_daily_summary_mode_date ON daily_summary(mode, trade_date);
 
 
 -- ═══════════════════════════════════════════════════════════════════════════════

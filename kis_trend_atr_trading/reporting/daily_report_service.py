@@ -13,7 +13,7 @@ from datetime import date
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from db.mysql import MySQLManager, get_db_manager
-from env import get_trading_mode
+from env import get_db_namespace_mode
 from utils.logger import get_logger
 from utils.symbol_resolver import SymbolResolver, get_symbol_resolver
 from utils.telegram_notifier import TelegramNotifier, get_telegram_notifier
@@ -75,7 +75,7 @@ class DailyReportService:
         self._db = db or get_db_manager()
         self._notifier = notifier or get_telegram_notifier()
         self._symbol_resolver = symbol_resolver or get_symbol_resolver()
-        self._mode = mode or get_trading_mode()
+        self._mode = mode or get_db_namespace_mode()
 
     @staticmethod
     def calculate_trade_metrics(trades: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
@@ -130,7 +130,7 @@ class DailyReportService:
         start_equity, end_equity = self._get_equity_bounds(trade_date)
 
         source = "trades"
-        if persist_daily_summary and self._daily_summary_exists():
+        if persist_daily_summary and self._daily_summary_mode_isolated():
             self._upsert_daily_summary(
                 trade_date=trade_date,
                 metrics=computed,
@@ -146,6 +146,18 @@ class DailyReportService:
         realized_pnl_pct = None
         if start_equity and start_equity != 0:
             realized_pnl_pct = (realized_pnl / start_equity) * 100.0
+
+        unrealized_pnl: Optional[float] = None
+        try:
+            unrealized_pnl = self._get_unrealized_pnl()
+        except Exception as err:
+            logger.warning(f"[REPORT] 미실현손익 조회 실패 - N/A 처리: {err}")
+
+        risk_events: List[str] = []
+        try:
+            risk_events = self._load_risk_events(trade_date)
+        except Exception as err:
+            logger.warning(f"[REPORT] 리스크 이벤트 조회 실패 - 빈 목록 처리: {err}")
 
         return DailyReportResult(
             trade_date=trade_date,
@@ -163,9 +175,9 @@ class DailyReportService:
             avg_loss=self._to_float_or_none(computed.get("avg_loss")),
             start_equity=self._to_float_or_none(start_equity),
             end_equity=self._to_float_or_none(end_equity),
-            unrealized_pnl=self._get_unrealized_pnl(),
+            unrealized_pnl=unrealized_pnl,
             top_symbols=self._build_symbol_summaries(trades),
-            risk_events=self._load_risk_events(trade_date),
+            risk_events=risk_events,
         )
 
     def render_message(
@@ -329,13 +341,28 @@ class DailyReportService:
         if not self._positions_has_unrealized_columns():
             return None
 
+        position_columns = self._get_table_columns("positions")
+        where_clauses: List[str] = []
+        params: List[Any] = []
+
+        # 구버전 테이블 호환: 컬럼이 있는 경우에만 조건을 추가합니다.
+        if "status" in position_columns:
+            where_clauses.append("status IN ('OPEN', 'ENTERED')")
+        if "mode" in position_columns:
+            where_clauses.append("mode = %s")
+            params.append(self._mode)
+
+        where_sql = ""
+        if where_clauses:
+            where_sql = "WHERE " + " AND ".join(where_clauses)
+
         rows = self._db.execute_query(
-            """
-            SELECT symbol, unrealized_pnl
+            f"""
+            SELECT unrealized_pnl
             FROM positions
-            WHERE status IN ('OPEN', 'ENTERED') AND mode = %s
+            {where_sql}
             """,
-            (self._mode,),
+            tuple(params) if params else None,
         )
         rows = rows or []
         if not rows:
@@ -361,6 +388,18 @@ class DailyReportService:
             fetch_one=True,
         )
         return int((result or {}).get("cnt", 0) or 0) >= 2
+
+    def _get_table_columns(self, table_name: str) -> set:
+        db_name = self._get_db_name()
+        rows = self._db.execute_query(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s
+            """,
+            (db_name, table_name),
+        )
+        return {str(row.get("column_name") or "").lower() for row in (rows or [])}
 
     def _load_risk_events(self, trade_date: date) -> List[str]:
         events: List[str] = []
@@ -423,16 +462,39 @@ class DailyReportService:
     def _daily_summary_exists(self) -> bool:
         return self._db.table_exists("daily_summary")
 
+    def _daily_summary_mode_isolated(self) -> bool:
+        if not self._daily_summary_exists():
+            return False
+
+        columns = self._get_table_columns("daily_summary")
+        if "mode" not in columns:
+            return False
+
+        db_name = self._get_db_name()
+        pk_rows = self._db.execute_query(
+            """
+            SELECT column_name
+            FROM information_schema.key_column_usage
+            WHERE table_schema = %s
+              AND table_name = 'daily_summary'
+              AND constraint_name = 'PRIMARY'
+            ORDER BY ordinal_position
+            """,
+            (db_name,),
+        )
+        pk_columns = [str(row.get("column_name") or "").lower() for row in (pk_rows or [])]
+        return pk_columns == ["trade_date", "mode"]
+
     def _get_daily_summary_row(self, trade_date: date) -> Optional[Dict[str, Any]]:
         return self._db.execute_query(
             """
-            SELECT trade_date, total_trades, buy_count, sell_count,
+            SELECT trade_date, mode, total_trades, buy_count, sell_count,
                    realized_pnl, win_count, loss_count, win_rate,
                    max_profit, max_loss, start_equity, end_equity
             FROM daily_summary
-            WHERE trade_date = %s
+            WHERE trade_date = %s AND mode = %s
             """,
-            (trade_date,),
+            (trade_date, self._mode),
             fetch_one=True,
         )
 
@@ -446,12 +508,13 @@ class DailyReportService:
         self._db.execute_command(
             """
             INSERT INTO daily_summary (
-                trade_date, total_trades, buy_count, sell_count,
+                trade_date, mode, total_trades, buy_count, sell_count,
                 realized_pnl, win_count, loss_count, win_rate,
                 max_profit, max_loss, start_equity, end_equity
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
+                mode = VALUES(mode),
                 total_trades = VALUES(total_trades),
                 buy_count = VALUES(buy_count),
                 sell_count = VALUES(sell_count),
@@ -466,6 +529,7 @@ class DailyReportService:
             """,
             (
                 trade_date,
+                self._mode,
                 int(metrics.get("total_trades", 0) or 0),
                 int(metrics.get("buy_count", 0) or 0),
                 int(metrics.get("sell_count", 0) or 0),

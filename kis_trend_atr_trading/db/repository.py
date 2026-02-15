@@ -45,15 +45,15 @@ import threading
 from db.mysql import MySQLManager, get_db_manager, QueryError
 from utils.logger import get_logger
 from utils.market_hours import KST, get_today
-from env import get_trading_mode
+from env import get_db_namespace_mode
 
 logger = get_logger("repository")
 
 
 def _get_namespace_mode() -> str:
-    """DB 네임스페이스용 모드를 반환합니다 (PAPER/REAL)."""
+    """DB 네임스페이스용 모드를 반환합니다 (DRY_RUN/PAPER/REAL)."""
     try:
-        return get_trading_mode()
+        return get_db_namespace_mode()
     except Exception:
         return "PAPER"
 

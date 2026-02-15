@@ -54,9 +54,11 @@ class Environment(Enum):
 
 # 환경 변수 이름
 TRADING_MODE_ENV_VAR = "TRADING_MODE"
+EXECUTION_MODE_ENV_VAR = "EXECUTION_MODE"
 
 # 허용 모드 (정식)
 ALLOWED_TRADING_MODES = {"PAPER", "REAL"}
+ALLOWED_DB_NAMESPACE_MODES = {"DRY_RUN", "PAPER", "REAL"}
 
 # 하위 호환 모드 매핑
 LEGACY_MODE_MAP = {
@@ -69,6 +71,7 @@ LEGACY_MODE_MAP = {
 
 # 기본값: PAPER(모의투자)
 DEFAULT_TRADING_MODE = "PAPER"
+DEFAULT_EXECUTION_MODE = "DRY_RUN"
 DEFAULT_ENVIRONMENT = Environment.DEV
 
 
@@ -176,6 +179,49 @@ def get_trading_mode() -> str:
             f"유효하지 않은 TRADING_MODE='{raw_mode}'. 허용값: {sorted(ALLOWED_TRADING_MODES)}"
         )
     return normalized
+
+
+def normalize_execution_mode(raw_mode: str) -> str:
+    """EXECUTION_MODE 문자열을 DB 네임스페이스 모드로 정규화합니다."""
+    value = str(raw_mode or "").strip().upper()
+    mode_map = {
+        "DRY_RUN": "DRY_RUN",
+        "DRYRUN": "DRY_RUN",
+        "CBT": "DRY_RUN",
+        "SIGNAL_ONLY": "DRY_RUN",
+        "PAPER": "PAPER",
+        "REAL": "REAL",
+        "LIVE": "REAL",
+        "DEV": "PAPER",
+        "PROD": "REAL",
+    }
+    return mode_map.get(value, value)
+
+
+def get_db_namespace_mode() -> str:
+    """
+    DB 저장/조회용 모드를 DRY_RUN/PAPER/REAL로 반환합니다.
+
+    우선순위:
+        1) EXECUTION_MODE (설정된 경우)
+        2) TRADING_MODE (기존 로직, PAPER/REAL)
+    """
+    raw_execution_mode = os.getenv(EXECUTION_MODE_ENV_VAR, "").strip().upper()
+    if raw_execution_mode:
+        normalized_execution = normalize_execution_mode(raw_execution_mode)
+        if normalized_execution in ALLOWED_DB_NAMESPACE_MODES:
+            return normalized_execution
+
+    raw_trading_mode = os.getenv(TRADING_MODE_ENV_VAR, "").strip().upper()
+    normalized_trading_for_db = normalize_execution_mode(raw_trading_mode)
+    if normalized_trading_for_db in ALLOWED_DB_NAMESPACE_MODES:
+        return normalized_trading_for_db
+
+    # EXECUTION_MODE가 없거나 비정상이면 기존 TRADING_MODE 경로로 폴백
+    trading_mode = get_trading_mode()
+    if trading_mode in ALLOWED_DB_NAMESPACE_MODES:
+        return trading_mode
+    return "PAPER"
 
 
 def normalize_trading_mode(raw_mode: str) -> str:

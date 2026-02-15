@@ -40,8 +40,8 @@
 --    - status: OPEN(들고있음) / CLOSED(다 팔았음)
 --
 CREATE TABLE IF NOT EXISTS positions (
-    -- 기본 키: 종목 코드 (한 종목에 하나의 포지션만 가질 수 있음)
-    symbol VARCHAR(20) PRIMARY KEY,
+    -- 기본 키: 종목 코드 + 모드 (DRY_RUN/PAPER/REAL 분리)
+    symbol VARCHAR(20) NOT NULL,
     
     -- 진입 정보 ────────────────────────────────────────
     entry_price DECIMAL(15, 2) NOT NULL,        -- 매수 평균가
@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS positions (
     take_profit_price DECIMAL(15, 2),           -- 익절가 (이 가격 이상이면 익절, NULL 가능)
     trailing_stop DECIMAL(15, 2),               -- 트레일링 스탑 (최고가 기준으로 움직임)
     highest_price DECIMAL(15, 2),               -- 보유 중 최고가 (트레일링 계산용)
+    mode VARCHAR(16) NOT NULL DEFAULT 'PAPER',  -- 실행 모드 네임스페이스
     
     -- 상태 ─────────────────────────────────────────────
     -- OPEN: 현재 보유 중
@@ -66,11 +67,13 @@ CREATE TABLE IF NOT EXISTS positions (
     
     -- 메타 정보 ─────────────────────────────────────────
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (symbol, mode)
 );
 
 -- 상태별 조회를 빠르게 하기 위한 인덱스
 CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
+CREATE INDEX IF NOT EXISTS idx_positions_mode_status ON positions(mode, status);
 
 -- 코멘트 추가
 COMMENT ON TABLE positions IS '현재 보유 중인 포지션 정보. 서버 재시작 시 복구용.';
@@ -123,6 +126,7 @@ CREATE TABLE IF NOT EXISTS trades (
     
     -- 메타 정보 ─────────────────────────────────────────
     order_no VARCHAR(50),                       -- 주문번호 (KIS API 응답값)
+    mode VARCHAR(16) NOT NULL DEFAULT 'PAPER', -- 실행 모드 네임스페이스
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -131,6 +135,7 @@ CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol);
 CREATE INDEX IF NOT EXISTS idx_trades_executed_at ON trades(executed_at);
 CREATE INDEX IF NOT EXISTS idx_trades_side ON trades(side);
 CREATE INDEX IF NOT EXISTS idx_trades_reason ON trades(reason);
+CREATE INDEX IF NOT EXISTS idx_trades_mode_executed_at ON trades(mode, executed_at);
 
 -- 일별 집계용 인덱스
 CREATE INDEX IF NOT EXISTS idx_trades_date ON trades(DATE(executed_at));
@@ -155,24 +160,27 @@ COMMENT ON COLUMN trades.reason IS '청산 사유 - ATR_STOP, TAKE_PROFIT, TRAIL
 --    - realized_pnl: 실현 손익 (판 주식의 손익 합계)
 --
 CREATE TABLE IF NOT EXISTS account_snapshots (
-    -- 기본 키: 스냅샷 시간 (1분에 하나씩만)
-    snapshot_time TIMESTAMP PRIMARY KEY,
+    -- 기본 키: 스냅샷 시간 + 모드 (DRY_RUN/PAPER/REAL 분리)
+    snapshot_time TIMESTAMP NOT NULL,
     
     -- 자산 정보 ────────────────────────────────────────
     total_equity DECIMAL(15, 2) NOT NULL,       -- 총 평가금액
     cash DECIMAL(15, 2) NOT NULL,               -- 현금
     unrealized_pnl DECIMAL(15, 2) DEFAULT 0,    -- 미실현 손익
     realized_pnl DECIMAL(15, 2) DEFAULT 0,      -- 실현 손익 (누적)
+    mode VARCHAR(16) NOT NULL DEFAULT 'PAPER',  -- 실행 모드 네임스페이스
     
     -- 포지션 정보 ───────────────────────────────────────
     position_count INTEGER DEFAULT 0,           -- 보유 포지션 수
     
     -- 메타 정보 ─────────────────────────────────────────
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (snapshot_time, mode)
 );
 
 -- 날짜별 조회를 위한 인덱스
 CREATE INDEX IF NOT EXISTS idx_snapshots_date ON account_snapshots(DATE(snapshot_time));
+CREATE INDEX IF NOT EXISTS idx_snapshots_mode_time ON account_snapshots(mode, snapshot_time);
 
 COMMENT ON TABLE account_snapshots IS '특정 시점의 계좌 상태 기록. 자산 변화 추적 및 성과 분석용.';
 
@@ -186,8 +194,9 @@ COMMENT ON TABLE account_snapshots IS '특정 시점의 계좌 상태 기록. �
 --    - 텔레그램 일일 리포트 전송용
 --
 CREATE TABLE IF NOT EXISTS daily_summary (
-    -- 기본 키: 날짜
-    trade_date DATE PRIMARY KEY,
+    -- 기본 키: 날짜 + 모드 (DRY_RUN/PAPER/REAL 분리)
+    trade_date DATE NOT NULL,
+    mode VARCHAR(16) NOT NULL DEFAULT 'PAPER',
     
     -- 거래 요약 ────────────────────────────────────────
     total_trades INTEGER DEFAULT 0,             -- 총 거래 횟수
@@ -210,10 +219,12 @@ CREATE TABLE IF NOT EXISTS daily_summary (
     
     -- 메타 정보 ─────────────────────────────────────────
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (trade_date, mode)
 );
 
 COMMENT ON TABLE daily_summary IS '일별 거래 요약. 빠른 리포트 생성용.';
+CREATE INDEX IF NOT EXISTS idx_daily_summary_mode_date ON daily_summary(mode, trade_date);
 
 
 -- ───────────────────────────────────────────────────────────────────────────────

@@ -172,19 +172,32 @@ class DatabaseTrader:
             telegram: 텔레그램 알림기
             api_client: KIS API 클라이언트 (실주문용)
         """
-        # 트레이딩 모드 결정
-        env_mode = os.getenv("TRADING_MODE", "PAPER").upper()
-        
+        # 트레이딩 모드 결정 (TRADING_MODE 우선, 없으면 EXECUTION_MODE 폴백)
+        env_trading_mode = os.getenv("TRADING_MODE", "").upper().strip()
+        env_execution_mode = os.getenv("EXECUTION_MODE", "").upper().strip()
+
+        def _resolve_mode(raw_mode: str) -> Optional[TradingMode]:
+            mapping = {
+                "SIGNAL_ONLY": TradingMode.SIGNAL_ONLY,
+                "CBT": TradingMode.CBT,
+                "DRY_RUN": TradingMode.CBT,
+                "DRYRUN": TradingMode.CBT,
+                "PAPER": TradingMode.PAPER,
+                "LIVE": TradingMode.LIVE,
+                "REAL": TradingMode.LIVE,
+                "PROD": TradingMode.LIVE,
+                "DEV": TradingMode.PAPER,
+            }
+            return mapping.get(str(raw_mode or "").upper().strip())
+
         if mode:
             self.mode = mode
-        elif env_mode == "SIGNAL_ONLY":
-            self.mode = TradingMode.SIGNAL_ONLY
-        elif env_mode == "CBT":
-            self.mode = TradingMode.CBT
-        elif env_mode == "LIVE":
-            self.mode = TradingMode.LIVE
         else:
-            self.mode = TradingMode.PAPER
+            self.mode = (
+                _resolve_mode(env_trading_mode)
+                or _resolve_mode(env_execution_mode)
+                or TradingMode.PAPER
+            )
         
         # 의존성 주입
         self.db = db or get_db_manager()
@@ -231,8 +244,12 @@ class DatabaseTrader:
             self.initialize()
 
     def _namespace_mode(self) -> str:
-        """DB 네임스페이스 모드(PAPER/REAL)로 변환합니다."""
-        return "REAL" if self.mode == TradingMode.LIVE else "PAPER"
+        """DB 네임스페이스 모드(DRY_RUN/PAPER/REAL)로 변환합니다."""
+        if self.mode == TradingMode.LIVE:
+            return "REAL"
+        if self.mode in (TradingMode.CBT, TradingMode.SIGNAL_ONLY):
+            return "DRY_RUN"
+        return "PAPER"
 
     @staticmethod
     def _make_idempotency_key(parts: Tuple[Any, ...]) -> str:

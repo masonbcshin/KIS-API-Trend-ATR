@@ -27,6 +27,7 @@ class DummyDB:
         order_state_row=None,
         positions_column_count=0,
         positions_rows=None,
+        position_columns=None,
         table_exists_map=None,
     ):
         self.trades = trades or []
@@ -37,6 +38,7 @@ class DummyDB:
         self.order_state_row = order_state_row
         self.positions_column_count = positions_column_count
         self.positions_rows = positions_rows or []
+        self.position_columns = position_columns or []
         self.table_exists_map = table_exists_map or {}
         self.commands = []
         self.config = SimpleNamespace(database="kis_trading")
@@ -57,6 +59,8 @@ class DummyDB:
             result = self.daily_summary_row
         elif "from information_schema.columns" in q and "table_name = 'positions'" in q:
             result = {"cnt": self.positions_column_count}
+        elif "select column_name" in q and "from information_schema.columns" in q and "table_name = %s" in q:
+            result = [{"column_name": name} for name in self.position_columns]
         elif "from positions" in q and "unrealized_pnl" in q:
             result = self.positions_rows
         elif "from trades" in q and "reason in" in q:
@@ -162,3 +166,27 @@ def test_render_message_contains_date_realized_pnl_and_symbol_display():
     assert "2026-02-15" in message
     assert "실현손익: +12,345원" in message
     assert "삼성전자(005930)" in message
+
+
+def test_unrealized_query_does_not_require_symbol_column():
+    class SymbolSensitiveDB(DummyDB):
+        def execute_query(self, query, params=None, fetch_one=False):
+            q = " ".join(query.lower().split())
+            if "from positions" in q and "symbol" in q:
+                raise AssertionError("positions query must not require symbol column")
+            return super().execute_query(query, params=params, fetch_one=fetch_one)
+
+    db = SymbolSensitiveDB(
+        trades=[{"symbol": "005930", "side": "SELL", "pnl": 10000, "reason": "TAKE_PROFIT"}],
+        snapshot_first={"total_equity": 1_000_000},
+        snapshot_last={"total_equity": 1_010_000},
+        positions_column_count=2,
+        position_columns=["status", "mode", "unrealized_pnl", "current_price"],
+        positions_rows=[{"unrealized_pnl": 1234.5}],
+        table_exists_map={"daily_summary": False, "positions": True, "order_state": False},
+    )
+    service = _create_service(db)
+
+    report = service.build_report(date(2026, 2, 15))
+
+    assert report.unrealized_pnl == 1234.5

@@ -621,6 +621,7 @@ class MySQLManager:
 
                 # 기존 DB 호환을 위한 안전 마이그레이션
                 self._ensure_columns(cursor)
+                self._ensure_primary_keys(cursor)
                 self._ensure_indexes(cursor)
                 conn.commit()
                 
@@ -645,7 +646,7 @@ class MySQLManager:
         """
         return """
         CREATE TABLE IF NOT EXISTS positions (
-            symbol VARCHAR(20) NOT NULL PRIMARY KEY,
+            symbol VARCHAR(20) NOT NULL,
             entry_price DECIMAL(15, 2) NOT NULL,
             quantity INT NOT NULL,
             entry_time DATETIME NOT NULL,
@@ -657,7 +658,8 @@ class MySQLManager:
             mode VARCHAR(16) NOT NULL DEFAULT 'PAPER',
             status VARCHAR(20) NOT NULL DEFAULT 'OPEN',
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (symbol, mode)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         
         CREATE TABLE IF NOT EXISTS trades (
@@ -679,14 +681,15 @@ class MySQLManager:
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         
         CREATE TABLE IF NOT EXISTS account_snapshots (
-            snapshot_time DATETIME NOT NULL PRIMARY KEY,
+            snapshot_time DATETIME NOT NULL,
             total_equity DECIMAL(15, 2) NOT NULL,
             cash DECIMAL(15, 2) NOT NULL,
             unrealized_pnl DECIMAL(15, 2) DEFAULT 0,
             realized_pnl DECIMAL(15, 2) DEFAULT 0,
             mode VARCHAR(16) NOT NULL DEFAULT 'PAPER',
             position_count INT DEFAULT 0,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (snapshot_time, mode)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
         CREATE TABLE IF NOT EXISTS symbol_cache (
@@ -748,6 +751,7 @@ class MySQLManager:
             ("trades", "mode", "VARCHAR(16) NOT NULL DEFAULT 'PAPER'"),
             ("trades", "idempotency_key", "VARCHAR(128) NULL"),
             ("account_snapshots", "mode", "VARCHAR(16) NOT NULL DEFAULT 'PAPER'"),
+            ("daily_summary", "mode", "VARCHAR(16) NOT NULL DEFAULT 'PAPER'"),
         ]
 
         for table_name, column_name, column_ddl in column_specs:
@@ -774,6 +778,7 @@ class MySQLManager:
             ("trades", "uq_trades_idempotency_key", "CREATE UNIQUE INDEX uq_trades_idempotency_key ON trades(idempotency_key)"),
             ("account_snapshots", "idx_snapshots_time", "CREATE INDEX idx_snapshots_time ON account_snapshots(snapshot_time)"),
             ("account_snapshots", "idx_snapshots_mode_time", "CREATE INDEX idx_snapshots_mode_time ON account_snapshots(mode, snapshot_time)"),
+            ("daily_summary", "idx_daily_summary_mode_date", "CREATE INDEX idx_daily_summary_mode_date ON daily_summary(mode, trade_date)"),
             ("symbol_cache", "idx_symbol_cache_updated_at", "CREATE INDEX idx_symbol_cache_updated_at ON symbol_cache(updated_at)"),
             ("order_state", "idx_order_state_mode_status", "CREATE INDEX idx_order_state_mode_status ON order_state(mode, status)"),
             ("order_state", "idx_order_state_order_no", "CREATE INDEX idx_order_state_order_no ON order_state(order_no)"),
@@ -786,6 +791,82 @@ class MySQLManager:
                 cursor.execute(ddl)
             except MySQLError as e:
                 logger.warning(f"[DB] 인덱스 생성 건너뜀: {index_name} ({e})")
+
+    def _get_primary_key_columns(self, table_name: str) -> List[str]:
+        """기본 키 컬럼 순서를 반환합니다."""
+        rows = self.execute_query(
+            """
+            SELECT column_name
+            FROM information_schema.key_column_usage
+            WHERE table_schema = %s
+              AND table_name = %s
+              AND constraint_name = 'PRIMARY'
+            ORDER BY ordinal_position
+            """,
+            (self.config.database, table_name),
+        )
+        return [row["column_name"] for row in rows]
+
+    def _has_duplicate_composite_key(self, table_name: str, key_columns: List[str]) -> bool:
+        """복합 키 기준 중복 레코드 존재 여부를 확인합니다."""
+        column_expr = ", ".join([f"`{column}`" for column in key_columns])
+        result = self.execute_query(
+            f"""
+            SELECT 1
+            FROM `{table_name}`
+            GROUP BY {column_expr}
+            HAVING COUNT(*) > 1
+            LIMIT 1
+            """,
+            fetch_one=True,
+        )
+        return bool(result)
+
+    def _ensure_primary_keys(self, cursor) -> None:
+        """실행 모드 분리를 위한 복합 기본 키를 안전하게 보정합니다."""
+        pk_specs: List[Tuple[str, List[str]]] = [
+            ("positions", ["symbol", "mode"]),
+            ("account_snapshots", ["snapshot_time", "mode"]),
+            ("daily_summary", ["trade_date", "mode"]),
+        ]
+
+        for table_name, target_pk_columns in pk_specs:
+            try:
+                if not self.table_exists(table_name):
+                    continue
+
+                if any(not self._column_exists(table_name, col) for col in target_pk_columns):
+                    logger.warning(
+                        f"[DB] PK 마이그레이션 건너뜀: {table_name} (필수 컬럼 누락: {target_pk_columns})"
+                    )
+                    continue
+
+                current_pk_columns = self._get_primary_key_columns(table_name)
+                if current_pk_columns == target_pk_columns:
+                    continue
+
+                if self._has_duplicate_composite_key(table_name, target_pk_columns):
+                    logger.warning(
+                        f"[DB] PK 마이그레이션 건너뜀: {table_name} "
+                        f"(중복 키 존재: {target_pk_columns})"
+                    )
+                    continue
+
+                target_pk_expr = ", ".join([f"`{column}`" for column in target_pk_columns])
+                if current_pk_columns:
+                    cursor.execute(
+                        f"ALTER TABLE `{table_name}` DROP PRIMARY KEY, ADD PRIMARY KEY ({target_pk_expr})"
+                    )
+                else:
+                    cursor.execute(
+                        f"ALTER TABLE `{table_name}` ADD PRIMARY KEY ({target_pk_expr})"
+                    )
+                logger.info(
+                    f"[DB] PK 마이그레이션 적용: {table_name} "
+                    f"{current_pk_columns or ['<none>']} -> {target_pk_columns}"
+                )
+            except MySQLError as e:
+                logger.warning(f"[DB] PK 마이그레이션 건너뜀: {table_name} ({e})")
     
     def table_exists(self, table_name: str) -> bool:
         """테이블 존재 여부 확인"""
