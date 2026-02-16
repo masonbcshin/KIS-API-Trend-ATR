@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import types
 import datetime as dt
+from unittest.mock import patch
 
 try:
     import pytz  # noqa: F401
@@ -113,6 +114,30 @@ class UniverseSelectorFixedTests(unittest.TestCase):
             self.assertIn("date", payload)
             self.assertEqual(payload["stocks"], ["005930"])
             self.assertIn("selection_method", payload)
+
+    def test_from_yaml_reads_root_level_stocks_for_backward_compatibility(self):
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = Path(td) / "universe_cache.json"
+            yaml_path = Path(td) / "universe.yaml"
+            yaml_path.write_text(
+                json.dumps(
+                    {
+                        "universe": {
+                            "selection_method": "fixed",
+                            "max_stocks": 3,
+                            "universe_cache_file": str(cache_path),
+                        },
+                        "stocks": ["005930", "000660", "035420"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            fake_yaml = types.SimpleNamespace(safe_load=lambda stream: json.loads(stream.read()))
+            with patch("universe_selector.yaml", new=fake_yaml):
+                selector = UniverseSelector.from_yaml(str(yaml_path), kis_client=_DummyKIS(), db=None)
+            selected = selector.select()
+            self.assertEqual(selected, ["005930", "000660", "035420"])
 
     def test_combined_refresh_on_restart_rebuilds_cached_single_symbol(self):
         with tempfile.TemporaryDirectory() as td:

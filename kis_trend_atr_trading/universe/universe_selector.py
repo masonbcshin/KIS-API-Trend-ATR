@@ -79,6 +79,12 @@ class UniverseSelector:
         with path.open("r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
         section = data.get("universe", {})
+        # Backward compatibility: fixed stocks can be defined at root-level "stocks".
+        raw_stocks = section.get("stocks")
+        if raw_stocks is None:
+            raw_stocks = data.get("stocks", [])
+        if not isinstance(raw_stocks, list):
+            raw_stocks = []
         cfg = UniverseSelectionConfig(
             selection_method=str(section.get("selection_method", "fixed")).lower(),
             max_stocks=int(section.get("max_stocks", 5)),
@@ -94,7 +100,7 @@ class UniverseSelector:
             universe_cache_file=str(section.get("universe_cache_file", "data/universe_cache.json")),
             candidate_pool_mode=str(section.get("candidate_pool_mode", "yaml")).lower(),
             candidate_stocks=[str(x) for x in section.get("candidate_stocks", [])],
-            stocks=[str(x) for x in section.get("stocks", [])],
+            stocks=[str(x) for x in raw_stocks],
             cache_refresh_enabled=bool(section.get("cache_refresh_enabled", False)),
             cache_refresh_on_restart=bool(section.get("cache_refresh_on_restart", False)),
             cache_refresh_on_market_open=bool(section.get("cache_refresh_on_market_open", False)),
