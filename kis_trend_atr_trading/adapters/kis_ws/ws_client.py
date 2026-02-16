@@ -149,6 +149,7 @@ class KISWSClient:
             raise RuntimeError("websockets package is required for WS feed.") from err
 
         self._approval_key = self._get_approval_key()
+        logger.info("[WS] connecting url=%s stock_count=%s", self.ws_url, len(stock_codes))
         async with websockets.connect(
             self.ws_url,
             ping_interval=30,
@@ -156,14 +157,25 @@ class KISWSClient:
             close_timeout=10,
         ) as ws:
             self._ws = ws
+            logger.info("[WS] connected url=%s", self.ws_url)
             for stock_code in stock_codes:
                 await self._send_subscribe(stock_code)
+                logger.info("[WS] subscribe sent stock=%s tr_id=%s", str(stock_code).zfill(6), TR_SUBSCRIBE)
 
+            first_tick_logged = False
             while self._running:
                 message = await asyncio.wait_for(ws.recv(), timeout=90)
                 tick = self._parse_tick(message)
                 if tick is None:
                     continue
+                if not first_tick_logged:
+                    logger.info(
+                        "[WS] first tick stock=%s price=%s ts=%s",
+                        tick.stock_code,
+                        tick.price,
+                        tick.timestamp,
+                    )
+                    first_tick_logged = True
                 if asyncio.iscoroutinefunction(on_tick):
                     await on_tick(tick)
                 else:
@@ -201,4 +213,3 @@ class KISWSClient:
                 await asyncio.sleep(delay)
 
         return WSRunResult(success=True, failure_policy=self.failure_policy, reason="stopped")
-

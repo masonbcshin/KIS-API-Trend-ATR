@@ -106,6 +106,7 @@ def run_trade_app(args: argparse.Namespace) -> int:
             # WS mode: evaluate strategy only on completed 1m bar callback.
             run_count = {"value": 0}
             stop_requested = {"value": False}
+            heartbeat = {"last": time.time()}
 
             def _on_completed_bar(_bar) -> None:
                 if stop_requested["value"]:
@@ -125,6 +126,15 @@ def run_trade_app(args: argparse.Namespace) -> int:
 
             stop_ws = ws_provider.subscribe_bars([args.stock], "1m", _on_completed_bar)
             while not stop_requested["value"]:
+                now = time.time()
+                if now - heartbeat["last"] >= 30:
+                    logger.info(
+                        "[KR_TRADE][WS] waiting completed bar run_count=%s ws_running=%s ws_failed=%s",
+                        run_count["value"],
+                        ws_provider.ws_running,
+                        ws_provider.ws_failed,
+                    )
+                    heartbeat["last"] = now
                 if ws_provider.ws_failed and ws_provider.ws_running is False:
                     logger.warning("[KR_TRADE] WS unavailable -> rest fallback polling loop")
                     executor.run(
