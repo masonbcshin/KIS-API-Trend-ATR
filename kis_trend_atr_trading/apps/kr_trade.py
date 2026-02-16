@@ -110,6 +110,14 @@ def run_trade_app(args: argparse.Namespace) -> int:
             def _on_completed_bar(_bar) -> None:
                 if stop_requested["value"]:
                     return
+                logger.info(
+                    "[KR_TRADE][WS] completed 1m bar stock=%s start=%s end=%s close=%s volume=%s",
+                    getattr(_bar, "stock_code", "unknown"),
+                    getattr(_bar, "start_at", "unknown"),
+                    getattr(_bar, "end_at", "unknown"),
+                    getattr(_bar, "close", "unknown"),
+                    getattr(_bar, "volume", "unknown"),
+                )
                 executor.run_once()
                 run_count["value"] += 1
                 if args.max_runs and run_count["value"] >= int(args.max_runs):
