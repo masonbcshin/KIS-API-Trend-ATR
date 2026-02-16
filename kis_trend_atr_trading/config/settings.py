@@ -21,7 +21,11 @@ KIS Trend-ATR Trading System - 통합 설정 파일
 
 import os
 from pathlib import Path
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    def load_dotenv(*args, **kwargs):  # type: ignore[override]
+        return False
 
 # .env 파일 로드
 env_path = Path(__file__).parent.parent / '.env'
@@ -51,14 +55,14 @@ _CURRENT_MODE = _get_execution_mode()
 
 # 모드별 설정 로드
 if _CURRENT_MODE == "REAL":
-    from config.settings_real import *
+    from kis_trend_atr_trading.config.settings_real import *
     _LOADED_SETTINGS = "settings_real.py"
 elif _CURRENT_MODE == "PAPER":
-    from config.settings_paper import *
+    from kis_trend_atr_trading.config.settings_paper import *
     _LOADED_SETTINGS = "settings_paper.py"
 else:
     # 기본값: DRY_RUN (가장 안전)
-    from config.settings_base import *
+    from kis_trend_atr_trading.config.settings_base import *
     _LOADED_SETTINGS = "settings_base.py"
 
 # 로드된 설정 파일 로깅

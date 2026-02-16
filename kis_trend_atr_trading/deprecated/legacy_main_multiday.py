@@ -40,16 +40,16 @@ from pathlib import Path
 from datetime import datetime, timedelta
 
 # 프로젝트 모듈 임포트
-from config import settings
-from adapters.kis_rest.market_data import KISRestMarketDataProvider
-from adapters.kis_ws.market_data import KISWSMarketDataProvider
-from adapters.kis_ws.ws_client import KISWSClient
-from api.kis_api import KISApi, KISApiError
-from strategy.multiday_trend_atr import MultidayTrendATRStrategy
-from engine.multiday_executor import MultidayExecutor
-from engine.order_synchronizer import get_instance_lock
-from engine.risk_manager import create_risk_manager_from_settings
-from engine.runtime_state_machine import (
+from kis_trend_atr_trading.config import settings
+from kis_trend_atr_trading.adapters.kis_rest.market_data import KISRestMarketDataProvider
+from kis_trend_atr_trading.adapters.kis_ws.market_data import KISWSMarketDataProvider
+from kis_trend_atr_trading.adapters.kis_ws.ws_client import KISWSClient
+from kis_trend_atr_trading.api.kis_api import KISApi, KISApiError
+from kis_trend_atr_trading.strategy.multiday_trend_atr import MultidayTrendATRStrategy
+from kis_trend_atr_trading.engine.multiday_executor import MultidayExecutor
+from kis_trend_atr_trading.engine.order_synchronizer import get_instance_lock
+from kis_trend_atr_trading.engine.risk_manager import create_risk_manager_from_settings
+from kis_trend_atr_trading.engine.runtime_state_machine import (
     FeedStatus,
     RuntimeConfig,
     RuntimeOverlay,
@@ -58,13 +58,13 @@ from engine.runtime_state_machine import (
     TransitionCooldown,
     completed_bar_ts_1m,
 )
-from backtest.backtester import Backtester
-from universe import UniverseSelector
-from universe.universe_service import UniverseService
-from utils.logger import setup_logger, get_logger
-from utils.market_hours import KST, MarketSessionState, get_market_session_state
-from utils.position_store import PositionStore
-from env import get_trading_mode, validate_environment, assert_not_real_mode
+from kis_trend_atr_trading.backtest.backtester import Backtester
+from kis_trend_atr_trading.universe import UniverseSelector
+from kis_trend_atr_trading.universe.universe_service import UniverseService
+from kis_trend_atr_trading.utils.logger import setup_logger, get_logger
+from kis_trend_atr_trading.utils.market_hours import KST, MarketSessionState, get_market_session_state
+from kis_trend_atr_trading.utils.position_store import PositionStore
+from kis_trend_atr_trading.env import get_trading_mode, validate_environment, assert_not_real_mode
 
 
 def print_banner():

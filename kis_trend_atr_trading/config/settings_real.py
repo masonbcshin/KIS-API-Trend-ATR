@@ -24,7 +24,7 @@ KIS Trend-ATR Trading System - 실계좌 전용 설정
 버전: 2.0.0
 """
 
-from config.settings_base import *
+from kis_trend_atr_trading.config.settings_base import *
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ⚠️⚠️⚠️ 실계좌 활성화 확인 플래그 ⚠️⚠️⚠️
