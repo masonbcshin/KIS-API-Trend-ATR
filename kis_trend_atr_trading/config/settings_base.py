@@ -246,7 +246,7 @@ RATE_LIMIT_DELAY: float = 0.1
 TOKEN_RETRY_DELAY_SECONDS: float = float(os.getenv("TOKEN_RETRY_DELAY_SECONDS", "61.0"))
 
 # 토큰 만료 임박 판단 기준 (분)
-TOKEN_REFRESH_MARGIN_MINUTES: int = int(os.getenv("TOKEN_REFRESH_MARGIN_MINUTES", "10"))
+TOKEN_REFRESH_MARGIN_MINUTES: int = int(os.getenv("TOKEN_REFRESH_MARGIN_MINUTES", "30"))
 
 # 장 시작 전 토큰 프리워밍 시각 (KST, 기본 08:00)
 TOKEN_PREWARM_HOUR: int = int(os.getenv("TOKEN_PREWARM_HOUR", "8"))
@@ -284,6 +284,53 @@ MARKET_CLOSE_MINUTE: int = 30
 
 # ★ 장 운영시간 외 주문 차단 (필수 True)
 ENFORCE_MARKET_HOURS: bool = True
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 24/365 런타임 상태머신 설정
+# ═══════════════════════════════════════════════════════════════════════════════
+
+MARKET_TIMEZONE: str = os.getenv("MARKET_TIMEZONE", "Asia/Seoul")
+DATA_FEED_DEFAULT: str = os.getenv("DATA_FEED_DEFAULT", "rest").strip().lower() or "rest"
+RUNTIME_TIMEFRAME: str = os.getenv("RUNTIME_TIMEFRAME", "1m").strip().lower() or "1m"
+
+PREOPEN_WARMUP_MIN: int = int(os.getenv("PREOPEN_WARMUP_MIN", "10"))
+POSTCLOSE_MIN: int = int(os.getenv("POSTCLOSE_MIN", "10"))
+AUCTION_GUARD_WINDOWS: List[str] = [
+    token.strip() for token in os.getenv("AUCTION_GUARD_WINDOWS", "").split(",") if token.strip()
+]
+ALLOW_EXIT_IN_AUCTION: bool = os.getenv("ALLOW_EXIT_IN_AUCTION", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+OFFSESSION_WS_ENABLED: bool = os.getenv("OFFSESSION_WS_ENABLED", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+
+WS_START_GRACE_SEC: int = int(os.getenv("WS_START_GRACE_SEC", "30"))
+WS_STALE_SEC: int = int(os.getenv("WS_STALE_SEC", "60"))
+WS_RECONNECT_MAX_ATTEMPTS: int = int(os.getenv("WS_RECONNECT_MAX_ATTEMPTS", "5"))
+WS_RECONNECT_BACKOFF_BASE_SEC: int = int(os.getenv("WS_RECONNECT_BACKOFF_BASE_SEC", "1"))
+WS_RECOVER_POLICY: str = os.getenv("WS_RECOVER_POLICY", "auto").strip().lower() or "auto"
+WS_RECOVER_STABLE_SEC: int = int(os.getenv("WS_RECOVER_STABLE_SEC", "30"))
+WS_RECOVER_REQUIRED_BARS: int = int(os.getenv("WS_RECOVER_REQUIRED_BARS", "2"))
+WS_MIN_DEGRADED_SEC: int = int(os.getenv("WS_MIN_DEGRADED_SEC", "120"))
+WS_MIN_NORMAL_SEC: int = int(os.getenv("WS_MIN_NORMAL_SEC", "120"))
+TELEGRAM_TRANSITION_COOLDOWN_SEC: int = int(
+    os.getenv("TELEGRAM_TRANSITION_COOLDOWN_SEC", "600")
+)
+
+RUNTIME_STATUS_LOG_INTERVAL_SEC: int = int(os.getenv("RUNTIME_STATUS_LOG_INTERVAL_SEC", "300"))
+RUNTIME_STATUS_TELEGRAM: bool = os.getenv("RUNTIME_STATUS_TELEGRAM", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+RUNTIME_INSESSION_SLEEP_SEC: int = int(os.getenv("RUNTIME_INSESSION_SLEEP_SEC", "60"))
+RUNTIME_OFFSESSION_SLEEP_SEC: int = int(os.getenv("RUNTIME_OFFSESSION_SLEEP_SEC", "600"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

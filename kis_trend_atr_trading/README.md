@@ -28,6 +28,61 @@
 
 ---
 
+## 24/365 Runtime (상태머신)
+
+- 세션 상태(`MarketSessionState`)
+  - `OFF_SESSION`, `PREOPEN_WARMUP`, `IN_SESSION`, `AUCTION_GUARD`, `POSTCLOSE`
+- 런타임 오버레이(`RuntimeOverlay`)
+  - `NORMAL`, `DEGRADED_FEED`, `EMERGENCY_STOP`
+- 핵심 규칙
+  - WS stale 판정은 `IN_SESSION`에서만 수행
+  - `DEGRADED_FEED`에서는 거래는 REST로 계속 수행, WS는 백그라운드 복구
+  - run_once 게이트는 1분 완료봉 기준(`bar_ts=KST 분 시작 시각`)으로 1회만 실행
+
+### WS 폴백/복귀 조건
+
+- 폴백(`NORMAL -> DEGRADED_FEED`)
+  - `IN_SESSION` AND `last_ws_message_age > WS_STALE_SEC`
+  - AND 시작 유예(`WS_START_GRACE_SEC`) 이후
+- 복귀(`DEGRADED_FEED -> NORMAL`)
+  - `WS_RECOVER_POLICY=auto`: 안정화(연속 정상 수신 + 연속 bar 증가) 만족 시 자동 복귀
+  - `WS_RECOVER_POLICY=next_session`: 세션 재개 이후에만 복귀 허용
+- 히스테리시스
+  - `WS_MIN_DEGRADED_SEC`, `WS_MIN_NORMAL_SEC`로 플래핑 방지
+
+### 런타임 설정 키(기본값)
+
+- `MARKET_TIMEZONE="Asia/Seoul"`
+- `DATA_FEED_DEFAULT="rest"` (`rest|ws`)
+- `RUNTIME_TIMEFRAME="1m"`
+- `PREOPEN_WARMUP_MIN=10`
+- `POSTCLOSE_MIN=10`
+- `AUCTION_GUARD_WINDOWS=""` (쉼표 구분, 기본 비활성)
+- `ALLOW_EXIT_IN_AUCTION=true`
+- `OFFSESSION_WS_ENABLED=false`
+- `WS_START_GRACE_SEC=30`
+- `WS_STALE_SEC=60`
+- `WS_RECONNECT_MAX_ATTEMPTS=5`
+- `WS_RECONNECT_BACKOFF_BASE_SEC=1`
+- `WS_RECOVER_POLICY="auto"` (`auto|next_session`)
+- `WS_RECOVER_STABLE_SEC=30`
+- `WS_RECOVER_REQUIRED_BARS=2`
+- `WS_MIN_DEGRADED_SEC=120`
+- `WS_MIN_NORMAL_SEC=120`
+- `TELEGRAM_TRANSITION_COOLDOWN_SEC=600`
+- `RUNTIME_STATUS_LOG_INTERVAL_SEC=300`
+- `RUNTIME_STATUS_TELEGRAM=false`
+- `TOKEN_REFRESH_MARGIN_MINUTES=30`
+
+### 운영 스모크/테스트
+
+- Paper 스모크
+  - `python -m kis_trend_atr_trading.main_multiday --mode trade --max-runs 1 --interval 60`
+- 단위 테스트
+  - `python -m pytest kis_trend_atr_trading/tests/test_state_machine.py kis_trend_atr_trading/tests/test_feed_failover.py kis_trend_atr_trading/tests/test_token_refresh.py -q`
+
+---
+
 ## 1️⃣ 시스템 개요
 
 ### 전략 개요 (Trend + ATR)

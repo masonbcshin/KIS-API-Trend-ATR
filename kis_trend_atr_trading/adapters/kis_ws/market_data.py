@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import threading
 from collections import defaultdict, deque
+from datetime import datetime
 from typing import Callable, Deque, Dict, List, Optional
 
 from adapters.kis_rest.market_data import KISRestMarketDataProvider
@@ -32,9 +34,13 @@ class KISWSMarketDataProvider(MarketDataProvider):
         rest_fallback_provider: Optional[KISRestMarketDataProvider] = None,
         max_bar_history: int = 2048,
         failure_policy: str = "rest_fallback",
+        max_reconnect_attempts: int = 5,
+        reconnect_base_delay: float = 1.0,
+        missing_gap_required: int = 2,
     ):
         self._ws_client = ws_client or KISWSClient(
-            max_reconnect_attempts=5,
+            max_reconnect_attempts=max_reconnect_attempts,
+            reconnect_base_delay=reconnect_base_delay,
             failure_policy=failure_policy,
         )
         self._rest_fallback = rest_fallback_provider or KISRestMarketDataProvider()
@@ -49,6 +55,11 @@ class KISWSMarketDataProvider(MarketDataProvider):
         self._lock = threading.Lock()
         self._ws_running = False
         self._ws_failed = False
+        self._subscribed_codes: List[str] = []
+        self._last_message_ts: Optional[datetime] = None
+        self._last_completed_bar_ts: Dict[str, datetime] = {}
+        self._missing_gap_required = max(int(missing_gap_required), 2)
+        self._missing_gap_detected: bool = False
 
     def get_recent_bars(self, stock_code: str, n: int, timeframe: str) -> List[dict]:
         code = str(stock_code).zfill(6)
@@ -75,13 +86,31 @@ class KISWSMarketDataProvider(MarketDataProvider):
         code = str(tick.stock_code).zfill(6)
         with self._lock:
             self._latest_price[code] = float(tick.price)
+            self._last_message_ts = datetime.now()
 
         completed = self._aggregator.add_tick(tick)
         if completed is None:
             return
 
+        missing_count = 0
         with self._lock:
+            prev_ts = self._last_completed_bar_ts.get(code)
+            if prev_ts is not None:
+                jump_min = int((completed.start_at - prev_ts).total_seconds() // 60)
+                missing_count = max(jump_min - 1, 0)
+                if missing_count >= self._missing_gap_required:
+                    self._missing_gap_detected = True
+            self._last_completed_bar_ts[code] = completed.start_at
             self._bars[code].append(completed)
+
+        if missing_count >= self._missing_gap_required:
+            logger.warning(
+                "[WS] missing completed bars detected stock=%s missing=%s (>= %s)",
+                code,
+                missing_count,
+                self._missing_gap_required,
+            )
+            self._attempt_backfill(code, missing_count)
 
         cb = self._on_bar_callback
         if cb is None:
@@ -93,6 +122,7 @@ class KISWSMarketDataProvider(MarketDataProvider):
 
     def _run_ws(self, stock_codes: List[str]) -> None:
         self._ws_running = True
+        self._ws_failed = False
         try:
             result = asyncio.run(self._ws_client.run(stock_codes, self._handle_tick))
             if not result.success:
@@ -119,7 +149,10 @@ class KISWSMarketDataProvider(MarketDataProvider):
         codes = [str(code).zfill(6) for code in stock_codes]
 
         if self._thread and self._thread.is_alive():
-            return self.stop
+            with self._lock:
+                if codes == self._subscribed_codes:
+                    return self.stop
+            self.stop()
 
         self._thread = threading.Thread(
             target=self._run_ws,
@@ -127,6 +160,9 @@ class KISWSMarketDataProvider(MarketDataProvider):
             daemon=True,
             name="kis-ws-market-data",
         )
+        with self._lock:
+            self._subscribed_codes = list(codes)
+            self._ws_failed = False
         self._thread.start()
         return self.stop
 
@@ -136,6 +172,53 @@ class KISWSMarketDataProvider(MarketDataProvider):
             self._thread.join(timeout=3.0)
         self._thread = None
 
+    def _attempt_backfill(self, stock_code: str, missing_count: int) -> None:
+        try:
+            self._rest_fallback.get_recent_bars(
+                stock_code=stock_code,
+                n=max(missing_count + 2, 3),
+                timeframe="1m",
+            )
+            logger.info("[WS] REST backfill attempted stock=%s missing=%s", stock_code, missing_count)
+        except Exception as err:
+            logger.warning(
+                "[WS] REST backfill failed stock=%s missing=%s err=%s",
+                stock_code,
+                missing_count,
+                err,
+            )
+
+    def is_ws_connected(self) -> bool:
+        with self._lock:
+            running = self._ws_running
+            failed = self._ws_failed
+        return bool(running) and not bool(failed)
+
+    def last_message_age_sec(self) -> float:
+        with self._lock:
+            ts = self._last_message_ts
+        if ts is None:
+            return math.inf
+        return max((datetime.now() - ts).total_seconds(), 0.0)
+
+    def get_last_completed_bar_ts(self, stock_code: Optional[str] = None) -> Optional[datetime]:
+        with self._lock:
+            if stock_code:
+                return self._last_completed_bar_ts.get(str(stock_code).zfill(6))
+            if not self._last_completed_bar_ts:
+                return None
+            return max(self._last_completed_bar_ts.values())
+
+    def health(self) -> Dict[str, object]:
+        return {
+            "ws_running": bool(self.ws_running),
+            "ws_failed": bool(self.ws_failed),
+            "ws_connected": bool(self.is_ws_connected()),
+            "last_message_age_sec": float(self.last_message_age_sec()),
+            "subscribed_count": len(self._subscribed_codes),
+            "missing_gap_detected": bool(self._missing_gap_detected),
+        }
+
     @property
     def ws_failed(self) -> bool:
         return self._ws_failed
@@ -143,4 +226,3 @@ class KISWSMarketDataProvider(MarketDataProvider):
     @property
     def ws_running(self) -> bool:
         return self._ws_running
-

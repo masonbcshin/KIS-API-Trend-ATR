@@ -10,8 +10,9 @@ KIS Trend-ATR Trading System - 거래시간 검증 모듈
 ⚠️ 공휴일은 별도 캘린더 연동이 필요합니다.
 """
 
-from datetime import datetime, time, date
-from typing import Tuple
+from datetime import datetime, time, date, timedelta
+from enum import Enum
+from typing import Optional, Sequence, Tuple
 import logging
 import pytz
 
@@ -39,6 +40,9 @@ MARKET_OPEN = time(9, 0, 0)
 
 # 정규장 종료 시간 (동시호가 시작 전, 안전 마진 포함)
 MARKET_CLOSE = time(15, 20, 0)
+
+# 상태머신 세션 판정 기준 정규장 종료(15:30)
+SESSION_CLOSE = time(15, 30, 0)
 
 # 점심시간 (선택적 거래 제한용)
 LUNCH_START = time(11, 30, 0)
@@ -111,6 +115,107 @@ HOLIDAYS_2024_2025 = {
     date(2026, 12, 25), # 크리스마스
     date(2026, 12, 31), # 연말휴장
 }
+
+
+class MarketSessionState(Enum):
+    """런타임 상태머신용 시장 세션 상태."""
+
+    OFF_SESSION = "OFF_SESSION"
+    PREOPEN_WARMUP = "PREOPEN_WARMUP"
+    IN_SESSION = "IN_SESSION"
+    AUCTION_GUARD = "AUCTION_GUARD"
+    POSTCLOSE = "POSTCLOSE"
+
+
+def _ensure_tz(check_time: Optional[datetime], tz: str) -> datetime:
+    tzinfo = pytz.timezone(tz)
+    if check_time is None:
+        return datetime.now(tzinfo)
+    if check_time.tzinfo is None:
+        return tzinfo.localize(check_time)
+    return check_time.astimezone(tzinfo)
+
+
+def _parse_hhmm(value: str) -> Optional[time]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        hour_str, minute_str = raw.split(":", 1)
+        return time(int(hour_str), int(minute_str), 0)
+    except Exception:
+        return None
+
+
+def _in_auction_window(now: datetime, windows: Sequence[str]) -> Tuple[bool, str]:
+    current_time = now.time()
+    for raw_window in windows:
+        token = str(raw_window or "").strip()
+        if not token:
+            continue
+        if "-" not in token:
+            continue
+        start_raw, end_raw = token.split("-", 1)
+        start_time = _parse_hhmm(start_raw)
+        end_time = _parse_hhmm(end_raw)
+        if start_time is None or end_time is None:
+            continue
+        if start_time <= current_time < end_time:
+            return True, token
+    return False, ""
+
+
+def get_market_session_state(
+    now: Optional[datetime] = None,
+    tz: str = "Asia/Seoul",
+    preopen_warmup_min: int = 10,
+    postclose_min: int = 10,
+    auction_guard_windows: Optional[Sequence[str]] = None,
+) -> Tuple[MarketSessionState, str]:
+    """
+    24/365 런타임용 시장 세션 상태를 반환합니다.
+
+    기본 세션:
+      - IN_SESSION: 09:00~15:30 (KST)
+      - 주말/휴장: OFF_SESSION
+    """
+    now_kst = _ensure_tz(now, tz)
+    today = now_kst.date()
+
+    if is_weekend(today):
+        return MarketSessionState.OFF_SESSION, "weekend_closed"
+    if is_holiday(today):
+        return MarketSessionState.OFF_SESSION, "holiday_closed"
+
+    open_dt = now_kst.replace(
+        hour=MARKET_OPEN.hour,
+        minute=MARKET_OPEN.minute,
+        second=0,
+        microsecond=0,
+    )
+    close_dt = now_kst.replace(
+        hour=SESSION_CLOSE.hour,
+        minute=SESSION_CLOSE.minute,
+        second=0,
+        microsecond=0,
+    )
+    preopen_dt = open_dt - timedelta(minutes=max(int(preopen_warmup_min), 0))
+    postclose_end_dt = close_dt + timedelta(minutes=max(int(postclose_min), 0))
+
+    windows = list(auction_guard_windows or [])
+    in_auction, auction_reason = _in_auction_window(now_kst, windows)
+    if in_auction:
+        return MarketSessionState.AUCTION_GUARD, f"auction_guard:{auction_reason}"
+
+    if now_kst < preopen_dt:
+        return MarketSessionState.OFF_SESSION, "off_session_before_prewarm"
+    if preopen_dt <= now_kst < open_dt:
+        return MarketSessionState.PREOPEN_WARMUP, "preopen_warmup"
+    if open_dt <= now_kst < close_dt:
+        return MarketSessionState.IN_SESSION, "regular_session_open"
+    if close_dt <= now_kst < postclose_end_dt:
+        return MarketSessionState.POSTCLOSE, "post_close_cleanup"
+    return MarketSessionState.OFF_SESSION, "off_session_after_postclose"
 
 
 # ════════════════════════════════════════════════════════════════

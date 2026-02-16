@@ -31,25 +31,38 @@ KIS Trend-ATR Trading System - 멀티데이 전략 실행 파일
 """
 
 import argparse
+import math
 import os
 import sys
 import time
 import subprocess
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # 프로젝트 모듈 임포트
 from config import settings
+from adapters.kis_rest.market_data import KISRestMarketDataProvider
+from adapters.kis_ws.market_data import KISWSMarketDataProvider
+from adapters.kis_ws.ws_client import KISWSClient
 from api.kis_api import KISApi, KISApiError
 from strategy.multiday_trend_atr import MultidayTrendATRStrategy
 from engine.multiday_executor import MultidayExecutor
 from engine.order_synchronizer import get_instance_lock
 from engine.risk_manager import create_risk_manager_from_settings
+from engine.runtime_state_machine import (
+    FeedStatus,
+    RuntimeConfig,
+    RuntimeOverlay,
+    RuntimeStateMachine,
+    SymbolBarGate,
+    TransitionCooldown,
+    completed_bar_ts_1m,
+)
 from backtest.backtester import Backtester
 from universe import UniverseSelector
 from universe.universe_service import UniverseService
 from utils.logger import setup_logger, get_logger
-from utils.market_hours import KST
+from utils.market_hours import KST, MarketSessionState, get_market_session_state
 from utils.position_store import PositionStore
 from env import get_trading_mode, validate_environment, assert_not_real_mode
 
@@ -299,6 +312,7 @@ def run_trade(
     # 설정 요약 출력
     print(settings.get_settings_summary())
     executors = []
+    ws_stop = None
 
     try:
         # REAL 첫날 종목수 제한 (세이프가드)
@@ -320,6 +334,31 @@ def run_trade(
             api.prewarm_access_token_if_due()
         api.get_access_token()
         print("✅ 토큰 준비 완료\n")
+
+        runtime_config = RuntimeConfig.from_settings(settings)
+        runtime_machine = RuntimeStateMachine(runtime_config, start_ts=datetime.now(KST))
+        bar_gate = SymbolBarGate()
+        transition_cooldown = TransitionCooldown(runtime_config.telegram_transition_cooldown_sec)
+        runtime_status_telegram = bool(getattr(settings, "RUNTIME_STATUS_TELEGRAM", False))
+
+        rest_provider = KISRestMarketDataProvider(api=api)
+        ws_provider = None
+        if runtime_config.data_feed_default == "ws" or runtime_config.offsession_ws_enabled:
+            ws_client = KISWSClient(
+                app_key=settings.APP_KEY,
+                app_secret=settings.APP_SECRET,
+                is_paper_trading=(trading_mode != "REAL"),
+                max_reconnect_attempts=runtime_config.ws_reconnect_max_attempts,
+                reconnect_base_delay=float(runtime_config.ws_reconnect_backoff_base_sec),
+                failure_policy="rest_fallback",
+                approval_key_refresh_margin_min=30,
+            )
+            ws_provider = KISWSMarketDataProvider(
+                ws_client=ws_client,
+                rest_fallback_provider=rest_provider,
+                max_reconnect_attempts=runtime_config.ws_reconnect_max_attempts,
+                reconnect_base_delay=float(runtime_config.ws_reconnect_backoff_base_sec),
+            )
         
         # Universe 서비스 (일자별 1회 생성 + 재사용, 보유종목/신규진입 분리)
         universe_yaml = Path(__file__).resolve().parent / "config" / "universe.yaml"
@@ -394,6 +433,7 @@ def run_trade(
                 order_quantity=order_quantity,
                 risk_manager=shared_risk_manager,
                 position_store=_symbol_position_store(symbol),
+                market_data_provider=rest_provider,
             )
             restored = executor.restore_position_on_start()
             state_msg = "복원 완료 - Exit 조건 감시" if restored else "복원 포지션 없음 - Entry 조건 감시"
@@ -409,7 +449,52 @@ def run_trade(
         print("   ★ 포지션은 프로그램 종료 시에도 유지됩니다.")
         print("   ★ Exit는 오직 가격 조건으로만 발생합니다.\n")
 
+        def _normalize_bar_ts(ts):
+            if ts is None:
+                return None
+            if ts.tzinfo is None:
+                return KST.localize(ts)
+            return ts.astimezone(KST)
+
+        def _send_transition_alert(key: str, level: str, message: str, now_kst: datetime) -> None:
+            if not executors:
+                return
+            if not transition_cooldown.should_send(key, now_kst):
+                return
+            notifier = getattr(executors[0], "telegram", None)
+            if notifier is None:
+                return
+            try:
+                if level == "warning":
+                    notifier.notify_warning(message)
+                else:
+                    notifier.notify_info(message)
+            except Exception:
+                pass
+
+        def _ensure_ws_subscription(symbols) -> None:
+            nonlocal ws_stop
+            if ws_provider is None:
+                return
+            if ws_stop is not None:
+                return
+            ws_stop = ws_provider.subscribe_bars(symbols, runtime_config.timeframe, lambda _bar: None)
+
+        def _stop_ws_subscription() -> None:
+            nonlocal ws_stop
+            if ws_stop is None:
+                return
+            try:
+                ws_stop()
+            except Exception:
+                pass
+            ws_stop = None
+
         iteration = 0
+        active_feed_name = "rest"
+        last_status_log_at = None
+        last_postclose_report_date = None
+        last_prewarm_prepare_date = None
         while True:
             iteration += 1
             logger.info(f"[MULTI] 반복 #{iteration} / symbols={len(executors)}")
@@ -433,12 +518,175 @@ def run_trade(
                         order_quantity=order_quantity,
                         risk_manager=shared_risk_manager,
                         position_store=_symbol_position_store(symbol),
+                        market_data_provider=rest_provider,
                     )
                     restored = executor.restore_position_on_start()
                     state_msg = "복원 완료 - Exit 조건 감시" if restored else "복원 포지션 없음 - Entry 조건 감시"
                     print(f"  - {symbol}: {state_msg}")
                     executors_by_symbol[symbol] = executor
                     executors.append(executor)
+
+            now_kst = datetime.now(KST)
+            market_state, market_reason = get_market_session_state(
+                now=now_kst,
+                tz=runtime_config.market_timezone,
+                preopen_warmup_min=runtime_config.preopen_warmup_min,
+                postclose_min=runtime_config.postclose_min,
+                auction_guard_windows=runtime_config.auction_guard_windows,
+            )
+            ws_last_bar_ts = (
+                _normalize_bar_ts(ws_provider.get_last_completed_bar_ts()) if ws_provider else None
+            )
+            feed_status = FeedStatus(
+                ws_enabled=(ws_provider is not None),
+                ws_connected=bool(ws_provider and ws_provider.is_ws_connected()),
+                ws_last_message_age_sec=(
+                    float(ws_provider.last_message_age_sec()) if ws_provider else math.inf
+                ),
+                ws_last_bar_ts=ws_last_bar_ts,
+            )
+            kill_check = shared_risk_manager.check_kill_switch()
+            decision = runtime_machine.evaluate(
+                now=now_kst,
+                market_state=market_state,
+                market_reason=market_reason,
+                feed_status=feed_status,
+                risk_stop=(not kill_check.passed),
+            )
+
+            if decision.market_transition is not None:
+                prev_state, next_state = decision.market_transition
+                logger.info(
+                    "[RUNTIME] market transition %s -> %s reason=%s",
+                    prev_state.value,
+                    next_state.value,
+                    decision.market_reason,
+                )
+                if (
+                    prev_state == MarketSessionState.OFF_SESSION
+                    and next_state == MarketSessionState.PREOPEN_WARMUP
+                ):
+                    _send_transition_alert(
+                        key="market:OFF_SESSION->PREOPEN_WARMUP",
+                        level="info",
+                        message=(
+                            "[RUNTIME] OFF_SESSION -> PREOPEN_WARMUP "
+                            f"(reason={decision.market_reason})"
+                        ),
+                        now_kst=now_kst,
+                    )
+                elif (
+                    prev_state == MarketSessionState.PREOPEN_WARMUP
+                    and next_state == MarketSessionState.IN_SESSION
+                ):
+                    _send_transition_alert(
+                        key="market:PREOPEN_WARMUP->IN_SESSION",
+                        level="info",
+                        message=(
+                            "[RUNTIME] PREOPEN_WARMUP -> IN_SESSION "
+                            f"(reason={decision.market_reason})"
+                        ),
+                        now_kst=now_kst,
+                    )
+
+            if decision.overlay_transition is not None:
+                prev_overlay, next_overlay = decision.overlay_transition
+                logger.warning(
+                    "[RUNTIME] overlay transition %s -> %s",
+                    prev_overlay.value,
+                    next_overlay.value,
+                )
+                if (
+                    prev_overlay == RuntimeOverlay.NORMAL
+                    and next_overlay == RuntimeOverlay.DEGRADED_FEED
+                ):
+                    _send_transition_alert(
+                        key="overlay:NORMAL->DEGRADED_FEED",
+                        level="warning",
+                        message=(
+                            "[RUNTIME] NORMAL -> DEGRADED_FEED "
+                            f"(market={decision.market_state.value}, reason={decision.market_reason})"
+                        ),
+                        now_kst=now_kst,
+                    )
+                elif (
+                    prev_overlay == RuntimeOverlay.DEGRADED_FEED
+                    and next_overlay == RuntimeOverlay.NORMAL
+                ):
+                    _send_transition_alert(
+                        key="overlay:DEGRADED_FEED->NORMAL",
+                        level="info",
+                        message="[RUNTIME] DEGRADED_FEED -> NORMAL (WS recovered)",
+                        now_kst=now_kst,
+                    )
+                elif next_overlay == RuntimeOverlay.EMERGENCY_STOP:
+                    _send_transition_alert(
+                        key="overlay:*->EMERGENCY_STOP",
+                        level="warning",
+                        message="[RUNTIME] EMERGENCY_STOP activated by risk/kill-switch",
+                        now_kst=now_kst,
+                    )
+
+            if last_status_log_at is None or (
+                now_kst - last_status_log_at
+            ).total_seconds() >= runtime_config.status_log_interval_sec:
+                summary = (
+                    f"[RUNTIME] market_state={decision.market_state.value}, "
+                    f"reason={decision.market_reason}, "
+                    f"overlay={decision.overlay.value}, "
+                    f"active_feed={decision.policy.active_feed_mode}, "
+                    f"ws_connected={decision.feed_status.ws_connected}, "
+                    f"last_ws_message_age={decision.feed_status.ws_last_message_age_sec:.1f}, "
+                    f"symbols_count={len(executors)}"
+                )
+                logger.info(summary)
+                if runtime_status_telegram:
+                    _send_transition_alert(
+                        key="runtime:summary",
+                        level="info",
+                        message=summary,
+                        now_kst=now_kst,
+                    )
+                last_status_log_at = now_kst
+
+            if ws_provider is not None:
+                if decision.policy.ws_should_run:
+                    _ensure_ws_subscription(run_symbols)
+                else:
+                    _stop_ws_subscription()
+
+            if decision.market_state == MarketSessionState.PREOPEN_WARMUP:
+                prewarm_date = now_kst.strftime("%Y-%m-%d")
+                if prewarm_date != last_prewarm_prepare_date:
+                    for symbol in run_symbols:
+                        try:
+                            rest_provider.get_recent_bars(stock_code=symbol, n=5, timeframe="D")
+                            rest_provider.get_latest_price(stock_code=symbol)
+                        except Exception as preload_err:
+                            logger.warning(
+                                "[RUNTIME] preopen preload failed symbol=%s err=%s",
+                                symbol,
+                                preload_err,
+                            )
+                    logger.info(
+                        "[RUNTIME] PREOPEN_WARMUP preload completed symbols=%s",
+                        len(run_symbols),
+                    )
+                    last_prewarm_prepare_date = prewarm_date
+
+            target_feed = "rest"
+            if decision.policy.active_feed_mode == "ws" and ws_provider is not None:
+                target_feed = "ws"
+            active_provider = ws_provider if target_feed == "ws" else rest_provider
+            for executor in executors:
+                executor.market_data_provider = active_provider
+            if active_feed_name != target_feed:
+                logger.info(
+                    "[RUNTIME] active feed switched %s -> %s",
+                    active_feed_name,
+                    target_feed,
+                )
+                active_feed_name = target_feed
 
             # 런타임 holdings/entry_candidates 재계산 (보유는 항상 관리, 진입은 후보만)
             runtime_holdings = [e.stock_code for e in executors if e.strategy.has_position]
@@ -451,7 +699,15 @@ def run_trade(
 
             for executor in executors:
                 symbol = executor.stock_code
-                if symbol in runtime_holdings:
+                if not decision.policy.allow_new_entries:
+                    executor.set_entry_control(
+                        False,
+                        (
+                            f"[ENTRY] runtime blocked: "
+                            f"market={decision.market_state.value}, overlay={decision.overlay.value}"
+                        ),
+                    )
+                elif symbol in runtime_holdings:
                     executor.set_entry_control(False, f"[ENTRY] skipped: already holding symbol={symbol}")
                 elif symbol not in entry_candidates:
                     executor.set_entry_control(False, f"[ENTRY] skipped: symbol={symbol} not in entry_candidates")
@@ -465,7 +721,50 @@ def run_trade(
                 else:
                     executor.set_entry_control(True, "")
 
+                if not decision.policy.run_strategy:
+                    continue
+
+                if active_feed_name == "ws" and ws_provider is not None:
+                    symbol_bar_ts = _normalize_bar_ts(ws_provider.get_last_completed_bar_ts(symbol))
+                    prev_bar_ts = bar_gate.last_processed(symbol)
+                    if (
+                        prev_bar_ts is not None
+                        and symbol_bar_ts is not None
+                        and symbol_bar_ts > (prev_bar_ts + timedelta(minutes=1))
+                    ):
+                        missing_count = int((symbol_bar_ts - prev_bar_ts).total_seconds() // 60) - 1
+                        if missing_count >= 2:
+                            try:
+                                rest_provider.get_recent_bars(
+                                    stock_code=symbol,
+                                    n=max(missing_count + 2, 3),
+                                    timeframe="1m",
+                                )
+                                logger.info(
+                                    "[RUNTIME] WS recovery backfill attempted symbol=%s missing=%s",
+                                    symbol,
+                                    missing_count,
+                                )
+                            except Exception as backfill_err:
+                                logger.warning(
+                                    "[RUNTIME] WS recovery backfill failed symbol=%s missing=%s err=%s",
+                                    symbol,
+                                    missing_count,
+                                    backfill_err,
+                                )
+                else:
+                    symbol_bar_ts = completed_bar_ts_1m(
+                        now=now_kst,
+                        tz=runtime_config.market_timezone,
+                    )
+
+                if not bar_gate.should_run(symbol, _normalize_bar_ts(symbol_bar_ts)):
+                    continue
+
                 executor.run_once()
+                normalized_symbol_bar_ts = _normalize_bar_ts(symbol_bar_ts)
+                if normalized_symbol_bar_ts is not None:
+                    bar_gate.mark_processed(symbol, normalized_symbol_bar_ts)
                 runtime_holdings = [e.stock_code for e in executors if e.strategy.has_position]
                 holdings_count = len(runtime_holdings)
                 if stock_code == settings.DEFAULT_STOCK_CODE:
@@ -473,12 +772,37 @@ def run_trade(
                 else:
                     entry_candidates = [stock_code] if stock_code not in runtime_holdings else []
 
+            if decision.market_state == MarketSessionState.POSTCLOSE:
+                report_date = now_kst.strftime("%Y-%m-%d")
+                if report_date != last_postclose_report_date:
+                    logger.info("[RUNTIME] POSTCLOSE actions started date=%s", report_date)
+                    for executor in executors:
+                        if hasattr(executor, "_persist_account_snapshot"):
+                            try:
+                                executor._persist_account_snapshot(force=True)
+                            except Exception:
+                                pass
+                    last_postclose_report_date = report_date
+
             if max_runs and iteration >= max_runs:
                 logger.info(f"[MULTI] 최대 반복 도달: {max_runs}")
                 break
 
-            logger.info(f"[MULTI] 다음 실행까지 {interval}초 대기")
-            time.sleep(interval)
+            if decision.market_state == MarketSessionState.IN_SESSION:
+                sleep_sec = max(15, min(int(interval), 60))
+            elif decision.market_state == MarketSessionState.OFF_SESSION:
+                sleep_sec = runtime_config.offsession_sleep_sec
+            else:
+                sleep_sec = max(int(decision.policy.sleep_sec), 5)
+
+            logger.info(
+                "[MULTI] 다음 실행까지 %s초 대기 (market=%s overlay=%s feed=%s)",
+                sleep_sec,
+                decision.market_state.value,
+                decision.overlay.value,
+                active_feed_name,
+            )
+            time.sleep(sleep_sec)
 
         print("\n" + "=" * 50)
         print("              멀티종목 거래 요약")
@@ -509,6 +833,11 @@ def run_trade(
         print(f"\n❌ 오류 발생: {e}")
         logger.error(f"거래 오류: {e}")
     finally:
+        if ws_stop is not None:
+            try:
+                ws_stop()
+            except Exception:
+                pass
         # 멀티심볼 사용자 루프에서는 executor.run()의 finally가 호출되지 않으므로 정리 보장
         for executor in executors:
             try:

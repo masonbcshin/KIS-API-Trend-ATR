@@ -27,7 +27,7 @@ logger = get_logger("kis_api")
 trade_logger = TradeLogger("kis_api")
 
 DEFAULT_TOKEN_RETRY_DELAY_SECONDS = 61.0
-DEFAULT_TOKEN_REFRESH_MARGIN_MINUTES = 10
+DEFAULT_TOKEN_REFRESH_MARGIN_MINUTES = 30
 DEFAULT_TOKEN_CACHE_FILE_NAME = "access_token_cache.json"
 
 
@@ -228,7 +228,9 @@ class KISApi:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             token = str(payload.get("access_token", "")).strip()
-            expires_at = self._parse_datetime(payload.get("token_expires_at"))
+            expires_at = self._parse_datetime(
+                payload.get("token_expires_at") or payload.get("expire_at")
+            )
             prewarm_date_raw = str(payload.get("last_prewarm_date", "")).strip()
 
             if token and expires_at:
@@ -259,6 +261,7 @@ class KISApi:
             payload = {
                 "access_token": self.access_token,
                 "token_expires_at": self.token_expires_at.astimezone(KST).isoformat(),
+                "expire_at": self.token_expires_at.astimezone(KST).isoformat(),
                 "updated_at": datetime.now(KST).isoformat(),
             }
             if self._last_token_prewarm_date:
@@ -361,20 +364,27 @@ class KISApi:
                     return response
                 
                 if (
-                    response.status_code == 401
+                    response.status_code in (401, 403)
                     and isinstance(headers, dict)
                     and "authorization" in headers
                     and "/oauth2/tokenP" not in url
                     and not did_auth_refresh
                 ):
-                    logger.warning("401 인증 오류 감지: 토큰 강제 갱신 후 재시도")
+                    logger.warning(
+                        "%s 인증 오류 감지: 토큰 강제 갱신 후 1회 재시도",
+                        response.status_code,
+                    )
                     try:
                         self.get_access_token(force_refresh=True)
                         headers["authorization"] = f"Bearer {self.access_token}"
                         did_auth_refresh = True
                         continue
                     except Exception as refresh_error:
-                        logger.warning(f"401 처리 중 토큰 갱신 실패: {refresh_error}")
+                        logger.warning(
+                            "%s 처리 중 토큰 갱신 실패: %s",
+                            response.status_code,
+                            refresh_error,
+                        )
                         did_auth_refresh = True
 
                 # 에러 응답 처리
@@ -486,6 +496,11 @@ class KISApi:
         """
         with self._token_lock:
             now_kst = datetime.now(KST)
+
+            if not self.app_key or not self.app_secret:
+                raise KISApiError(
+                    "KIS_APP_KEY/KIS_APP_SECRET가 설정되지 않아 토큰 발급을 중단합니다."
+                )
 
             # 메모리 토큰이 유효하면 즉시 재사용
             if not force_refresh and self._is_token_usable(now_kst):

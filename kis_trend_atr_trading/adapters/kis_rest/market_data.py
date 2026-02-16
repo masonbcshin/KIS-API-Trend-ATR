@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Callable, List, Optional
 
 from api.kis_api import KISApi
 from core.market_data import BarCallback, MarketDataProvider
+from utils.market_hours import KST
 
 
 class KISRestMarketDataProvider(MarketDataProvider):
@@ -22,8 +23,44 @@ class KISRestMarketDataProvider(MarketDataProvider):
         self._api = api or KISApi(is_paper_trading=True)
         self._period_type = period_type
 
+    @staticmethod
+    def _completed_minute_bar_ts() -> datetime:
+        now_kst = datetime.now(KST)
+        minute_floor = now_kst.replace(second=0, microsecond=0)
+        return minute_floor - timedelta(minutes=1)
+
+    def _build_synthetic_minute_bars(self, stock_code: str, n: int) -> List[dict]:
+        count = max(int(n), 1)
+        end_ts = self._completed_minute_bar_ts()
+        try:
+            last_price = float(self.get_latest_price(stock_code) or 0.0)
+        except Exception:
+            last_price = 0.0
+
+        bars: List[dict] = []
+        for idx in range(count):
+            start_at = end_ts - timedelta(minutes=(count - idx - 1))
+            bars.append(
+                {
+                    "stock_code": stock_code,
+                    "timeframe": "1m",
+                    "start_at": start_at,
+                    "end_at": start_at + timedelta(minutes=1),
+                    "date": start_at,
+                    "open": last_price,
+                    "high": last_price,
+                    "low": last_price,
+                    "close": last_price,
+                    "volume": 0.0,
+                }
+            )
+        return bars
+
     def get_recent_bars(self, stock_code: str, n: int, timeframe: str) -> List[dict]:
         tf = (timeframe or "").upper()
+        if tf in ("1M", "1MIN", "MINUTE"):
+            return self._build_synthetic_minute_bars(stock_code, n)
+
         if tf not in ("D", "1D", "DAY", "DAILY"):
             raise ValueError(f"REST provider currently supports daily bars only: timeframe={timeframe}")
 
@@ -65,4 +102,3 @@ class KISRestMarketDataProvider(MarketDataProvider):
     ) -> Optional[Callable[[], None]]:
         # REST adapter is polling-only. Subscription is not supported.
         return None
-

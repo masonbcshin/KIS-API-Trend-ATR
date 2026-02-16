@@ -145,6 +145,11 @@ class TestMainMultidayMultiSymbols(unittest.TestCase):
              patch.object(main_multiday, "MultidayTrendATRStrategy", lambda: object()), \
              patch.object(main_multiday.UniverseSelector, "from_yaml", return_value=selector), \
              patch.object(main_multiday, "get_trading_mode", return_value="PAPER"), \
+             patch.object(
+                 main_multiday,
+                 "get_market_session_state",
+                 return_value=(main_multiday.MarketSessionState.IN_SESSION, "regular_session_open"),
+             ), \
              patch.object(main_multiday, "get_instance_lock", return_value=_DummyLock()), \
              patch.object(main_multiday.settings, "validate_settings", return_value=True), \
              patch.object(main_multiday.settings, "get_settings_summary", return_value=""):

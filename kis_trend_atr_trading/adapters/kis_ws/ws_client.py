@@ -6,7 +6,7 @@ import asyncio
 import json
 import os
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Awaitable, Callable, Optional, Sequence
 
 import requests
@@ -50,6 +50,7 @@ class KISWSClient:
         max_reconnect_attempts: int = 5,
         reconnect_base_delay: float = 1.0,
         failure_policy: str = "rest_fallback",
+        approval_key_refresh_margin_min: int = 30,
     ):
         self.app_key = app_key or os.getenv("KIS_APP_KEY", "")
         self.app_secret = app_secret or os.getenv("KIS_APP_SECRET", "")
@@ -64,18 +65,29 @@ class KISWSClient:
         self.reconnect_base_delay = max(float(reconnect_base_delay), 0.2)
         self.failure_policy = failure_policy
         self._approval_key: Optional[str] = None
+        self._approval_key_expires_at: Optional[datetime] = None
+        self._approval_refresh_margin = timedelta(
+            minutes=max(int(approval_key_refresh_margin_min), 1)
+        )
         self._running: bool = False
         self._ws = None
 
     def stop(self) -> None:
         self._running = False
 
+    def _is_approval_key_usable(self) -> bool:
+        if not self._approval_key or not self._approval_key_expires_at:
+            return False
+        return datetime.now() < (self._approval_key_expires_at - self._approval_refresh_margin)
+
     def _get_approval_key(self) -> str:
-        if self._approval_key:
+        if self._is_approval_key_usable():
             return self._approval_key
 
         if not self.app_key or not self.app_secret:
-            raise RuntimeError("KIS_APP_KEY/KIS_APP_SECRET is required for WS.")
+            raise RuntimeError(
+                "KIS_APP_KEY/KIS_APP_SECRET is required for WS approval key request."
+            )
 
         url = f"{self.base_url}/oauth2/Approval"
         headers = {"content-type": "application/json; charset=utf-8"}
@@ -90,7 +102,9 @@ class KISWSClient:
         approval_key = str(data.get("approval_key", "")).strip()
         if not approval_key:
             raise RuntimeError(f"approval_key is missing: {data}")
+        expires_in = int(data.get("expires_in", 86400) or 86400)
         self._approval_key = approval_key
+        self._approval_key_expires_at = datetime.now() + timedelta(seconds=max(expires_in, 60))
         return approval_key
 
     async def _send_subscribe(self, stock_code: str) -> None:
