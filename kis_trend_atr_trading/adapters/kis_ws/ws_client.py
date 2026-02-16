@@ -163,10 +163,36 @@ class KISWSClient:
                 logger.info("[WS] subscribe sent stock=%s tr_id=%s", str(stock_code).zfill(6), TR_SUBSCRIBE)
 
             first_tick_logged = False
+            skipped_logged_count = 0
             while self._running:
                 message = await asyncio.wait_for(ws.recv(), timeout=90)
                 tick = self._parse_tick(message)
                 if tick is None:
+                    if skipped_logged_count < 10:
+                        preview = str(message).replace("\n", "\\n")[:240]
+                        reason = "unknown"
+                        if not message:
+                            reason = "empty_message"
+                        elif str(message).startswith("{"):
+                            reason = "json_control_message"
+                        elif "|" not in str(message):
+                            reason = "non_pipe_message"
+                        else:
+                            parts = str(message).split("|")
+                            if len(parts) < 3:
+                                reason = f"pipe_parts_too_short:{len(parts)}"
+                            elif parts[1] != TR_SUBSCRIBE:
+                                reason = f"unexpected_tr_id:{parts[1]}"
+                            else:
+                                raw = parts[2] if len(parts) == 3 else "|".join(parts[2:])
+                                field_count = len(raw.split("^"))
+                                reason = f"unexpected_field_count:{field_count}"
+                        logger.info(
+                            "[WS][PARSE] skipped message reason=%s preview=%s",
+                            reason,
+                            preview,
+                        )
+                        skipped_logged_count += 1
                     continue
                 if not first_tick_logged:
                     logger.info(
