@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import logging
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -12,6 +13,8 @@ from typing import Deque, Dict, List, Optional, Sequence, Tuple
 import pytz
 
 from utils.market_hours import MarketSessionState
+
+logger = logging.getLogger(__name__)
 
 
 class RuntimeOverlay(Enum):
@@ -188,6 +191,50 @@ class RuntimeStateMachine:
         self._ws_healthy_since: Optional[datetime] = None
         self._recent_ws_bar_ts: Deque[datetime] = deque(maxlen=16)
         self._session_reentered_for_recover: bool = False
+        self._market_state_warning_keys: set[str] = set()
+
+    def _coerce_market_state(self, market_state: object) -> MarketSessionState:
+        """
+        입력 market_state를 runtime_state_machine 기준 Enum으로 정규화합니다.
+
+        동일 파일이 다른 모듈 경로로 로드되면 Enum identity 비교가 실패할 수 있어
+        value 기반으로 안전하게 보정합니다.
+        """
+        if isinstance(market_state, MarketSessionState):
+            return market_state
+
+        raw_value = getattr(market_state, "value", market_state)
+        token = str(raw_value or "").strip().upper()
+        for state in MarketSessionState:
+            if token == state.value:
+                warning_key = (
+                    f"coerce:{type(market_state).__module__}."
+                    f"{type(market_state).__qualname__}:{token}"
+                )
+                if warning_key not in self._market_state_warning_keys:
+                    logger.warning(
+                        "[RUNTIME] market_state type mismatch detected; "
+                        "coerced type=%s value=%s -> %s",
+                        f"{type(market_state).__module__}.{type(market_state).__qualname__}",
+                        raw_value,
+                        state.value,
+                    )
+                    self._market_state_warning_keys.add(warning_key)
+                return state
+
+        warning_key = (
+            f"invalid:{type(market_state).__module__}."
+            f"{type(market_state).__qualname__}:{token}"
+        )
+        if warning_key not in self._market_state_warning_keys:
+            logger.warning(
+                "[RUNTIME] invalid market_state detected; fallback=OFF_SESSION "
+                "type=%s value=%s",
+                f"{type(market_state).__module__}.{type(market_state).__qualname__}",
+                raw_value,
+            )
+            self._market_state_warning_keys.add(warning_key)
+        return MarketSessionState.OFF_SESSION
 
     def _reset_ws_stability(self) -> None:
         self._ws_healthy_since = None
@@ -320,20 +367,21 @@ class RuntimeStateMachine:
         risk_stop: bool,
     ) -> RuntimeDecision:
         now_kst = _ensure_tz(now, self.config.market_timezone)
+        normalized_market_state = self._coerce_market_state(market_state)
 
         market_transition: Optional[Tuple[MarketSessionState, MarketSessionState]] = None
-        if self._last_market_state is not None and self._last_market_state != market_state:
-            market_transition = (self._last_market_state, market_state)
+        if self._last_market_state is not None and self._last_market_state != normalized_market_state:
+            market_transition = (self._last_market_state, normalized_market_state)
             if (
                 self.overlay == RuntimeOverlay.DEGRADED_FEED
                 and market_transition[0] != MarketSessionState.IN_SESSION
                 and market_transition[1] == MarketSessionState.IN_SESSION
             ):
                 self._session_reentered_for_recover = True
-        self._last_market_state = market_state
+        self._last_market_state = normalized_market_state
 
         ws_stable = False
-        if market_state == MarketSessionState.IN_SESSION:
+        if normalized_market_state == MarketSessionState.IN_SESSION:
             ws_stable = self._is_ws_recover_stable(now_kst, feed_status)
         else:
             self._reset_ws_stability()
@@ -345,7 +393,7 @@ class RuntimeStateMachine:
             self.overlay = RuntimeOverlay.EMERGENCY_STOP
             self._overlay_changed_at = now_kst
         elif self.overlay != RuntimeOverlay.EMERGENCY_STOP:
-            if market_state == MarketSessionState.IN_SESSION:
+            if normalized_market_state == MarketSessionState.IN_SESSION:
                 stale_condition = (
                     feed_status.ws_enabled
                     and (now_kst - self.start_ts).total_seconds() >= self.config.ws_start_grace_sec
@@ -375,8 +423,11 @@ class RuntimeStateMachine:
         if prev_overlay != self.overlay:
             overlay_transition = (prev_overlay, self.overlay)
 
-        policy = self._build_policy(market_state, feed_status)
-        if self.overlay == RuntimeOverlay.DEGRADED_FEED and market_state == MarketSessionState.IN_SESSION:
+        policy = self._build_policy(normalized_market_state, feed_status)
+        if (
+            self.overlay == RuntimeOverlay.DEGRADED_FEED
+            and normalized_market_state == MarketSessionState.IN_SESSION
+        ):
             policy = RuntimePolicy(
                 allow_new_entries=policy.allow_new_entries,
                 allow_exit=policy.allow_exit,
@@ -387,7 +438,7 @@ class RuntimeStateMachine:
             )
 
         return RuntimeDecision(
-            market_state=market_state,
+            market_state=normalized_market_state,
             market_reason=market_reason,
             overlay=self.overlay,
             policy=policy,

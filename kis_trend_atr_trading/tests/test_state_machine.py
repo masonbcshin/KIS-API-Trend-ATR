@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from enum import Enum
 
 import pytz
 
@@ -169,3 +170,51 @@ def test_ws_recover_policy_next_session():
         RuntimeOverlay.DEGRADED_FEED,
         RuntimeOverlay.NORMAL,
     )
+
+
+class _ForeignMarketSessionState(Enum):
+    OFF_SESSION = "OFF_SESSION"
+    IN_SESSION = "IN_SESSION"
+
+
+def test_foreign_market_state_enum_is_coerced_with_safe_policy():
+    config = RuntimeConfig(
+        data_feed_default="ws",
+        offsession_ws_enabled=True,
+        ws_start_grace_sec=0,
+        ws_stale_sec=60,
+        ws_min_normal_sec=0,
+    )
+    machine = RuntimeStateMachine(config=config, start_ts=_kst(2026, 2, 17, 6, 0, 0))
+
+    decision = machine.evaluate(
+        now=_kst(2026, 2, 17, 6, 5, 0),
+        market_state=_ForeignMarketSessionState.OFF_SESSION,
+        market_reason="holiday_closed",
+        feed_status=FeedStatus(
+            ws_enabled=True,
+            ws_connected=False,
+            ws_last_message_age_sec=999.0,
+        ),
+        risk_stop=False,
+    )
+
+    assert decision.market_state == MarketSessionState.OFF_SESSION
+    assert decision.policy.active_feed_mode == "rest"
+    assert decision.policy.allow_new_entries is False
+
+
+def test_invalid_market_state_falls_back_to_off_session():
+    config = RuntimeConfig(data_feed_default="ws")
+    machine = RuntimeStateMachine(config=config, start_ts=_kst(2026, 2, 17, 6, 0, 0))
+
+    decision = machine.evaluate(
+        now=_kst(2026, 2, 17, 6, 10, 0),
+        market_state="NOT_A_STATE",
+        market_reason="invalid_input",
+        feed_status=FeedStatus(ws_enabled=True),
+        risk_stop=False,
+    )
+
+    assert decision.market_state == MarketSessionState.OFF_SESSION
+    assert decision.policy.active_feed_mode == "rest"

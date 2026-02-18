@@ -336,6 +336,15 @@ def run_trade(
         print("✅ 토큰 준비 완료\n")
 
         runtime_config = RuntimeConfig.from_settings(settings)
+        logger.info(
+            "[RUNTIME] config feed_default=%s offsession_ws_enabled=%s "
+            "ws_start_grace_sec=%s ws_stale_sec=%s offsession_sleep_sec=%s",
+            runtime_config.data_feed_default,
+            runtime_config.offsession_ws_enabled,
+            runtime_config.ws_start_grace_sec,
+            runtime_config.ws_stale_sec,
+            runtime_config.offsession_sleep_sec,
+        )
         runtime_machine = RuntimeStateMachine(runtime_config, start_ts=datetime.now(KST))
         bar_gate = SymbolBarGate()
         transition_cooldown = TransitionCooldown(runtime_config.telegram_transition_cooldown_sec)
@@ -490,6 +499,19 @@ def run_trade(
                 pass
             ws_stop = None
 
+        def _resolve_effective_feed_mode(decision) -> str:
+            if ws_provider is None:
+                return "rest"
+            if (
+                decision.policy.active_feed_mode == "ws"
+                and decision.market_state in (
+                    MarketSessionState.IN_SESSION,
+                    MarketSessionState.AUCTION_GUARD,
+                )
+            ):
+                return "ws"
+            return "rest"
+
         iteration = 0
         active_feed_name = "rest"
         last_status_log_at = None
@@ -630,16 +652,27 @@ def run_trade(
             if last_status_log_at is None or (
                 now_kst - last_status_log_at
             ).total_seconds() >= runtime_config.status_log_interval_sec:
+                effective_feed_mode = _resolve_effective_feed_mode(decision)
                 summary = (
                     f"[RUNTIME] market_state={decision.market_state.value}, "
                     f"reason={decision.market_reason}, "
                     f"overlay={decision.overlay.value}, "
-                    f"active_feed={decision.policy.active_feed_mode}, "
+                    f"policy_feed={decision.policy.active_feed_mode}, "
+                    f"effective_feed={effective_feed_mode}, "
+                    f"policy_ws_should_run={decision.policy.ws_should_run}, "
                     f"ws_connected={decision.feed_status.ws_connected}, "
                     f"last_ws_message_age={decision.feed_status.ws_last_message_age_sec:.1f}, "
                     f"symbols_count={len(executors)}"
                 )
                 logger.info(summary)
+                if (
+                    decision.market_state == MarketSessionState.OFF_SESSION
+                    and effective_feed_mode != "rest"
+                ):
+                    logger.warning(
+                        "[RUNTIME] OFF_SESSION feed anomaly detected: effective_feed=%s",
+                        effective_feed_mode,
+                    )
                 if runtime_status_telegram:
                     _send_transition_alert(
                         key="runtime:summary",
@@ -674,9 +707,7 @@ def run_trade(
                     )
                     last_prewarm_prepare_date = prewarm_date
 
-            target_feed = "rest"
-            if decision.policy.active_feed_mode == "ws" and ws_provider is not None:
-                target_feed = "ws"
+            target_feed = _resolve_effective_feed_mode(decision)
             active_provider = ws_provider if target_feed == "ws" else rest_provider
             for executor in executors:
                 executor.market_data_provider = active_provider

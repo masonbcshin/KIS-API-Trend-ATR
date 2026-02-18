@@ -199,6 +199,9 @@ CUMULATIVE_DRAWDOWN_WARNING_PCT: float = 10.0
 # 장종료/주문불가 시 pending_exit 재시도 백오프(분)
 PENDING_EXIT_BACKOFF_MINUTES: int = 5
 
+# pending_exit 상태 자동 정리 최대 보관 시간(시간)
+PENDING_EXIT_MAX_AGE_HOURS: int = int(os.getenv("PENDING_EXIT_MAX_AGE_HOURS", "72"))
+
 # 긴급 손절 최대 재시도 횟수
 EMERGENCY_SELL_MAX_RETRIES: int = 10
 

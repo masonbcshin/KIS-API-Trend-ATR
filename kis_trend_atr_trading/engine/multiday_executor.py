@@ -245,9 +245,15 @@ class MultidayExecutor:
         self._pending_exit_backoff_minutes = int(
             getattr(settings, "PENDING_EXIT_BACKOFF_MINUTES", 5)
         )
+        self._pending_exit_max_age_hours = max(
+            int(getattr(settings, "PENDING_EXIT_MAX_AGE_HOURS", 72)),
+            1,
+        )
         self._entry_allowed: bool = True
         self._entry_block_reason: str = ""
-        self._pending_exit_state: Optional[Dict[str, Any]] = self.position_store.load_pending_exit()
+        self._pending_exit_state: Optional[Dict[str, Any]] = self._sanitize_loaded_pending_exit(
+            self.position_store.load_pending_exit()
+        )
         if self._pending_exit_state:
             logger.info(
                 f"[PENDING_EXIT] 복원: symbol={self._pending_exit_state.get('stock_code')}, "
@@ -284,6 +290,86 @@ class MultidayExecutor:
         logger.info(f"종료 시그널 수신: {signum}")
         self._save_position_on_exit()
         sys.exit(0)
+
+    def _parse_iso_datetime(self, raw: Any) -> Optional[datetime]:
+        if raw in (None, ""):
+            return None
+        try:
+            dt = datetime.fromisoformat(str(raw))
+        except (TypeError, ValueError):
+            return None
+        if dt.tzinfo is None:
+            return KST.localize(dt)
+        return dt.astimezone(KST)
+
+    def _sanitize_loaded_pending_exit(
+        self,
+        pending: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        시작 시 로드한 pending_exit를 검증/정리합니다.
+
+        stale 데이터는 전략 의사결정을 왜곡하지 않도록 즉시 제거합니다.
+        """
+        if not isinstance(pending, dict):
+            return None
+
+        pending_symbol = str(pending.get("stock_code") or "").zfill(6)
+        current_symbol = str(self.stock_code or "").zfill(6)
+        if pending_symbol and pending_symbol != current_symbol:
+            logger.warning(
+                "[PENDING_EXIT] 무시: symbol 불일치 stored=%s current=%s",
+                pending_symbol,
+                current_symbol,
+            )
+            self.position_store.clear_pending_exit()
+            return None
+
+        next_retry_raw = pending.get("next_retry_at")
+        updated_raw = pending.get("updated_at") or next_retry_raw
+        if next_retry_raw and self._parse_iso_datetime(next_retry_raw) is None:
+            logger.warning(
+                "[PENDING_EXIT] 무시: next_retry_at 파싱 실패 value=%s",
+                next_retry_raw,
+            )
+            self.position_store.clear_pending_exit()
+            return None
+
+        updated_at = self._parse_iso_datetime(updated_raw)
+        if updated_at is None:
+            logger.warning(
+                "[PENDING_EXIT] 무시: updated_at 파싱 실패 value=%s",
+                updated_raw,
+            )
+            self.position_store.clear_pending_exit()
+            return None
+
+        now = datetime.now(KST)
+        max_age = timedelta(hours=self._pending_exit_max_age_hours)
+        if now - updated_at > max_age:
+            logger.warning(
+                "[PENDING_EXIT] stale 상태 정리: symbol=%s age_hours=%.1f max_age_hours=%s",
+                current_symbol,
+                (now - updated_at).total_seconds() / 3600.0,
+                self._pending_exit_max_age_hours,
+            )
+            self.position_store.clear_pending_exit()
+            return None
+
+        return pending
+
+    def _drop_pending_exit_state(self, reason: str) -> None:
+        if not self._pending_exit_state:
+            return
+        previous = self._pending_exit_state
+        self._pending_exit_state = None
+        self.position_store.clear_pending_exit()
+        logger.info(
+            "[PENDING_EXIT] startup 정리: symbol=%s reason=%s prev_retry_key=%s",
+            self.stock_code,
+            reason,
+            previous.get("retry_key"),
+        )
 
     def _build_dry_run_virtual_snapshot(self) -> Dict[str, Any]:
         """DRY_RUN 모드용 가상 계좌 스냅샷을 생성합니다."""
@@ -707,10 +793,12 @@ class MultidayExecutor:
         sync_error_detail = "\n".join(sync_detail_lines)
         
         if action in ("NO_POSITION", "AUTO_RECOVERED_CLEARED"):
+            self._drop_pending_exit_state("no_position")
             logger.info("포지션 없음 확인")
             return False
         
         elif action == "UNTRACKED_HOLDING":
+            self._drop_pending_exit_state("untracked_holding")
             # 미기록 보유 발견 - 위험 상황
             logger.error("미기록 보유 발견 - 수동 확인 필요")
             self.telegram.notify_error(
@@ -722,11 +810,13 @@ class MultidayExecutor:
             return False
         
         elif action == "STORED_INVALID":
+            self._drop_pending_exit_state("stored_invalid")
             # 저장 데이터 무효 - 이미 삭제됨
             logger.warning("저장된 포지션이 무효하여 삭제됨")
             return False
         
         elif action == "CRITICAL_MISMATCH":
+            self._drop_pending_exit_state("critical_mismatch")
             # 심각한 불일치 - 킬 스위치 권장
             logger.error("심각한 포지션 불일치 - 수동 확인 필요")
             self.telegram.notify_error(
