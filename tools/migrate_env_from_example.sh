@@ -31,10 +31,20 @@ echo "[OK] backup created: $BACKUP_FILE"
 TMP_ADD="$(mktemp)"
 ADDED_COUNT=0
 
+has_key() {
+  local key="$1"
+  local file="$2"
+  if command -v rg >/dev/null 2>&1; then
+    rg -q "^${key}=" "$file"
+  else
+    grep -qE "^${key}=" "$file"
+  fi
+}
+
 while IFS= read -r line; do
   [[ "$line" =~ ^[A-Z][A-Z0-9_]*= ]] || continue
   key="${line%%=*}"
-  if ! rg -q "^${key}=" "$ENV_FILE"; then
+  if ! has_key "$key" "$ENV_FILE"; then
     echo "$line" >> "$TMP_ADD"
     ADDED_COUNT=$((ADDED_COUNT + 1))
   fi
