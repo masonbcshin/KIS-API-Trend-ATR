@@ -108,6 +108,9 @@ class TestPositionResynchronizerModes(unittest.TestCase):
     def setUp(self):
         PositionResynchronizer._db_sync_disabled_globally = False
         PositionResynchronizer._db_sync_disable_reason = ""
+        PositionResynchronizer._startup_holdings_cache = None
+        PositionResynchronizer._startup_holdings_cached_at = None
+        PositionResynchronizer._startup_db_sync_applied = False
 
     def test_paper_mode_sync_uses_api_on_startup(self):
         api = _DummyApi(holdings=[])

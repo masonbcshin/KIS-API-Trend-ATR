@@ -85,6 +85,7 @@ class MultidayExecutor:
     _shared_account_snapshot_ts: Optional[datetime] = None
     _pending_recovery_done: bool = False
     _pending_recovery_count: int = 0
+    _startup_resync_summary_notified: bool = False
 
     @staticmethod
     def _normalize_mode_label(mode: Optional[str]) -> str:
@@ -960,7 +961,7 @@ class MultidayExecutor:
 
         summary = sync_result.get("summary") or {}
         holdings = sync_result.get("holdings") or []
-        if summary:
+        if summary and not self.__class__._startup_resync_summary_notified:
             summary_msg = (
                 "복원 완료: "
                 f"{summary.get('total_holdings', 0)}종목 / "
@@ -974,11 +975,17 @@ class MultidayExecutor:
                 for item in holdings:
                     code = str(item.get("stock_code") or "").strip()
                     qty = int(item.get("qty") or 0)
-                    avg = str(item.get("avg_price") or "0")
+                    raw_avg = item.get("avg_price")
+                    try:
+                        avg_val = quantize_price(Decimal(str(raw_avg or "0")))
+                    except Exception:
+                        avg_val = Decimal("0.00")
+                    avg = f"{avg_val:,.2f}원"
                     if code and qty > 0:
                         detail_lines.append(f"- {code}: qty={qty}, avg={avg}")
                 if detail_lines:
                     self.telegram.notify_info(summary_msg + "\n" + "\n".join(detail_lines))
+            self.__class__._startup_resync_summary_notified = True
         
         action = sync_result.get("action", "")
         sync_warnings = sync_result.get("warnings", []) or []

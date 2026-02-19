@@ -61,6 +61,9 @@ class _DummyDbRepo:
 
 
 def test_reconcile_overwrites_stored_entry_price_and_quantity_from_holdings():
+    PositionResynchronizer._startup_holdings_cache = None
+    PositionResynchronizer._startup_holdings_cached_at = None
+    PositionResynchronizer._startup_db_sync_applied = False
     stored = StoredPosition(
         stock_code="005930",
         entry_price=60000.0,
@@ -102,6 +105,9 @@ def test_reconcile_overwrites_stored_entry_price_and_quantity_from_holdings():
 
 
 def test_reconcile_closes_db_open_positions_missing_from_holdings():
+    PositionResynchronizer._startup_holdings_cache = None
+    PositionResynchronizer._startup_holdings_cached_at = None
+    PositionResynchronizer._startup_db_sync_applied = False
     api = _DummyApi(
         [
             {
@@ -126,3 +132,43 @@ def test_reconcile_closes_db_open_positions_missing_from_holdings():
     assert result["success"] is True
     assert "000660" in db_repo.closed_symbols
     assert result["summary"]["zombies"] == 1
+
+
+def test_reconcile_avg_adjusted_action_when_only_avg_changes():
+    PositionResynchronizer._startup_holdings_cache = None
+    PositionResynchronizer._startup_holdings_cached_at = None
+    PositionResynchronizer._startup_db_sync_applied = False
+    stored = StoredPosition(
+        stock_code="005930",
+        entry_price=70000.0,
+        quantity=3,
+        stop_loss=68000.0,
+        take_profit=73000.0,
+        entry_date="2026-02-10",
+        atr_at_entry=1200.0,
+    )
+    api = _DummyApi(
+        [
+            {
+                "stock_code": "005930",
+                "qty": 3,
+                "avg_price": Decimal("70100.11"),
+            }
+        ]
+    )
+    db_repo = _DummyDbRepo(open_positions=[_DbPosition(symbol="005930")])
+    store = _DummyStore(stored=stored)
+    syncer = PositionResynchronizer(
+        api=api,
+        position_store=store,
+        db_repository=db_repo,
+        trading_mode="PAPER",
+        target_symbol="005930",
+    )
+
+    result = syncer.synchronize_on_startup()
+
+    assert result["success"] is True
+    assert result["action"] == "AVG_ADJUSTED"
+    assert result["position"].quantity == 3
+    assert result["position"].entry_price == 70100.11

@@ -1031,6 +1031,9 @@ class PositionResynchronizer:
     """
     _db_sync_disabled_globally: bool = False
     _db_sync_disable_reason: str = ""
+    _startup_holdings_cache: Optional[Dict[str, Dict[str, Any]]] = None
+    _startup_holdings_cached_at: Optional[datetime] = None
+    _startup_db_sync_applied: bool = False
     
     def __init__(
         self,
@@ -1138,6 +1141,25 @@ class PositionResynchronizer:
                 raise RuntimeError("계좌 잔고 조회 실패")
             raw_holdings = balance.get("holdings", [])
         return self._extract_active_holdings(raw_holdings)
+
+    @classmethod
+    def _load_startup_holdings_cache(cls) -> Optional[Dict[str, Dict[str, Any]]]:
+        if cls._startup_holdings_cache is None:
+            return None
+        if cls._startup_holdings_cached_at is None:
+            return cls._startup_holdings_cache
+        age_sec = (datetime.now(KST) - cls._startup_holdings_cached_at).total_seconds()
+        if age_sec > 120:
+            cls._startup_holdings_cache = None
+            cls._startup_holdings_cached_at = None
+            cls._startup_db_sync_applied = False
+            return None
+        return cls._startup_holdings_cache
+
+    @classmethod
+    def _save_startup_holdings_cache(cls, holdings: Dict[str, Dict[str, Any]]) -> None:
+        cls._startup_holdings_cache = holdings
+        cls._startup_holdings_cached_at = datetime.now(KST)
 
     def _resolve_target_holding(
         self,
@@ -1406,7 +1428,13 @@ class PositionResynchronizer:
         if self._is_account_sync_mode():
             # 1. API로 실제 보유 조회 (PAPER/REAL 모드)
             try:
-                api_holdings = self._fetch_ssot_holdings()
+                cached_holdings = self.__class__._load_startup_holdings_cache()
+                if cached_holdings is not None:
+                    api_holdings = cached_holdings
+                    logger.info("[RESYNC] startup holdings cache 재사용")
+                else:
+                    api_holdings = self._fetch_ssot_holdings()
+                    self.__class__._save_startup_holdings_cache(api_holdings)
                 result["holdings"] = [
                     {
                         "stock_code": symbol,
@@ -1418,7 +1446,11 @@ class PositionResynchronizer:
                 result["summary"]["total_holdings"] = len(api_holdings)
 
                 # ★ DB는 항상 API 계좌 보유를 기준으로 선반영
-                self._sync_db_positions_from_api(api_holdings, result)
+                if not self.__class__._startup_db_sync_applied:
+                    self._sync_db_positions_from_api(api_holdings, result)
+                    self.__class__._startup_db_sync_applied = True
+                else:
+                    logger.info("[RESYNC] startup DB 동기화는 이미 수행되어 재사용")
 
             except Exception as e:
                 result["warnings"].append(f"API 오류: {str(e)}")
@@ -1528,11 +1560,12 @@ class PositionResynchronizer:
                 )
             else:
                 result["success"] = True
+                qty_changed = api_qty != stored_position.quantity
                 stored_position.quantity = api_qty
                 stored_position.entry_price = api_avg
                 self.position_store.save_position(stored_position)
                 result["position"] = stored_position
-                result["action"] = "QTY_ADJUSTED"
+                result["action"] = "QTY_ADJUSTED" if qty_changed else "AVG_ADJUSTED"
                 msg = (
                     f"API 기준 자동복구: 정합 조정 {stored_position.stock_code} "
                     f"qty={api_qty}, avg={api_avg:,.2f}"
@@ -1594,6 +1627,7 @@ class PositionResynchronizer:
         
         try:
             api_holdings = self._fetch_ssot_holdings()
+            self.__class__._save_startup_holdings_cache(api_holdings)
             active_holdings = [
                 {
                     "stock_code": symbol,
@@ -1611,6 +1645,7 @@ class PositionResynchronizer:
 
             # DB도 API 계좌 기준으로 동기화
             self._sync_db_positions_from_api(api_holdings, result)
+            self.__class__._startup_db_sync_applied = True
             
             # 저장 포지션도 API 기준으로 강제 동기화
             stored_position = self.position_store.load_position()
