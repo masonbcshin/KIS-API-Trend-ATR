@@ -23,12 +23,14 @@ import atexit
 import hashlib
 from pathlib import Path
 from datetime import datetime, time as dt_time, timedelta
+from decimal import Decimal
 from typing import List, Tuple, Optional, Dict, Set, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 from utils.logger import get_logger
 from utils.market_hours import KST
+from utils.avg_price import quantize_price, calc_weighted_avg
 from env import get_trading_mode
 
 try:
@@ -397,6 +399,7 @@ class SynchronizedOrderResult:
     exec_qty: int = 0                     # 실제 체결 수량
     exec_price: float = 0.0               # 실제 체결 가격
     message: str = ""                     # 상세 메시지
+    fills: List[Dict[str, Any]] = field(default_factory=list)  # fill 단위 상세
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -405,7 +408,8 @@ class SynchronizedOrderResult:
             "order_no": self.order_no,
             "exec_qty": self.exec_qty,
             "exec_price": self.exec_price,
-            "message": self.message
+            "message": self.message,
+            "fills": self.fills,
         }
 
 
@@ -753,7 +757,8 @@ class OrderSynchronizer:
                 order_no=order_no,
                 exec_qty=exec_result.get("exec_qty", 0),
                 exec_price=exec_result.get("exec_price", 0),
-                message=exec_result.get("message", "완전 체결")
+                message=exec_result.get("message", "완전 체결"),
+                fills=exec_result.get("fills", []) or [],
             )
         
         elif exec_result.get("status") == "PARTIAL":
@@ -775,7 +780,8 @@ class OrderSynchronizer:
                 order_no=order_no,
                 exec_qty=exec_result.get("exec_qty", 0),
                 exec_price=exec_result.get("exec_price", 0),
-                message=exec_result.get("message", "부분 체결")
+                message=exec_result.get("message", "부분 체결"),
+                fills=exec_result.get("fills", []) or [],
             )
         
         else:
@@ -796,7 +802,8 @@ class OrderSynchronizer:
                 order_no=order_no,
                 exec_qty=exec_result.get("exec_qty", 0),
                 exec_price=exec_result.get("exec_price", 0),
-                message=exec_result.get("message", "미체결/취소")
+                message=exec_result.get("message", "미체결/취소"),
+                fills=exec_result.get("fills", []) or [],
             )
     
     def execute_sell_order(
@@ -955,7 +962,8 @@ class OrderSynchronizer:
                 order_no=order_no,
                 exec_qty=exec_result.get("exec_qty", 0),
                 exec_price=exec_result.get("exec_price", 0),
-                message=exec_result.get("message", "완전 체결")
+                message=exec_result.get("message", "완전 체결"),
+                fills=exec_result.get("fills", []) or [],
             )
         
         elif exec_result.get("status") == "PARTIAL":
@@ -978,7 +986,8 @@ class OrderSynchronizer:
                 order_no=order_no,
                 exec_qty=exec_result.get("exec_qty", 0),
                 exec_price=exec_result.get("exec_price", 0),
-                message=exec_result.get("message", "부분 체결 - 미체결분 취소됨")
+                message=exec_result.get("message", "부분 체결 - 미체결분 취소됨"),
+                fills=exec_result.get("fills", []) or [],
             )
         
         else:
@@ -999,7 +1008,8 @@ class OrderSynchronizer:
                 order_no=order_no,
                 exec_qty=exec_result.get("exec_qty", 0),
                 exec_price=exec_result.get("exec_price", 0),
-                message=exec_result.get("message", "미체결/취소")
+                message=exec_result.get("message", "미체결/취소"),
+                fills=exec_result.get("fills", []) or [],
             )
 
 
@@ -1049,44 +1059,64 @@ class PositionResynchronizer:
         return self.trading_mode in ("PAPER", "REAL")
 
     @staticmethod
-    def _extract_active_holdings(balance: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-        holdings = balance.get("holdings", []) if isinstance(balance, dict) else []
+    def _extract_active_holdings(holdings_payload: Any) -> Dict[str, Dict[str, Any]]:
+        """
+        SSOT holdings(payload)에서 유효 보유만 추출/집계합니다.
+
+        입력 허용:
+            - api.get_holdings() 결과(list)
+            - api.get_account_balance() 결과(dict, holdings 키)
+        """
+        if isinstance(holdings_payload, dict):
+            rows = holdings_payload.get("holdings", [])
+        else:
+            rows = holdings_payload
+
+        holdings = rows if isinstance(rows, list) else []
         aggregated: Dict[str, Dict[str, Any]] = {}
 
         for raw_holding in holdings:
+            if not isinstance(raw_holding, dict):
+                continue
             stock_code = str(raw_holding.get("stock_code", "")).strip()
-            qty = PositionResynchronizer._safe_int(raw_holding.get("quantity"), 0)
+            qty = PositionResynchronizer._safe_int(
+                raw_holding.get("qty", raw_holding.get("quantity")),
+                0,
+            )
             if not stock_code or qty <= 0:
                 continue
 
+            avg_price = PositionResynchronizer._safe_decimal(
+                raw_holding.get("avg_price"),
+                Decimal("0"),
+            )
+            avg_price = quantize_price(avg_price if avg_price > 0 else Decimal("0"))
+            stock_name = raw_holding.get("stock_name")
+
             if stock_code not in aggregated:
-                holding = dict(raw_holding)
-                holding["quantity"] = qty
-                aggregated[stock_code] = holding
+                aggregated[stock_code] = {
+                    "stock_code": stock_code,
+                    "qty": qty,
+                    "avg_price": avg_price,
+                    "stock_name": stock_name,
+                }
                 continue
 
             existing = aggregated[stock_code]
-            prev_qty = PositionResynchronizer._safe_int(existing.get("quantity"), 0)
+            prev_qty = PositionResynchronizer._safe_int(existing.get("qty"), 0)
             new_qty = prev_qty + qty
             if new_qty <= 0:
                 continue
 
-            prev_avg = PositionResynchronizer._safe_float(existing.get("avg_price"), 0.0)
-            new_avg = PositionResynchronizer._safe_float(raw_holding.get("avg_price"), prev_avg)
-            blended_avg = (
-                ((prev_avg * prev_qty) + (new_avg * qty)) / new_qty
-                if prev_qty > 0 and new_avg > 0
-                else max(prev_avg, new_avg)
+            prev_avg = PositionResynchronizer._safe_decimal(
+                existing.get("avg_price"),
+                Decimal("0"),
             )
-
-            existing["quantity"] = new_qty
+            blended_avg = calc_weighted_avg(prev_avg, prev_qty, avg_price, qty)
+            existing["qty"] = new_qty
             existing["avg_price"] = blended_avg
-            latest_price = PositionResynchronizer._safe_float(
-                raw_holding.get("current_price"),
-                PositionResynchronizer._safe_float(existing.get("current_price"), 0.0),
-            )
-            if latest_price > 0:
-                existing["current_price"] = latest_price
+            if stock_name and not existing.get("stock_name"):
+                existing["stock_name"] = stock_name
             logger.warning(
                 "[RESYNC] 동일 종목 다중 보유 row 감지: %s qty 누적 %s + %s = %s",
                 stock_code,
@@ -1096,6 +1126,18 @@ class PositionResynchronizer:
             )
 
         return aggregated
+
+    def _fetch_ssot_holdings(self) -> Dict[str, Dict[str, Any]]:
+        """잔고조회(보유수량+매입평균가) 기준 SSOT holdings를 조회합니다."""
+        self.api.get_access_token()
+        if hasattr(self.api, "get_holdings"):
+            raw_holdings = self.api.get_holdings()
+        else:
+            balance = self.api.get_account_balance()
+            if not isinstance(balance, dict) or not balance.get("success"):
+                raise RuntimeError("계좌 잔고 조회 실패")
+            raw_holdings = balance.get("holdings", [])
+        return self._extract_active_holdings(raw_holdings)
 
     def _resolve_target_holding(
         self,
@@ -1126,10 +1168,16 @@ class PositionResynchronizer:
         """API 보유 정보로 StoredPosition을 구성합니다."""
         from utils.position_store import StoredPosition
 
-        qty = self._safe_int(holding.get("quantity"), 0)
-        avg_price = self._safe_float(holding.get("avg_price"), 0.0)
-        current_price = self._safe_float(holding.get("current_price"), avg_price)
-        base_price = avg_price if avg_price > 0 else max(current_price, 1.0)
+        qty = self._safe_int(holding.get("qty", holding.get("quantity")), 0)
+        avg_price_dec = self._safe_decimal(holding.get("avg_price"), Decimal("0"))
+        avg_price_dec = quantize_price(avg_price_dec) if avg_price_dec > 0 else Decimal("0")
+        current_price = self._safe_float(holding.get("current_price"), 0.0)
+        if avg_price_dec > 0:
+            base_price = float(avg_price_dec)
+        elif current_price > 0:
+            base_price = float(quantize_price(Decimal(str(current_price))))
+        else:
+            base_price = 1.0
 
         if qty <= 0:
             return None
@@ -1192,6 +1240,21 @@ class PositionResynchronizer:
         except (TypeError, ValueError):
             return default
 
+    @staticmethod
+    def _safe_decimal(value: Any, default: Decimal = Decimal("0")) -> Decimal:
+        """Decimal 변환 실패 시 기본값을 반환합니다."""
+        if isinstance(value, Decimal):
+            return value
+        if value is None:
+            return default
+        raw = str(value).strip().replace(",", "")
+        if not raw:
+            return default
+        try:
+            return Decimal(str(raw))
+        except Exception:
+            return default
+
     def _sync_db_positions_from_api(
         self,
         api_holdings: Dict[str, Dict[str, Any]],
@@ -1216,36 +1279,52 @@ class PositionResynchronizer:
                 )
             return
 
+        summary = result.setdefault(
+            "summary",
+            {"total_holdings": 0, "updated": 0, "created": 0, "zombies": 0},
+        )
+        summary["total_holdings"] = len(api_holdings)
+
         try:
             db_open_positions = self.db_repository.get_open_positions()
             db_map = {p.symbol: p for p in db_open_positions}
+            updated_count = 0
+            created_count = 0
+            zombie_count = 0
 
             # 1) DB에는 있으나 실제 계좌에는 없는 포지션 정리
             for symbol, db_pos in db_map.items():
                 if symbol not in api_holdings:
                     self.db_repository.close_position(symbol)
+                    zombie_count += 1
                     msg = f"DB OPEN 정리: {symbol} (실계좌 보유 없음)"
                     result["warnings"].append(msg)
                     logger.warning(f"[RESYNC][DB] {msg}")
 
             # 2) 실제 계좌 보유를 DB에 반영
             for symbol, holding in api_holdings.items():
-                qty = self._safe_int(holding.get("quantity"), 0)
+                qty = self._safe_int(holding.get("qty", holding.get("quantity")), 0)
                 if qty <= 0:
                     continue
 
-                avg_price = self._safe_float(holding.get("avg_price"), 0.0)
-                current_price = self._safe_float(holding.get("current_price"), avg_price)
-                base_price = avg_price if avg_price > 0 else max(current_price, 1.0)
+                avg_price_dec = self._safe_decimal(holding.get("avg_price"), Decimal("0"))
+                avg_price_dec = quantize_price(avg_price_dec) if avg_price_dec > 0 else Decimal("0")
+                current_price = self._safe_float(holding.get("current_price"), float(avg_price_dec))
+                if avg_price_dec > 0:
+                    base_price = float(avg_price_dec)
+                else:
+                    base_price = max(current_price, 1.0)
 
                 existing = db_map.get(symbol)
                 if existing:
+                    updated_count += 1
                     atr_at_entry = existing.atr_at_entry if existing.atr_at_entry > 0 else max(base_price * 0.01, 1.0)
                     stop_price = existing.stop_price if existing.stop_price > 0 else round(base_price * 0.95, 2)
                     take_profit = existing.take_profit_price
                     trailing_stop = existing.trailing_stop if existing.trailing_stop else stop_price
                     highest_price = max(existing.highest_price or base_price, current_price, base_price)
                 else:
+                    created_count += 1
                     atr_at_entry = max(base_price * 0.01, 1.0)
                     stop_price = round(base_price * 0.95, 2)
                     take_profit = None
@@ -1271,6 +1350,9 @@ class PositionResynchronizer:
                         f"[RESYNC][DB] 실계좌 기준 반영: {symbol} "
                         f"qty={qty}, avg={base_price:,.0f}"
                     )
+            summary["updated"] = updated_count
+            summary["created"] = created_count
+            summary["zombies"] = zombie_count
         except Exception as e:
             err_text = str(e)
             lowered = err_text.lower()
@@ -1315,26 +1397,33 @@ class PositionResynchronizer:
             "action": "",
             "warnings": [],
             "recoveries": [],
+            "allow_new_entries": True,
+            "summary": {"total_holdings": 0, "updated": 0, "created": 0, "zombies": 0},
+            "holdings": [],
         }
         
         api_holdings: Dict[str, Dict[str, Any]] = {}
         if self._is_account_sync_mode():
             # 1. API로 실제 보유 조회 (PAPER/REAL 모드)
             try:
-                self.api.get_access_token()
-                balance = self.api.get_account_balance()
-                
-                if not balance.get("success"):
-                    result["warnings"].append("계좌 잔고 조회 실패")
-                    return result
-                
-                api_holdings = self._extract_active_holdings(balance)
+                api_holdings = self._fetch_ssot_holdings()
+                result["holdings"] = [
+                    {
+                        "stock_code": symbol,
+                        "qty": int(info.get("qty", 0)),
+                        "avg_price": str(info.get("avg_price", Decimal("0"))),
+                    }
+                    for symbol, info in api_holdings.items()
+                ]
+                result["summary"]["total_holdings"] = len(api_holdings)
 
                 # ★ DB는 항상 API 계좌 보유를 기준으로 선반영
                 self._sync_db_positions_from_api(api_holdings, result)
 
             except Exception as e:
                 result["warnings"].append(f"API 오류: {str(e)}")
+                result["action"] = "API_FAILED"
+                result["allow_new_entries"] = False
                 return result
         
         # 2. 저장된 포지션 로드
@@ -1361,6 +1450,7 @@ class PositionResynchronizer:
                     result["success"] = False
                     result["position"] = None
                     result["action"] = "UNTRACKED_HOLDING"
+                    result["allow_new_entries"] = False
                     result["warnings"].append(
                         f"미기록 보유 발견(대상 미확정): 보유={list(api_holdings.keys())}"
                     )
@@ -1406,14 +1496,28 @@ class PositionResynchronizer:
             return result
 
         if stored_position.stock_code == resolved_symbol:
-            api_qty = self._safe_int(resolved_holding.get("quantity"), stored_position.quantity)
+            api_qty = self._safe_int(
+                resolved_holding.get("qty", resolved_holding.get("quantity")),
+                stored_position.quantity,
+            )
+            api_avg = float(
+                quantize_price(
+                    self._safe_decimal(
+                        resolved_holding.get("avg_price"),
+                        Decimal(str(stored_position.entry_price)),
+                    )
+                )
+            )
             logger.info(
                 "[RESYNC] 수량 대조: symbol=%s, stored_qty=%s, api_qty=%s",
                 stored_position.stock_code,
                 stored_position.quantity,
                 api_qty,
             )
-            if api_qty == stored_position.quantity:
+            if (
+                api_qty == stored_position.quantity
+                and round(float(stored_position.entry_price), 2) == round(float(api_avg), 2)
+            ):
                 result["success"] = True
                 result["position"] = stored_position
                 result["action"] = "MATCHED"
@@ -1425,10 +1529,14 @@ class PositionResynchronizer:
             else:
                 result["success"] = True
                 stored_position.quantity = api_qty
+                stored_position.entry_price = api_avg
                 self.position_store.save_position(stored_position)
                 result["position"] = stored_position
                 result["action"] = "QTY_ADJUSTED"
-                msg = f"API 기준 자동복구: 수량 조정 {stored_position.stock_code} → {api_qty}주"
+                msg = (
+                    f"API 기준 자동복구: 정합 조정 {stored_position.stock_code} "
+                    f"qty={api_qty}, avg={api_avg:,.2f}"
+                )
                 result["recoveries"].append(msg)
                 logger.warning(f"[RESYNC][AUTO] {msg}")
             return result
@@ -1442,6 +1550,7 @@ class PositionResynchronizer:
             result["success"] = False
             result["position"] = None
             result["action"] = "CRITICAL_MISMATCH"
+            result["allow_new_entries"] = False
             result["warnings"].append(
                 f"심각한 불일치: 저장={stored_position.stock_code}, 보유={list(api_holdings.keys())}"
             )
@@ -1473,7 +1582,9 @@ class PositionResynchronizer:
         result = {
             "success": False,
             "holdings": [],
-            "action": ""
+            "action": "",
+            "allow_new_entries": True,
+            "summary": {"total_holdings": 0, "updated": 0, "created": 0, "zombies": 0},
         }
 
         if not self._is_account_sync_mode():
@@ -1482,20 +1593,21 @@ class PositionResynchronizer:
             return result
         
         try:
-            self.api.get_access_token()
-            balance = self.api.get_account_balance()
-            
-            if not balance.get("success"):
-                result["action"] = "API_FAILED"
-                return result
-            
-            holdings = balance.get("holdings", [])
-            active_holdings = [h for h in holdings if h.get("quantity", 0) > 0]
-            api_holdings = {h["stock_code"]: h for h in active_holdings}
+            api_holdings = self._fetch_ssot_holdings()
+            active_holdings = [
+                {
+                    "stock_code": symbol,
+                    "qty": info.get("qty", 0),
+                    "avg_price": info.get("avg_price", Decimal("0")),
+                    "stock_name": info.get("stock_name"),
+                }
+                for symbol, info in api_holdings.items()
+            ]
             
             result["success"] = True
             result["holdings"] = active_holdings
             result["action"] = "SYNCED"
+            result["summary"]["total_holdings"] = len(active_holdings)
 
             # DB도 API 계좌 기준으로 동기화
             self._sync_db_positions_from_api(api_holdings, result)
@@ -1519,6 +1631,7 @@ class PositionResynchronizer:
             
         except Exception as e:
             result["action"] = f"ERROR: {str(e)}"
+            result["allow_new_entries"] = False
             return result
 
 

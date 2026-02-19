@@ -22,6 +22,7 @@ import signal
 import sys
 import hashlib
 from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Dict, Optional, Any
 import pandas as pd
 
@@ -56,8 +57,10 @@ from utils.position_store import (
     get_position_store
 )
 from db.repository import get_position_repository
+from db.repository import get_trade_repository
 from db.mysql import get_db_manager, QueryError
 from core.market_data import MarketDataProvider
+from utils.avg_price import calc_weighted_avg, quantize_price, reduce_quantity_after_sell
 from utils.telegram_notifier import TelegramNotifier, get_telegram_notifier
 from utils.logger import get_logger, TradeLogger
 from utils.market_hours import KST
@@ -176,6 +179,10 @@ class MultidayExecutor:
             self.db_position_repo = get_position_repository()
         except Exception:
             self.db_position_repo = None
+        try:
+            self.db_trade_repo = get_trade_repository()
+        except Exception:
+            self.db_trade_repo = None
 
         # 리포트용 DB 성과 적재 (실패 시 매매 로직에는 영향 없음)
         try:
@@ -615,6 +622,169 @@ class MultidayExecutor:
                 f"[REPORT_DB] 거래 적재 예외(무시): side={side}, symbol={self.stock_code}, err={err}"
             )
 
+    def _parse_fill_executed_at(self, raw: Any) -> datetime:
+        if isinstance(raw, datetime):
+            return raw
+        if raw in (None, ""):
+            return datetime.now(KST)
+        try:
+            dt = datetime.fromisoformat(str(raw))
+            if dt.tzinfo is None:
+                return KST.localize(dt)
+            return dt.astimezone(KST)
+        except Exception:
+            return datetime.now(KST)
+
+    def _build_fill_idempotency_key(
+        self,
+        *,
+        side: str,
+        order_no: str,
+        exec_id: Optional[str],
+        executed_at: datetime,
+        price: float,
+        quantity: int,
+    ) -> str:
+        if exec_id:
+            seed = (
+                f"FILL|{self._report_mode}|{side.upper()}|{self.stock_code}|"
+                f"{order_no}|{exec_id}"
+            )
+        else:
+            seed = (
+                f"FILL|{self._report_mode}|{side.upper()}|{self.stock_code}|"
+                f"{order_no}|{executed_at.isoformat()}|{price:.2f}|{quantity}"
+            )
+        return hashlib.sha256(seed.encode("utf-8")).hexdigest()
+
+    def _extract_execution_fills(self, sync_result: Any, side: str) -> list[Dict[str, Any]]:
+        fills: list[Dict[str, Any]] = []
+        raw_fills = getattr(sync_result, "fills", None) or []
+        for raw in raw_fills:
+            if not isinstance(raw, dict):
+                continue
+            qty = int(raw.get("qty") or 0)
+            price_raw = raw.get("price")
+            if qty <= 0 or price_raw in (None, ""):
+                continue
+            price_dec = quantize_price(Decimal(str(price_raw)))
+            if price_dec <= 0:
+                continue
+            executed_at = self._parse_fill_executed_at(raw.get("executed_at"))
+            fills.append(
+                {
+                    "order_no": str(raw.get("order_no") or getattr(sync_result, "order_no", "") or ""),
+                    "exec_id": (str(raw.get("exec_id")).strip() if raw.get("exec_id") not in (None, "") else None),
+                    "executed_at": executed_at,
+                    "price": float(price_dec),
+                    "qty": qty,
+                    "side": str(raw.get("side") or side).upper(),
+                }
+            )
+
+        if not fills:
+            qty = int(getattr(sync_result, "exec_qty", 0) or 0)
+            price = float(getattr(sync_result, "exec_price", 0.0) or 0.0)
+            if qty > 0 and price > 0:
+                price_dec = quantize_price(Decimal(str(price)))
+                fills.append(
+                    {
+                        "order_no": str(getattr(sync_result, "order_no", "") or ""),
+                        "exec_id": None,
+                        "executed_at": datetime.now(KST),
+                        "price": float(price_dec),
+                        "qty": qty,
+                        "side": side.upper(),
+                    }
+                )
+        return fills
+
+    def _record_execution_fill(
+        self,
+        *,
+        side: str,
+        fill: Dict[str, Any],
+        reason: Optional[str] = None,
+        entry_price: Optional[float] = None,
+        holding_days: Optional[int] = None,
+        pnl: Optional[float] = None,
+        pnl_pct: Optional[float] = None,
+    ) -> bool:
+        order_no = str(fill.get("order_no") or "")
+        exec_id = fill.get("exec_id")
+        executed_at = self._parse_fill_executed_at(fill.get("executed_at"))
+        price = float(fill.get("price") or 0.0)
+        quantity = int(fill.get("qty") or 0)
+        if quantity <= 0 or price <= 0:
+            return False
+
+        idem_key = self._build_fill_idempotency_key(
+            side=side,
+            order_no=order_no,
+            exec_id=str(exec_id) if exec_id else None,
+            executed_at=executed_at,
+            price=price,
+            quantity=quantity,
+        )
+
+        if self.db_trade_repo is not None:
+            _record, created = self.db_trade_repo.save_execution_fill(
+                symbol=self.stock_code,
+                side=side,
+                price=price,
+                quantity=quantity,
+                executed_at=executed_at,
+                order_no=order_no,
+                exec_id=str(exec_id) if exec_id else None,
+                reason=reason,
+                entry_price=entry_price,
+                holding_days=holding_days,
+                pnl=pnl,
+                pnl_percent=pnl_pct,
+                idempotency_key=idem_key,
+            )
+            if created:
+                return True
+            return False
+
+        # DB repository가 없으면 기존 적재 경로로 폴백(중복 방지는 제한적)
+        self._persist_trade_record(
+            side=side,
+            price=price,
+            quantity=quantity,
+            order_no=order_no or None,
+            reason=reason,
+            pnl=pnl,
+            pnl_pct=pnl_pct,
+            entry_price=entry_price,
+            holding_days=holding_days,
+            executed_at=executed_at,
+        )
+        return True
+
+    def _sync_db_position_from_strategy(self) -> None:
+        if self.db_position_repo is None:
+            return
+        try:
+            if not self.strategy.has_position:
+                self.db_position_repo.close_position(self.stock_code)
+                return
+            pos = self.strategy.position
+            entry_price = float(quantize_price(Decimal(str(pos.entry_price))))
+            self.db_position_repo.upsert_from_account_holding(
+                symbol=self.stock_code,
+                entry_price=entry_price,
+                quantity=int(pos.quantity),
+                atr_at_entry=float(pos.atr_at_entry),
+                stop_price=float(pos.stop_loss),
+                take_profit_price=float(pos.take_profit) if pos.take_profit is not None else None,
+                trailing_stop=float(pos.trailing_stop),
+                highest_price=float(pos.highest_price),
+                entry_time=datetime.now(KST),
+            )
+        except Exception as err:
+            logger.warning(f"[REPO] 포지션 동기화 실패(무시): {err}")
+
     def _persist_account_snapshot(self, force: bool = False) -> None:
         if not self._report_db_available():
             return
@@ -770,7 +940,14 @@ class MultidayExecutor:
         
         # ★ API 기준 재동기화 (감사 보고서 지적 해결)
         sync_result = self.position_resync.synchronize_on_startup()
-        
+        if not sync_result.get("allow_new_entries", True):
+            reason = (
+                sync_result.get("action")
+                or "; ".join(sync_result.get("warnings", []) or [])
+                or "reconcile_failed"
+            )
+            self.set_entry_control(False, f"[ENTRY] blocked by reconcile: {reason}")
+
         # 경고 메시지 출력
         for warning in sync_result.get("warnings", []):
             logger.warning(f"[RESYNC] {warning}")
@@ -780,6 +957,28 @@ class MultidayExecutor:
         for recovery in sync_result.get("recoveries", []):
             logger.info(f"[RESYNC][AUTO] {recovery}")
             self.telegram.notify_info(f"포지션 자동복구 완료: {recovery}")
+
+        summary = sync_result.get("summary") or {}
+        holdings = sync_result.get("holdings") or []
+        if summary:
+            summary_msg = (
+                "복원 완료: "
+                f"{summary.get('total_holdings', 0)}종목 / "
+                f"업데이트 {summary.get('updated', 0)} / "
+                f"신규생성 {summary.get('created', 0)} / "
+                f"좀비정리 {summary.get('zombies', 0)}"
+            )
+            logger.info(f"[RESYNC] {summary_msg}")
+            if holdings:
+                detail_lines = []
+                for item in holdings:
+                    code = str(item.get("stock_code") or "").strip()
+                    qty = int(item.get("qty") or 0)
+                    avg = str(item.get("avg_price") or "0")
+                    if code and qty > 0:
+                        detail_lines.append(f"- {code}: qty={qty}, avg={avg}")
+                if detail_lines:
+                    self.telegram.notify_info(summary_msg + "\n" + "\n".join(detail_lines))
         
         action = sync_result.get("action", "")
         sync_warnings = sync_result.get("warnings", []) or []
@@ -795,6 +994,16 @@ class MultidayExecutor:
         if action in ("NO_POSITION", "AUTO_RECOVERED_CLEARED"):
             self._drop_pending_exit_state("no_position")
             logger.info("포지션 없음 확인")
+            return False
+        
+        elif action == "API_FAILED":
+            self._drop_pending_exit_state("api_failed")
+            logger.error("포지션 동기화 실패(API) - 신규 진입 차단 유지")
+            self.telegram.notify_error(
+                "포지션 동기화 실패",
+                "잔고조회 실패로 신규 진입을 차단했습니다.",
+                error_detail=sync_error_detail,
+            )
             return False
         
         elif action == "UNTRACKED_HOLDING":
@@ -1159,103 +1368,156 @@ class MultidayExecutor:
             )
             
             if sync_result.success:
-                # ★ 체결 확인됨 - 실제 체결가로 포지션 오픈
-                actual_price = sync_result.exec_price if sync_result.exec_price > 0 else signal.price
-                actual_qty = sync_result.exec_qty if sync_result.exec_qty > 0 else self.order_quantity
-                
-                # 실제 체결가 기준으로 손절/익절 재계산
-                actual_stop_loss = actual_price - (signal.atr * settings.ATR_MULTIPLIER_SL)
-                actual_take_profit = actual_price + (signal.atr * settings.ATR_MULTIPLIER_TP)
-                
-                self.strategy.open_position(
-                    symbol=self.stock_code,
-                    entry_price=actual_price,
-                    quantity=actual_qty,
-                    atr=signal.atr,
-                    stop_loss=actual_stop_loss,
-                    take_profit=actual_take_profit
-                )
-                
-                # 포지션 저장
+                fills = self._extract_execution_fills(sync_result, "BUY")
+                applied_qty = 0
+
+                for fill in fills:
+                    if not self._record_execution_fill(
+                        side="BUY",
+                        fill=fill,
+                        reason="BUY_FILLED",
+                    ):
+                        continue
+
+                    fill_price = float(fill["price"])
+                    fill_qty = int(fill["qty"])
+                    if not self.strategy.has_position:
+                        actual_stop_loss = fill_price - (signal.atr * settings.ATR_MULTIPLIER_SL)
+                        actual_take_profit = fill_price + (signal.atr * settings.ATR_MULTIPLIER_TP)
+                        self.strategy.open_position(
+                            symbol=self.stock_code,
+                            entry_price=fill_price,
+                            quantity=fill_qty,
+                            atr=signal.atr,
+                            stop_loss=actual_stop_loss,
+                            take_profit=actual_take_profit,
+                        )
+                    else:
+                        pos = self.strategy.position
+                        new_avg = calc_weighted_avg(
+                            Decimal(str(pos.entry_price)),
+                            int(pos.quantity),
+                            Decimal(str(fill_price)),
+                            fill_qty,
+                        )
+                        pos.entry_price = float(new_avg)
+                        pos.quantity = int(pos.quantity) + fill_qty
+                        pos.highest_price = max(float(pos.highest_price or 0.0), fill_price)
+                    applied_qty += fill_qty
+
+                if applied_qty <= 0:
+                    logger.warning(
+                        "[IDEMPOTENT] 매수 체결 반영 스킵(중복 체결): order_no=%s",
+                        sync_result.order_no,
+                    )
+                    return {
+                        "success": False,
+                        "order_no": sync_result.order_no,
+                        "exec_qty": 0,
+                        "message": "중복 체결 반영 스킵",
+                    }
+
                 self._save_position_on_exit()
-                
-                # 거래 기록 (실제 체결가 사용)
+                self._sync_db_position_from_strategy()
+                pos = self.strategy.position
+                actual_price = float(pos.entry_price)
+                actual_qty = int(pos.quantity)
+                actual_stop_loss = float(pos.stop_loss)
+                actual_take_profit = float(pos.take_profit) if pos.take_profit is not None else 0.0
                 self._daily_trades.append({
                     "time": datetime.now(KST).isoformat(),
                     "type": "BUY",
                     "price": actual_price,
-                    "quantity": actual_qty,
+                    "quantity": applied_qty,
                     "order_no": sync_result.order_no,
-                    "signal_price": signal.price  # 신호가도 기록
+                    "signal_price": signal.price,
                 })
-                self._persist_trade_record(
-                    side="BUY",
-                    price=actual_price,
-                    quantity=actual_qty,
-                    order_no=sync_result.order_no,
-                    reason="BUY_FILLED",
-                )
                 self._persist_account_snapshot(force=True)
-                
-                # 텔레그램 알림 실패가 주문 성공 흐름을 깨지 않도록 분리
+
                 try:
                     self.telegram.notify_buy_order(
                         stock_code=self.stock_code,
                         price=actual_price,
-                        quantity=actual_qty,
+                        quantity=applied_qty,
                         stop_loss=actual_stop_loss,
-                        take_profit=actual_take_profit
+                        take_profit=actual_take_profit,
+                    )
+                    self.telegram.notify_info(
+                        "BUY 체결 반영\n"
+                        f"종목: {self.stock_code}\n"
+                        f"체결수량: {applied_qty}주\n"
+                        f"갱신 평단가: {actual_price:,.2f}원\n"
+                        f"총보유수량: {actual_qty}주"
                     )
                 except Exception as notify_err:
                     logger.warning(f"매수 알림 전송 실패(주문은 성공): {notify_err}")
-                
-                logger.info(f"매수 체결 완료: {sync_result.order_no} @ {actual_price:,.0f}원")
-                
+
+                logger.info(
+                    "매수 체결 완료: %s qty=%s avg=%s",
+                    sync_result.order_no,
+                    applied_qty,
+                    actual_price,
+                )
+
                 return {
                     "success": True,
                     "order_no": sync_result.order_no,
                     "exec_price": actual_price,
-                    "exec_qty": actual_qty,
-                    "message": sync_result.message
+                    "exec_qty": applied_qty,
+                    "message": sync_result.message,
                 }
             
             elif sync_result.result_type == OrderExecutionResult.PARTIAL:
-                # 부분 체결 - 체결된 수량만큼 포지션 오픈
-                if sync_result.exec_qty > 0:
-                    actual_price = sync_result.exec_price
-                    
-                    self.strategy.open_position(
-                        symbol=self.stock_code,
-                        entry_price=actual_price,
-                        quantity=sync_result.exec_qty,
-                        atr=signal.atr,
-                        stop_loss=actual_price - (signal.atr * settings.ATR_MULTIPLIER_SL),
-                        take_profit=actual_price + (signal.atr * settings.ATR_MULTIPLIER_TP)
-                    )
-                    
-                    self._save_position_on_exit()
-                    self._persist_trade_record(
+                fills = self._extract_execution_fills(sync_result, "BUY")
+                applied_qty = 0
+                for fill in fills:
+                    if not self._record_execution_fill(
                         side="BUY",
-                        price=actual_price,
-                        quantity=sync_result.exec_qty,
-                        order_no=sync_result.order_no,
+                        fill=fill,
                         reason="BUY_PARTIAL",
-                    )
+                    ):
+                        continue
+                    fill_price = float(fill["price"])
+                    fill_qty = int(fill["qty"])
+                    if not self.strategy.has_position:
+                        self.strategy.open_position(
+                            symbol=self.stock_code,
+                            entry_price=fill_price,
+                            quantity=fill_qty,
+                            atr=signal.atr,
+                            stop_loss=fill_price - (signal.atr * settings.ATR_MULTIPLIER_SL),
+                            take_profit=fill_price + (signal.atr * settings.ATR_MULTIPLIER_TP),
+                        )
+                    else:
+                        pos = self.strategy.position
+                        new_avg = calc_weighted_avg(
+                            Decimal(str(pos.entry_price)),
+                            int(pos.quantity),
+                            Decimal(str(fill_price)),
+                            fill_qty,
+                        )
+                        pos.entry_price = float(new_avg)
+                        pos.quantity = int(pos.quantity) + fill_qty
+                    applied_qty += fill_qty
+
+                if applied_qty > 0:
+                    self._save_position_on_exit()
+                    self._sync_db_position_from_strategy()
                     self._persist_account_snapshot(force=True)
-                    
+                    pos = self.strategy.position
                     try:
                         self.telegram.notify_warning(
-                            f"부분 체결: {self.stock_code} {sync_result.exec_qty}/{self.order_quantity}주 @ {actual_price:,.0f}원"
+                            f"부분 체결: {self.stock_code} {applied_qty}/{self.order_quantity}주\n"
+                            f"평단가: {pos.entry_price:,.2f}원 | 총보유: {pos.quantity}주"
                         )
                     except Exception as notify_err:
                         logger.warning(f"부분체결 알림 전송 실패: {notify_err}")
-                    
-                    logger.warning(f"부분 체결: {sync_result.exec_qty}/{self.order_quantity}주")
+                    logger.warning(f"부분 체결: {applied_qty}/{self.order_quantity}주")
                 
                 return {
                     "success": False,
                     "order_no": sync_result.order_no,
-                    "exec_qty": sync_result.exec_qty,
+                    "exec_qty": applied_qty,
                     "message": sync_result.message
                 }
             
@@ -1358,109 +1620,184 @@ class MultidayExecutor:
             )
             
             if sync_result.success:
-                # ★ 체결 확인됨 - 실제 체결가로 청산 처리
-                actual_price = sync_result.exec_price if sync_result.exec_price > 0 else signal.price
-                
-                # 포지션 청산 (실제 체결가 사용)
-                close_result = self.strategy.close_position(actual_price, exit_reason)
-                
-                # 리스크 매니저에 손익 기록
-                if close_result:
-                    self.risk_manager.record_trade_pnl(close_result["pnl"])
-                    
-                    # 거래 기록 (실제 체결가)
-                    self._daily_trades.append({
-                        "time": datetime.now(KST).isoformat(),
-                        "type": "SELL",
-                        "price": actual_price,
-                        "quantity": sync_result.exec_qty,
-                        "order_no": sync_result.order_no,
-                        "pnl": close_result["pnl"],
-                        "pnl_pct": close_result["pnl_pct"],
-                        "exit_reason": exit_reason.value,
-                        "signal_price": signal.price  # 신호가도 기록
-                    })
-                    self._persist_trade_record(
+                fills = self._extract_execution_fills(sync_result, "SELL")
+                starting_qty = int(pos.quantity)
+                entry_price = float(pos.entry_price)
+                applied_qty = 0
+                applied_pnl = 0.0
+                last_exec_price = float(sync_result.exec_price or signal.price)
+
+                for fill in fills:
+                    fill_qty = int(fill.get("qty") or 0)
+                    if fill_qty <= 0:
+                        continue
+                    remaining = max(starting_qty - applied_qty, 0)
+                    if remaining <= 0:
+                        break
+                    if fill_qty > remaining:
+                        fill_qty = remaining
+                    fill_price = float(fill.get("price") or 0.0)
+                    fill["qty"] = fill_qty
+                    fill["price"] = fill_price
+                    partial_pnl = (fill_price - entry_price) * fill_qty
+                    partial_pnl_pct = (
+                        ((fill_price / entry_price) - 1.0) * 100.0
+                        if entry_price > 0
+                        else 0.0
+                    )
+                    if not self._record_execution_fill(
                         side="SELL",
-                        price=actual_price,
-                        quantity=int(sync_result.exec_qty or close_result.get("quantity") or 0),
-                        order_no=sync_result.order_no,
+                        fill=fill,
                         reason=exit_reason.value,
-                        pnl=float(close_result.get("pnl") or 0.0),
-                        pnl_pct=float(close_result.get("pnl_pct") or 0.0),
-                        entry_price=float(close_result.get("entry_price") or pos.entry_price),
-                        holding_days=int(close_result.get("holding_days") or 0),
+                        entry_price=entry_price,
+                        pnl=partial_pnl,
+                        pnl_pct=partial_pnl_pct,
+                    ):
+                        continue
+                    applied_qty += fill_qty
+                    applied_pnl += partial_pnl
+                    last_exec_price = fill_price
+
+                if applied_qty <= 0:
+                    logger.warning(
+                        "[IDEMPOTENT] 매도 체결 반영 스킵(중복 체결): order_no=%s",
+                        sync_result.order_no,
                     )
-                    self._persist_account_snapshot(force=True)
-                    
-                    # 텔레그램 알림 (청산 유형별)
-                    self._send_exit_notification(
-                        exit_reason,
-                        pos,
-                        actual_price,
-                        close_result,
-                        signal,
-                    )
-                
-                # 포지션 저장 파일 클리어
-                self.position_store.clear_position()
-                
-                logger.info(f"매도 체결 완료: {sync_result.order_no} @ {actual_price:,.0f}원")
-                
-                return {
-                    "success": True,
-                    "order_no": sync_result.order_no,
-                    "exec_price": actual_price,
-                    "exec_qty": sync_result.exec_qty,
-                    "pnl": close_result["pnl"] if close_result else 0,
-                    "message": sync_result.message
-                }
-            
-            elif sync_result.result_type == OrderExecutionResult.PARTIAL:
-                # 부분 체결 - 체결된 수량만큼만 청산 처리
-                if sync_result.exec_qty > 0:
-                    actual_price = sync_result.exec_price
-                    
-                    # 부분 청산 손익 계산
-                    partial_pnl = (actual_price - pos.entry_price) * sync_result.exec_qty
-                    partial_pnl_pct = (actual_price - pos.entry_price) / pos.entry_price * 100
-                    self._persist_trade_record(
-                        side="SELL",
-                        price=actual_price,
-                        quantity=int(sync_result.exec_qty),
-                        order_no=sync_result.order_no,
-                        reason=f"{exit_reason.value}_PARTIAL",
-                        pnl=float(partial_pnl),
-                        pnl_pct=float(partial_pnl_pct),
-                        entry_price=float(pos.entry_price),
-                    )
-                    self._persist_account_snapshot(force=True)
-                    
-                    # 남은 수량으로 포지션 축소 (전략 상태는 유지)
-                    remaining_qty = pos.quantity - sync_result.exec_qty
-                    if remaining_qty > 0:
-                        pos.quantity = remaining_qty
-                        self._save_position_on_exit()
-                        
-                        self.telegram.notify_warning(
-                            f"부분 청산: {self.stock_code} {sync_result.exec_qty}/{pos.quantity + sync_result.exec_qty}주\n"
-                            f"손익: {partial_pnl:+,.0f}원 ({partial_pnl_pct:+.2f}%)\n"
-                            f"잔여: {remaining_qty}주 보유 중"
+                    return {
+                        "success": False,
+                        "order_no": sync_result.order_no,
+                        "exec_qty": 0,
+                        "message": "중복 체결 반영 스킵",
+                    }
+
+                if applied_qty >= starting_qty:
+                    close_result = self.strategy.close_position(last_exec_price, exit_reason)
+                    self.position_store.clear_position()
+                    self._sync_db_position_from_strategy()
+                    if close_result:
+                        self.risk_manager.record_trade_pnl(close_result["pnl"])
+                        self._daily_trades.append({
+                            "time": datetime.now(KST).isoformat(),
+                            "type": "SELL",
+                            "price": last_exec_price,
+                            "quantity": applied_qty,
+                            "order_no": sync_result.order_no,
+                            "pnl": close_result["pnl"],
+                            "pnl_pct": close_result["pnl_pct"],
+                            "exit_reason": exit_reason.value,
+                            "signal_price": signal.price,
+                        })
+                        self._send_exit_notification(
+                            exit_reason,
+                            pos,
+                            last_exec_price,
+                            close_result,
+                            signal,
                         )
-                    else:
-                        # 전량 청산된 경우
-                        close_result = self.strategy.close_position(actual_price, exit_reason)
-                        self.position_store.clear_position()
-                        if close_result:
-                            self.risk_manager.record_trade_pnl(close_result["pnl"])
-                    
-                    logger.warning(f"부분 청산: {sync_result.exec_qty}/{pos.quantity}주")
-                
+                    self._persist_account_snapshot(force=True)
+                    logger.info(f"매도 체결 완료: {sync_result.order_no} @ {last_exec_price:,.0f}원")
+                    return {
+                        "success": True,
+                        "order_no": sync_result.order_no,
+                        "exec_price": last_exec_price,
+                        "exec_qty": applied_qty,
+                        "pnl": close_result["pnl"] if close_result else applied_pnl,
+                        "message": sync_result.message,
+                    }
+
+                # 안전장치: API 성공이더라도 반영수량이 전량 미만이면 부분청산 처리
+                remaining_qty = reduce_quantity_after_sell(starting_qty, applied_qty)
+                pos.quantity = remaining_qty
+                self._save_position_on_exit()
+                self._sync_db_position_from_strategy()
+                self._persist_account_snapshot(force=True)
+                self.risk_manager.record_trade_pnl(applied_pnl)
+                self.telegram.notify_warning(
+                    f"부분 청산: {self.stock_code} {applied_qty}/{starting_qty}주\n"
+                    f"손익: {applied_pnl:+,.0f}원\n"
+                    f"평단가(유지): {entry_price:,.2f}원 | 잔여: {remaining_qty}주"
+                )
                 return {
                     "success": False,
                     "order_no": sync_result.order_no,
-                    "exec_qty": sync_result.exec_qty,
-                    "message": sync_result.message
+                    "exec_price": last_exec_price,
+                    "exec_qty": applied_qty,
+                    "message": "부분 체결(중복 skip 포함)로 잔여 포지션 유지",
+                }
+            
+            elif sync_result.result_type == OrderExecutionResult.PARTIAL:
+                fills = self._extract_execution_fills(sync_result, "SELL")
+                starting_qty = int(pos.quantity)
+                entry_price = float(pos.entry_price)
+                applied_qty = 0
+                applied_pnl = 0.0
+                last_exec_price = float(sync_result.exec_price or signal.price)
+
+                for fill in fills:
+                    fill_qty = int(fill.get("qty") or 0)
+                    if fill_qty <= 0:
+                        continue
+                    remaining = max(starting_qty - applied_qty, 0)
+                    if remaining <= 0:
+                        break
+                    if fill_qty > remaining:
+                        fill_qty = remaining
+                    fill_price = float(fill.get("price") or 0.0)
+                    fill["qty"] = fill_qty
+                    fill["price"] = fill_price
+                    partial_pnl = (fill_price - entry_price) * fill_qty
+                    partial_pnl_pct = (
+                        ((fill_price / entry_price) - 1.0) * 100.0
+                        if entry_price > 0
+                        else 0.0
+                    )
+                    if not self._record_execution_fill(
+                        side="SELL",
+                        fill=fill,
+                        reason=f"{exit_reason.value}_PARTIAL",
+                        entry_price=entry_price,
+                        pnl=partial_pnl,
+                        pnl_pct=partial_pnl_pct,
+                    ):
+                        continue
+                    applied_qty += fill_qty
+                    applied_pnl += partial_pnl
+                    last_exec_price = fill_price
+
+                if applied_qty <= 0:
+                    return {
+                        "success": False,
+                        "order_no": sync_result.order_no,
+                        "exec_qty": 0,
+                        "message": "중복 체결 반영 스킵",
+                    }
+
+                remaining_qty = reduce_quantity_after_sell(starting_qty, applied_qty)
+                if remaining_qty > 0:
+                    pos.quantity = remaining_qty
+                    self._save_position_on_exit()
+                    self._sync_db_position_from_strategy()
+                    self.risk_manager.record_trade_pnl(applied_pnl)
+                    self.telegram.notify_warning(
+                        f"부분 청산: {self.stock_code} {applied_qty}/{starting_qty}주\n"
+                        f"손익: {applied_pnl:+,.0f}원\n"
+                        f"평단가(유지): {entry_price:,.2f}원 | 잔여: {remaining_qty}주 보유 중"
+                    )
+                else:
+                    close_result = self.strategy.close_position(last_exec_price, exit_reason)
+                    self.position_store.clear_position()
+                    self._sync_db_position_from_strategy()
+                    if close_result:
+                        self.risk_manager.record_trade_pnl(close_result["pnl"])
+                self._persist_account_snapshot(force=True)
+                logger.warning(f"부분 청산: {applied_qty}/{starting_qty}주")
+
+                return {
+                    "success": False,
+                    "order_no": sync_result.order_no,
+                    "exec_price": last_exec_price,
+                    "exec_qty": applied_qty,
+                    "message": sync_result.message,
                 }
             
             else:

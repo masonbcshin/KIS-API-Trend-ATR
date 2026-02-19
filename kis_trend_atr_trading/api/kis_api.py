@@ -14,6 +14,7 @@ import time
 import threading
 from copy import deepcopy
 from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Any, List
 import requests
@@ -107,6 +108,8 @@ class KISApi:
         self._balance_cache_ttl_sec: float = float(
             getattr(settings, "ACCOUNT_BALANCE_CACHE_TTL_SEC", 2.0)
         )
+        self._balance_raw_cache: Optional[Dict[str, Any]] = None
+        self._balance_raw_cache_ts: float = 0.0
         
         # 네트워크 상태 관리 (1분 이상 단절 시 거래 중단 판단)
         self._network_down_since: Optional[float] = None
@@ -208,6 +211,130 @@ class KISApi:
                 return int(float(raw))
             except (TypeError, ValueError):
                 return default
+
+    @staticmethod
+    def _parse_numeric_decimal(
+        value: Any,
+        default: Optional[Decimal] = Decimal("0"),
+    ) -> Optional[Decimal]:
+        """문자열/숫자 입력을 Decimal로 안전 변환합니다."""
+        if value is None:
+            return default
+        if isinstance(value, Decimal):
+            return value
+
+        raw = str(value).strip().replace(",", "")
+        if not raw:
+            return default
+        try:
+            return Decimal(str(raw))
+        except (InvalidOperation, TypeError):
+            return default
+
+    @staticmethod
+    def _pick_first_value(source: Dict[str, Any], keys: List[str]) -> Any:
+        for key in keys:
+            if key in source:
+                return source.get(key)
+        return None
+
+    @staticmethod
+    def _resolve_first_list_path(
+        payload: Dict[str, Any],
+        candidate_paths: List[Tuple[str, ...]],
+    ) -> Tuple[List[Dict[str, Any]], str]:
+        def _walk(obj: Any, path: Tuple[str, ...]) -> Any:
+            current = obj
+            for key in path:
+                if not isinstance(current, dict):
+                    return None
+                current = current.get(key)
+            return current
+
+        for path in candidate_paths:
+            found = _walk(payload, path)
+            if isinstance(found, list):
+                return [row for row in found if isinstance(row, dict)], ".".join(path)
+
+        # 후보 경로를 모두 시도한 뒤에만 완화 탐색을 허용합니다.
+        if isinstance(payload, dict):
+            for key, value in payload.items():
+                if isinstance(value, list):
+                    return [row for row in value if isinstance(row, dict)], key
+                if isinstance(value, dict):
+                    for sub_key, sub_value in value.items():
+                        if isinstance(sub_value, list):
+                            path = f"{key}.{sub_key}"
+                            return [row for row in sub_value if isinstance(row, dict)], path
+        return [], ""
+
+    def _request_balance_payload(self) -> Dict[str, Any]:
+        """잔고/보유현황 원본 payload를 조회합니다."""
+        now_ts = time.time()
+        if (
+            self._balance_raw_cache is not None
+            and (now_ts - self._balance_raw_cache_ts) < max(self._balance_cache_ttl_sec, 0.0)
+        ):
+            return deepcopy(self._balance_raw_cache)
+
+        url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
+
+        tr_id = self._resolve_tr_id("balance")
+        if self._is_token_usable() or (self.access_token and self.token_expires_at is None):
+            headers = {
+                "content-type": "application/json; charset=utf-8",
+                "authorization": f"Bearer {self.access_token}",
+                "appkey": self.app_key,
+                "appsecret": self.app_secret,
+                "tr_id": tr_id,
+            }
+        else:
+            headers = self._get_auth_headers(tr_id)
+
+        params = {
+            "CANO": self.account_no,
+            "ACNT_PRDT_CD": self.account_product_code,
+            "AFHR_FLPR_YN": "N",
+            "OFL_YN": "",
+            "INQR_DVSN": "02",
+            "UNPR_DVSN": "01",
+            "FUND_STTL_ICLD_YN": "N",
+            "FNCG_AMT_AUTO_RDPT_YN": "N",
+            "PRCS_DVSN": "00",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+        }
+
+        max_attempts = 3
+        data: Dict[str, Any] = {}
+        for attempt in range(1, max_attempts + 1):
+            response = self._request_with_retry("GET", url, headers, params=params)
+            data = response.json()
+            rt_cd = str(data.get("rt_cd", ""))
+            if rt_cd == "0":
+                self._balance_raw_cache = deepcopy(data)
+                self._balance_raw_cache_ts = time.time()
+                return data
+
+            msg = str(data.get("msg1", "Unknown error"))
+            should_retry_invalid_acno = (
+                "INVALID_CHECK_ACNO" in msg and attempt < max_attempts
+            )
+            if should_retry_invalid_acno:
+                logger.warning(
+                    "[KIS][BAL] 계좌 검증 오류 재시도(%s/%s): %s",
+                    attempt,
+                    max_attempts,
+                    msg,
+                )
+                time.sleep(0.3 * attempt)
+                continue
+
+            raise KISApiError(f"잔고 조회 실패: {msg}")
+
+        raise KISApiError(
+            f"잔고 조회 실패: {str(data.get('msg1', 'Unknown error'))}"
+        )
 
     def _is_token_usable(self, now_kst: Optional[datetime] = None) -> bool:
         if not self.access_token or not self.token_expires_at:
@@ -1036,15 +1163,37 @@ class KISApi:
         
         orders = []
         for item in data.get("output1", []):
+            order_date = str(item.get("ord_dt") or today).strip()
+            order_time = str(item.get("ord_tmd") or item.get("ord_tm") or "").strip()
+            executed_at_iso = None
+            try:
+                if len(order_date) == 8 and order_time:
+                    clean_time = "".join(ch for ch in order_time if ch.isdigit())
+                    if len(clean_time) >= 6:
+                        dt = datetime.strptime(f"{order_date}{clean_time[:6]}", "%Y%m%d%H%M%S")
+                        executed_at_iso = KST.localize(dt).isoformat()
+            except Exception:
+                executed_at_iso = None
+
+            exec_id = None
+            for candidate in ("exec_id", "ccld_no", "exec_no", "ord_seqno", "trad_no"):
+                raw_exec_id = item.get(candidate)
+                if raw_exec_id not in (None, ""):
+                    exec_id = str(raw_exec_id).strip()
+                    break
+
             orders.append({
                 "order_no": item.get("odno"),
                 "stock_code": item.get("pdno"),
                 "order_type": "매수" if item.get("sll_buy_dvsn_cd") == "02" else "매도",
+                "side": "BUY" if item.get("sll_buy_dvsn_cd") == "02" else "SELL",
                 "order_qty": int(item.get("ord_qty", 0)),
                 "exec_qty": int(item.get("tot_ccld_qty", 0)),
                 "remain_qty": int(item.get("ord_qty", 0)) - int(item.get("tot_ccld_qty", 0)),
                 "order_price": float(item.get("ord_unpr", 0)),
                 "exec_price": float(item.get("avg_prvs", 0)),
+                "executed_at": executed_at_iso,
+                "exec_id": exec_id,
                 "status": "체결완료" if int(item.get("tot_ccld_qty", 0)) == int(item.get("ord_qty", 0)) else (
                     "부분체결" if int(item.get("tot_ccld_qty", 0)) > 0 else "미체결"
                 ),
@@ -1087,6 +1236,25 @@ class KISApi:
         """
         start_time = time.time()
         last_exec_qty = 0
+
+        def _collect_fills(order_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            fills: List[Dict[str, Any]] = []
+            for row in order_rows:
+                fill_qty = int(row.get("exec_qty", 0) or 0)
+                fill_price = float(row.get("exec_price", 0) or 0)
+                if fill_qty <= 0 or fill_price <= 0:
+                    continue
+                fills.append(
+                    {
+                        "order_no": row.get("order_no") or order_no,
+                        "exec_id": row.get("exec_id"),
+                        "executed_at": row.get("executed_at") or datetime.now(KST).isoformat(),
+                        "price": fill_price,
+                        "qty": fill_qty,
+                        "side": row.get("side", "BUY"),
+                    }
+                )
+            return fills
         
         logger.info(f"체결 대기 시작: 주문번호={order_no}, 예상수량={expected_qty}, 타임아웃={timeout_seconds}초")
         
@@ -1106,12 +1274,25 @@ class KISApi:
                 # 완전 체결
                 if exec_qty >= expected_qty:
                     logger.info(f"체결 완료: {exec_qty}주 @ {exec_price:,.0f}원")
+                    fills = _collect_fills(status_result.get("orders", []))
+                    if not fills and exec_qty > 0 and exec_price > 0:
+                        fills = [
+                            {
+                                "order_no": order_no,
+                                "exec_id": None,
+                                "executed_at": datetime.now(KST).isoformat(),
+                                "price": exec_price,
+                                "qty": exec_qty,
+                                "side": order.get("side", "BUY"),
+                            }
+                        ]
                     return {
                         "success": True,
                         "exec_qty": exec_qty,
                         "exec_price": exec_price,
                         "status": "FILLED",
-                        "message": f"완전 체결: {exec_qty}주 @ {exec_price:,.0f}원"
+                        "message": f"완전 체결: {exec_qty}주 @ {exec_price:,.0f}원",
+                        "fills": fills,
                     }
                 
                 # 부분 체결 진행 중
@@ -1142,13 +1323,25 @@ class KISApi:
                     if final_remain > 0:
                         cancel_result = self.cancel_order(order_no)
                         logger.info(f"미체결분 취소 시도: {cancel_result}")
-                    
+                    fills = _collect_fills(final_status.get("orders", []))
+                    if not fills and final_exec_qty > 0 and final_exec_price > 0:
+                        fills = [
+                            {
+                                "order_no": order_no,
+                                "exec_id": None,
+                                "executed_at": datetime.now(KST).isoformat(),
+                                "price": final_exec_price,
+                                "qty": final_exec_qty,
+                                "side": final_order.get("side", "BUY"),
+                            }
+                        ]
                     return {
                         "success": False,
                         "exec_qty": final_exec_qty,
                         "exec_price": final_exec_price,
                         "status": "PARTIAL",
-                        "message": f"부분 체결: {final_exec_qty}/{expected_qty}주, 미체결 취소 시도"
+                        "message": f"부분 체결: {final_exec_qty}/{expected_qty}주, 미체결 취소 시도",
+                        "fills": fills,
                     }
                 else:
                     # 완전 미체결 - 주문 취소
@@ -1158,7 +1351,8 @@ class KISApi:
                         "exec_qty": 0,
                         "exec_price": 0,
                         "status": "CANCELLED",
-                        "message": f"미체결로 주문 취소됨: {cancel_result}"
+                        "message": f"미체결로 주문 취소됨: {cancel_result}",
+                        "fills": [],
                     }
         except Exception as e:
             logger.error(f"최종 상태 확인 실패: {e}")
@@ -1168,7 +1362,8 @@ class KISApi:
             "exec_qty": last_exec_qty,
             "exec_price": 0,
             "status": "TIMEOUT",
-            "message": f"타임아웃 - 마지막 확인 체결수량: {last_exec_qty}주"
+            "message": f"타임아웃 - 마지막 확인 체결수량: {last_exec_qty}주",
+            "fills": [],
         }
     
     def cancel_order(self, order_no: str) -> Dict:
@@ -1253,55 +1448,7 @@ class KISApi:
                 now_ts - self._balance_cache_ts,
             )
             return deepcopy(self._balance_cache)
-
-        url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
-        
-        tr_id = self._resolve_tr_id("balance")
-        headers = self._get_auth_headers(tr_id)
-        
-        params = {
-            "CANO": self.account_no,
-            "ACNT_PRDT_CD": self.account_product_code,
-            "AFHR_FLPR_YN": "N",
-            "OFL_YN": "",
-            "INQR_DVSN": "02",
-            "UNPR_DVSN": "01",
-            "FUND_STTL_ICLD_YN": "N",
-            "FNCG_AMT_AUTO_RDPT_YN": "N",
-            "PRCS_DVSN": "00",
-            "CTX_AREA_FK100": "",
-            "CTX_AREA_NK100": "",
-        }
-        
-        max_attempts = 3
-        data = {}
-        for attempt in range(1, max_attempts + 1):
-            response = self._request_with_retry("GET", url, headers, params=params)
-            data = response.json()
-            rt_cd = str(data.get("rt_cd", ""))
-            if rt_cd == "0":
-                break
-
-            msg = str(data.get("msg1", "Unknown error"))
-            should_retry_invalid_acno = (
-                "INVALID_CHECK_ACNO" in msg
-                and attempt < max_attempts
-            )
-            if should_retry_invalid_acno:
-                logger.warning(
-                    "[KIS][BAL] 계좌 검증 오류 재시도(%s/%s): %s",
-                    attempt,
-                    max_attempts,
-                    msg,
-                )
-                time.sleep(0.3 * attempt)
-                continue
-
-            raise KISApiError(f"잔고 조회 실패: {msg}")
-        else:
-            raise KISApiError(
-                f"잔고 조회 실패: {str(data.get('msg1', 'Unknown error'))}"
-            )
+        data = self._request_balance_payload()
         
         # 보유 종목
         holdings = []
@@ -1346,3 +1493,72 @@ class KISApi:
         self._balance_cache = deepcopy(result)
         self._balance_cache_ts = time.time()
         return result
+
+    def get_holdings(self) -> List[Dict[str, Any]]:
+        """
+        계좌 보유현황을 SSOT 형식으로 정규화해 반환합니다.
+
+        Returns:
+            List[Dict]: [{"stock_code": str, "qty": int, "avg_price": Decimal, "stock_name": Optional[str]}]
+        """
+        data = self._request_balance_payload()
+
+        candidate_paths: List[Tuple[str, ...]] = [
+            ("output1",),
+            ("output2",),
+            ("output", "output1"),
+            ("output", "output2"),
+        ]
+        rows, resolved_path = self._resolve_first_list_path(data, candidate_paths)
+        if not rows:
+            logger.warning(
+                "[KIS][HOLDINGS] 보유 배열 경로를 찾지 못함: candidates=%s",
+                ["/".join(path) for path in candidate_paths],
+            )
+            return []
+
+        stock_code_keys = ["pdno", "prdt_no", "stock_code", "symbol"]
+        qty_keys = ["hldg_qty", "hold_qty", "qty", "quantity"]
+        avg_price_keys = ["pchs_avg_pric", "avg_buy_price", "avg_price", "pchs_avrg_pric"]
+        stock_name_keys = ["prdt_name", "name", "stock_name"]
+
+        holdings: List[Dict[str, Any]] = []
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+
+            stock_code_raw = self._pick_first_value(item, stock_code_keys)
+            qty_raw = self._pick_first_value(item, qty_keys)
+            avg_raw = self._pick_first_value(item, avg_price_keys)
+            stock_name_raw = self._pick_first_value(item, stock_name_keys)
+
+            stock_code = str(stock_code_raw or "").strip()
+            qty = self._parse_numeric_int(qty_raw, 0)
+            avg_price = self._parse_numeric_decimal(avg_raw, Decimal("0"))
+            if avg_price is None:
+                avg_price = Decimal("0")
+
+            if not stock_code:
+                logger.warning(
+                    "[KIS][HOLDINGS] 항목 스킵(stock_code 미존재): keys=%s",
+                    list(item.keys()),
+                )
+                continue
+            if qty <= 0:
+                continue
+
+            holdings.append(
+                {
+                    "stock_code": stock_code,
+                    "qty": int(qty),
+                    "avg_price": avg_price,
+                    "stock_name": str(stock_name_raw).strip() if stock_name_raw else None,
+                }
+            )
+
+        logger.info(
+            "[KIS][HOLDINGS] parsed path=%s count=%s",
+            resolved_path,
+            len(holdings),
+        )
+        return holdings

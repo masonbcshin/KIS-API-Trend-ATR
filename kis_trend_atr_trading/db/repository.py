@@ -1000,6 +1000,139 @@ class TradeRepository:
     def __init__(self, db: MySQLManager = None):
         self.db = db or get_db_manager()
         self.mode = _get_namespace_mode()
+
+    def save_execution_fill(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        price: Any,
+        quantity: int,
+        executed_at: datetime = None,
+        order_no: str = None,
+        exec_id: str = None,
+        reason: str = None,
+        entry_price: Any = None,
+        holding_days: int = None,
+        pnl: Any = None,
+        pnl_percent: Any = None,
+        idempotency_key: str = None,
+    ) -> Tuple[Optional[TradeRecord], bool]:
+        """
+        fill 단위 거래를 저장합니다.
+
+        Returns:
+            (TradeRecord | None, created)
+            - created=False 이면 중복 체결로 skip 처리됨
+        """
+        side_upper = str(side or "").upper().strip()
+        if side_upper not in ("BUY", "SELL"):
+            raise ValueError(f"unsupported side: {side}")
+        if int(quantity) <= 0:
+            raise ValueError(f"quantity must be > 0, got {quantity}")
+
+        executed_at = executed_at or datetime.now(KST)
+        price_dec = Decimal(str(price)).quantize(Decimal("0.01"))
+        entry_price_dec = (
+            Decimal(str(entry_price)).quantize(Decimal("0.01"))
+            if entry_price is not None
+            else None
+        )
+        pnl_dec = Decimal(str(pnl)).quantize(Decimal("0.01")) if pnl is not None else None
+        pnl_pct_dec = Decimal(str(pnl_percent)) if pnl_percent is not None else None
+
+        if idempotency_key is None:
+            if exec_id:
+                idempotency_key = _build_idempotency_key(
+                    ("FILL", side_upper, symbol, order_no or "", str(exec_id), self.mode)
+                )
+            else:
+                idempotency_key = _build_idempotency_key(
+                    (
+                        "FILL",
+                        side_upper,
+                        symbol,
+                        order_no or "",
+                        executed_at.isoformat(),
+                        str(price_dec),
+                        int(quantity),
+                        self.mode,
+                    )
+                )
+
+        sql = """
+            INSERT INTO trades (
+                symbol, side, price, quantity, executed_at,
+                reason, pnl, pnl_percent, entry_price, holding_days,
+                order_no, mode, idempotency_key
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                idempotency_key = VALUES(idempotency_key)
+        """
+        params = (
+            symbol,
+            side_upper,
+            float(price_dec),
+            int(quantity),
+            executed_at,
+            reason,
+            float(pnl_dec) if pnl_dec is not None else None,
+            float(pnl_pct_dec) if pnl_pct_dec is not None else None,
+            float(entry_price_dec) if entry_price_dec is not None else None,
+            int(holding_days) if holding_days is not None else None,
+            order_no,
+            self.mode,
+            idempotency_key,
+        )
+
+        try:
+            with self.db.transaction() as cursor:
+                cursor.execute(sql, params)
+                created = bool(cursor.rowcount)
+
+            if not created:
+                logger.info(
+                    "[REPO] 체결 중복 skip: symbol=%s side=%s order_no=%s exec_id=%s",
+                    symbol,
+                    side_upper,
+                    order_no,
+                    exec_id,
+                )
+                row = self.db.execute_query(
+                    "SELECT * FROM trades WHERE idempotency_key = %s AND mode = %s LIMIT 1",
+                    (idempotency_key, self.mode),
+                    fetch_one=True,
+                )
+                return (self._to_record(row) if row else None, False)
+
+            logger.info(
+                "[REPO] 체결 저장: symbol=%s side=%s price=%s qty=%s order_no=%s",
+                symbol,
+                side_upper,
+                price_dec,
+                quantity,
+                order_no,
+            )
+            saved = TradeRecord(
+                symbol=symbol,
+                side=side_upper,
+                price=float(price_dec),
+                quantity=int(quantity),
+                executed_at=executed_at,
+                reason=reason,
+                pnl=float(pnl_dec) if pnl_dec is not None else None,
+                pnl_percent=float(pnl_pct_dec) if pnl_pct_dec is not None else None,
+                entry_price=float(entry_price_dec) if entry_price_dec is not None else None,
+                holding_days=int(holding_days) if holding_days is not None else None,
+                order_no=order_no,
+                idempotency_key=idempotency_key,
+                mode=self.mode,
+            )
+            return saved, True
+        except QueryError as e:
+            logger.error(f"[REPO] 체결 저장 실패: {e}")
+            return None, False
     
     def save_buy(
         self,
