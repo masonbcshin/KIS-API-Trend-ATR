@@ -465,6 +465,16 @@ def run_trade(
                 return KST.localize(ts)
             return ts.astimezone(KST)
 
+        def _state_value(state) -> str:
+            return str(getattr(state, "value", state)).strip().upper()
+
+        def _state_equals(state, expected) -> bool:
+            return _state_value(state) == _state_value(expected)
+
+        def _state_in(state, expected_states) -> bool:
+            state_token = _state_value(state)
+            return any(state_token == _state_value(expected) for expected in expected_states)
+
         def _send_transition_alert(key: str, level: str, message: str, now_kst: datetime) -> None:
             if not executors:
                 return
@@ -504,10 +514,10 @@ def run_trade(
                 return "rest"
             if (
                 decision.policy.active_feed_mode == "ws"
-                and decision.market_state in (
+                and _state_in(decision.market_state, (
                     MarketSessionState.IN_SESSION,
                     MarketSessionState.AUCTION_GUARD,
-                )
+                ))
             ):
                 return "ws"
             return "rest"
@@ -585,8 +595,8 @@ def run_trade(
                     decision.market_reason,
                 )
                 if (
-                    prev_state == MarketSessionState.OFF_SESSION
-                    and next_state == MarketSessionState.PREOPEN_WARMUP
+                    _state_equals(prev_state, MarketSessionState.OFF_SESSION)
+                    and _state_equals(next_state, MarketSessionState.PREOPEN_WARMUP)
                 ):
                     _send_transition_alert(
                         key="market:OFF_SESSION->PREOPEN_WARMUP",
@@ -598,8 +608,8 @@ def run_trade(
                         now_kst=now_kst,
                     )
                 elif (
-                    prev_state == MarketSessionState.PREOPEN_WARMUP
-                    and next_state == MarketSessionState.IN_SESSION
+                    _state_equals(prev_state, MarketSessionState.PREOPEN_WARMUP)
+                    and _state_equals(next_state, MarketSessionState.IN_SESSION)
                 ):
                     _send_transition_alert(
                         key="market:PREOPEN_WARMUP->IN_SESSION",
@@ -666,7 +676,7 @@ def run_trade(
                 )
                 logger.info(summary)
                 if (
-                    decision.market_state == MarketSessionState.OFF_SESSION
+                    _state_equals(decision.market_state, MarketSessionState.OFF_SESSION)
                     and effective_feed_mode != "rest"
                 ):
                     logger.warning(
@@ -688,7 +698,7 @@ def run_trade(
                 else:
                     _stop_ws_subscription()
 
-            if decision.market_state == MarketSessionState.PREOPEN_WARMUP:
+            if _state_equals(decision.market_state, MarketSessionState.PREOPEN_WARMUP):
                 prewarm_date = now_kst.strftime("%Y-%m-%d")
                 if prewarm_date != last_prewarm_prepare_date:
                     for symbol in run_symbols:
@@ -803,7 +813,7 @@ def run_trade(
                 else:
                     entry_candidates = [stock_code] if stock_code not in runtime_holdings else []
 
-            if decision.market_state == MarketSessionState.POSTCLOSE:
+            if _state_equals(decision.market_state, MarketSessionState.POSTCLOSE):
                 report_date = now_kst.strftime("%Y-%m-%d")
                 if report_date != last_postclose_report_date:
                     logger.info("[RUNTIME] POSTCLOSE actions started date=%s", report_date)
@@ -819,9 +829,9 @@ def run_trade(
                 logger.info(f"[MULTI] 최대 반복 도달: {max_runs}")
                 break
 
-            if decision.market_state == MarketSessionState.IN_SESSION:
+            if _state_equals(decision.market_state, MarketSessionState.IN_SESSION):
                 sleep_sec = max(15, min(int(interval), 60))
-            elif decision.market_state == MarketSessionState.OFF_SESSION:
+            elif _state_equals(decision.market_state, MarketSessionState.OFF_SESSION):
                 sleep_sec = runtime_config.offsession_sleep_sec
             else:
                 sleep_sec = max(int(decision.policy.sleep_sec), 5)

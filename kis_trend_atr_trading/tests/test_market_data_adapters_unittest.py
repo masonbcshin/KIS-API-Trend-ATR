@@ -122,3 +122,48 @@ def test_ws_client_reconnect_attempts_capped_at_five(monkeypatch):
     # Initial try + up to 5 retries.
     assert client.listen_calls == 6
 
+
+def test_ws_client_parse_tick_accepts_numeric_envelope_segment():
+    # Paper WS may deliver: 0|H0STCNT0|017|000660^...
+    msg = "0|H0STCNT0|017|000660^090008^905000^0^0^0^0^0^0^0^0^0^1200"
+
+    tick = KISWSClient._parse_tick(msg)
+
+    assert tick is not None
+    assert tick.stock_code == "000660"
+    assert tick.price == 905000.0
+    assert tick.volume == 1200.0
+
+
+def test_ws_client_parse_tick_keeps_legacy_payload_format():
+    msg = "0|H0STCNT0|000660^090008^905000^0^0^0^0^0^0^0^0^0^300"
+
+    tick = KISWSClient._parse_tick(msg)
+
+    assert tick is not None
+    assert tick.stock_code == "000660"
+    assert tick.price == 905000.0
+    assert tick.volume == 300.0
+
+
+class _CountingRestProvider:
+    def __init__(self):
+        self.calls = 0
+
+    def get_recent_bars(self, **_kwargs):
+        self.calls += 1
+        return []
+
+
+def test_ws_provider_backfill_cooldown_prevents_back_to_back_calls():
+    rest_provider = _CountingRestProvider()
+    provider = KISWSMarketDataProvider(
+        rest_fallback_provider=rest_provider,
+        backfill_cooldown_sec=60,
+    )
+
+    provider._attempt_backfill("005930", 2)
+    provider._attempt_backfill("005930", 3)
+    provider._attempt_backfill("000660", 2)
+
+    assert rest_provider.calls == 2

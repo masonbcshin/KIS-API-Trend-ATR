@@ -129,15 +129,35 @@ class KISWSClient:
         if len(parts) < 3 or parts[1] != TR_SUBSCRIBE:
             return None
 
-        raw = parts[2] if len(parts) == 3 else "|".join(parts[2:])
+        payload_parts = parts[2:]
+
+        # Some environments prepend an extra numeric envelope segment:
+        # e.g. "0|H0STCNT0|017|000660^...".
+        if (
+            len(payload_parts) >= 2
+            and "^" not in payload_parts[0]
+            and "^" in payload_parts[1]
+        ):
+            payload_parts = payload_parts[1:]
+
+        raw = next((seg for seg in payload_parts if "^" in seg), "")
+        if not raw:
+            return None
+
         fields = raw.split("^")
         if len(fields) < 13:
             return None
 
         stock_code = str(fields[0]).zfill(6)
+        if len(stock_code) != 6 or not stock_code.isdigit():
+            return None
+
         hhmmss = str(fields[1] or "000000")
-        price = float(fields[2] or 0.0)
-        volume = float(fields[12] or 0.0)
+        try:
+            price = float(fields[2] or 0.0)
+            volume = float(fields[12] or 0.0)
+        except (TypeError, ValueError):
+            return None
         now = datetime.now()
         try:
             ts = now.replace(

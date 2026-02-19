@@ -37,6 +37,7 @@ class KISWSMarketDataProvider(MarketDataProvider):
         max_reconnect_attempts: int = 5,
         reconnect_base_delay: float = 1.0,
         missing_gap_required: int = 2,
+        backfill_cooldown_sec: int = 30,
     ):
         self._ws_client = ws_client or KISWSClient(
             max_reconnect_attempts=max_reconnect_attempts,
@@ -60,6 +61,8 @@ class KISWSMarketDataProvider(MarketDataProvider):
         self._last_completed_bar_ts: Dict[str, datetime] = {}
         self._missing_gap_required = max(int(missing_gap_required), 2)
         self._missing_gap_detected: bool = False
+        self._backfill_cooldown_sec = max(int(backfill_cooldown_sec), 0)
+        self._last_backfill_attempt_ts: Dict[str, datetime] = {}
 
     def get_recent_bars(self, stock_code: str, n: int, timeframe: str) -> List[dict]:
         code = str(stock_code).zfill(6)
@@ -173,6 +176,17 @@ class KISWSMarketDataProvider(MarketDataProvider):
         self._thread = None
 
     def _attempt_backfill(self, stock_code: str, missing_count: int) -> None:
+        now = datetime.now()
+        with self._lock:
+            last_attempt_ts = self._last_backfill_attempt_ts.get(stock_code)
+            if (
+                self._backfill_cooldown_sec > 0
+                and last_attempt_ts is not None
+                and (now - last_attempt_ts).total_seconds() < self._backfill_cooldown_sec
+            ):
+                return
+            self._last_backfill_attempt_ts[stock_code] = now
+
         try:
             self._rest_fallback.get_recent_bars(
                 stock_code=stock_code,
