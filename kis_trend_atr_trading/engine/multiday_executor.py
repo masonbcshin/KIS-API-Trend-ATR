@@ -1177,6 +1177,17 @@ class MultidayExecutor:
         """실제 주문 가능 여부"""
         return self.trading_mode in ("LIVE", "REAL", "PAPER")
 
+    @staticmethod
+    def _signal_type_value(signal_type: Any) -> str:
+        """
+        시그널 타입을 문자열로 정규화합니다.
+
+        모듈 네임스페이스가 다른 Enum 인스턴스(kis_trend_atr_trading.strategy.* vs strategy.*)
+        가 섞여도 value 기준으로 안정적으로 분기하기 위해 사용합니다.
+        """
+        raw_value = getattr(signal_type, "value", signal_type)
+        return str(raw_value).upper().strip()
+
     def _build_exit_retry_key(self, signal: TradingSignal) -> str:
         exit_reason = signal.exit_reason.value if signal.exit_reason else ExitReason.MANUAL_EXIT.value
         reason_code = signal.reason_code or "NO_REASON_CODE"
@@ -2057,8 +2068,10 @@ class MultidayExecutor:
                 stock_code=self.stock_code
             )
             
+            signal_type_value = self._signal_type_value(signal.signal_type)
+
             result["signal"] = {
-                "type": signal.signal_type.value,
+                "type": signal_type_value,
                 "price": signal.price,
                 "stop_loss": signal.stop_loss,
                 "take_profit": signal.take_profit,
@@ -2070,14 +2083,14 @@ class MultidayExecutor:
             }
             
             logger.info(
-                f"시그널: {signal.signal_type.value} | "
+                f"시그널: {signal_type_value} | "
                 f"가격: {current_price:,.0f}원 | "
                 f"추세: {signal.trend.value} | "
                 f"사유: {signal.reason}"
             )
             
             # 4. 시그널에 따른 주문 실행
-            if signal.signal_type == SignalType.BUY:
+            if signal_type_value == SignalType.BUY.value:
                 if not self._entry_allowed:
                     block_msg = self._entry_block_reason or f"[ENTRY] blocked: symbol={self.stock_code}"
                     logger.info(block_msg)
@@ -2090,11 +2103,11 @@ class MultidayExecutor:
                     order_result = self.execute_buy(signal)
                     result["order_result"] = order_result
                 
-            elif signal.signal_type == SignalType.SELL:
+            elif signal_type_value == SignalType.SELL.value:
                 order_result = self._execute_exit_with_pending_control(signal)
                 result["order_result"] = order_result
                 
-            elif signal.signal_type == SignalType.HOLD:
+            elif signal_type_value == SignalType.HOLD.value:
                 # 근접 알림 체크
                 self._check_and_send_alerts(signal, current_price)
             

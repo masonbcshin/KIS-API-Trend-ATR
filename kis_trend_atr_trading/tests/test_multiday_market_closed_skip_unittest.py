@@ -144,6 +144,7 @@ class TestMultidayMarketClosedSkip(unittest.TestCase):
                 "recoveries": ["API 기준 자동복구: 저장 포지션 정리(005930)"],
             }
         )
+        ex._pending_exit_state = None
         ex.telegram = SimpleNamespace(
             notify_warning=lambda msg: warning_messages.append(msg),
             notify_info=lambda msg: info_messages.append(msg),
@@ -160,6 +161,48 @@ class TestMultidayMarketClosedSkip(unittest.TestCase):
         self.assertEqual(len(warning_messages), 0)
         self.assertEqual(len(info_messages), 1)
         self.assertIn("포지션 자동복구 완료", info_messages[0])
+
+    def test_run_once_routes_buy_with_foreign_signal_enum_instance(self):
+        ex = MultidayExecutor.__new__(MultidayExecutor)
+        ex.trading_mode = "PAPER"
+        ex.stock_code = "069500"
+        ex.market_checker = SimpleNamespace(is_tradeable=lambda: (True, "정규장"))
+        ex.risk_manager = SimpleNamespace(
+            check_kill_switch=lambda: SimpleNamespace(passed=True, should_exit=False, reason="")
+        )
+        ex.api = SimpleNamespace()
+        ex._entry_allowed = True
+        ex._entry_block_reason = ""
+        ex._last_market_closed_skip_log_at = None
+        ex.fetch_market_data = lambda: SimpleNamespace(empty=False)
+        ex.fetch_current_price = lambda: (86295.0, 86000.0)
+        ex._persist_account_snapshot = lambda force=False: None
+        ex._check_and_send_alerts = lambda _signal, _price: None
+        ex._execute_exit_with_pending_control = lambda _signal: {"success": True, "message": "sell"}
+
+        buy_calls = []
+        ex.execute_buy = lambda _signal: (buy_calls.append("buy") or {"success": True, "message": "ok"})
+        ex.strategy = SimpleNamespace(
+            has_position=False,
+            generate_signal=lambda **_kwargs: SimpleNamespace(
+                # Enum class identity가 달라도 value가 BUY면 매수 분기로 라우팅되어야 함
+                signal_type=SimpleNamespace(value="BUY"),
+                price=86295.0,
+                stop_loss=84000.0,
+                take_profit=89000.0,
+                trailing_stop=None,
+                exit_reason=None,
+                reason="foreign enum buy",
+                atr=1000.0,
+                trend=SimpleNamespace(value="UPTREND"),
+            ),
+        )
+
+        result = ex.run_once()
+
+        self.assertEqual(len(buy_calls), 1)
+        self.assertTrue(result["order_result"]["success"])
+        self.assertEqual(result["signal"]["type"], "BUY")
 
 
 if __name__ == "__main__":
