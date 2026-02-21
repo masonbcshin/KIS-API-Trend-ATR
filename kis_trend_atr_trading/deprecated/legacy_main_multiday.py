@@ -458,6 +458,27 @@ def run_trade(
         print("   ★ 포지션은 프로그램 종료 시에도 유지됩니다.")
         print("   ★ Exit는 오직 가격 조건으로만 발생합니다.\n")
 
+        # 멀티심볼 루프는 executor.run()을 직접 호출하지 않으므로 시작 알림을 수동 전송
+        if executors:
+            notifier = getattr(executors[0], "telegram", None)
+            if notifier is not None:
+                mode_display = {
+                    "REAL": "🔴 실계좌",
+                    "LIVE": "🔴 실계좌",
+                    "CBT": "🟡 종이매매",
+                    "DRY_RUN": "🟡 종이매매",
+                    "PAPER": "🟢 모의투자",
+                }.get(trading_mode, trading_mode)
+                try:
+                    notifier.notify_system_start(
+                        stock_code=", ".join(run_symbols),
+                        order_quantity=order_quantity,
+                        interval=int(interval),
+                        mode=mode_display,
+                    )
+                except Exception as e:
+                    logger.warning(f"[TELEGRAM] 시작 알림 전송 실패(계속 진행): {e}")
+
         def _normalize_bar_ts(ts):
             if ts is None:
                 return None
