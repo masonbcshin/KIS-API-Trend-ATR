@@ -15,6 +15,7 @@ jobs:
         with:
           host: ${{ secrets.OCI_HOST }}
           username: ${{ secrets.OCI_USER }}
+          key: ${{ secrets.OCI_SSH_KEY }}
           script: |
             cd ${{ secrets.OCI_PROJECT_PATH }}
 
