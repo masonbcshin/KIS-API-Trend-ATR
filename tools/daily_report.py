@@ -13,7 +13,10 @@ from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 APP_ROOT = PROJECT_ROOT / "kis_trend_atr_trading"
-sys.path.insert(0, str(APP_ROOT))
+for _path in (APP_ROOT, PROJECT_ROOT):
+    path_str = str(_path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
 
 from reporting.daily_report_service import DailyReportService
 from utils.logger import get_logger

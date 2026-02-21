@@ -13,7 +13,11 @@ def main() -> int:
     if not ROOT_TOOL.exists():
         print(f"daily_report tool not found: {ROOT_TOOL}")
         return 1
-    namespace = {}
+    namespace = {
+        "__file__": str(ROOT_TOOL),
+        "__name__": "__daily_report_root__",
+        "__package__": None,
+    }
     exec(compile(ROOT_TOOL.read_text(encoding="utf-8"), str(ROOT_TOOL), "exec"), namespace)
     entry = namespace.get("main")
     if callable(entry):
@@ -23,4 +27,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

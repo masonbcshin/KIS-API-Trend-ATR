@@ -19,7 +19,7 @@ KIS Trend-ATR Trading System - 모의투자 전용 설정
 버전: 2.0.0
 """
 
-from kis_trend_atr_trading.config.settings_base import *
+from .settings_base import *
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 모의투자 전용 설정 (Base 오버라이드)

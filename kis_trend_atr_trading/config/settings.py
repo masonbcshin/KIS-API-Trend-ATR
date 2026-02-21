@@ -55,14 +55,14 @@ _CURRENT_MODE = _get_execution_mode()
 
 # 모드별 설정 로드
 if _CURRENT_MODE == "REAL":
-    from kis_trend_atr_trading.config.settings_real import *
+    from .settings_real import *
     _LOADED_SETTINGS = "settings_real.py"
 elif _CURRENT_MODE == "PAPER":
-    from kis_trend_atr_trading.config.settings_paper import *
+    from .settings_paper import *
     _LOADED_SETTINGS = "settings_paper.py"
 else:
     # 기본값: DRY_RUN (가장 안전)
-    from kis_trend_atr_trading.config.settings_base import *
+    from .settings_base import *
     _LOADED_SETTINGS = "settings_base.py"
 
 # 로드된 설정 파일 로깅
@@ -206,7 +206,7 @@ def can_place_orders() -> bool:
     
     if _CURRENT_MODE == "REAL":
         # 실계좌는 이중 승인 필요
-        from config.execution_mode import get_execution_mode_manager
+        from .execution_mode import get_execution_mode_manager
         return get_execution_mode_manager().can_place_orders()
     
     return False
