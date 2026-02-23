@@ -17,6 +17,9 @@ pytz>=2024.1
 # YAML 설정 파일 파싱
 PyYAML>=6.0.0
 
+# WebSocket 실시간 피드
+websockets>=12.0
+
 # 기술적 지표 계산
 ta>=0.10.2
 

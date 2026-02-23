@@ -692,6 +692,7 @@ class KISApi:
         
         Returns:
             Dict: 현재가 정보
+                - stock_name: 종목명(제공 시)
                 - current_price: 현재가
                 - change_rate: 등락률
                 - volume: 거래량
@@ -717,9 +718,20 @@ class KISApi:
             raise KISApiError(f"현재가 조회 실패: {data.get('msg1', 'Unknown error')}")
         
         output = data.get("output", {})
+        stock_name = (
+            str(
+                output.get("hts_kor_isnm")
+                or output.get("prdt_name")
+                or output.get("isnm_nm")
+                or ""
+            )
+            .strip()
+            or None
+        )
         
         return {
             "stock_code": stock_code,
+            "stock_name": stock_name,
             "current_price": float(output.get("stck_prpr", 0)),
             "change_rate": float(output.get("prdy_ctrt", 0)),
             "volume": int(output.get("acml_vol", 0)),
@@ -1511,6 +1523,13 @@ class KISApi:
         ]
         rows, resolved_path = self._resolve_first_list_path(data, candidate_paths)
         if not rows:
+            # path는 찾았지만 결과가 빈 배열인 경우(정상 무보유)는 경고 대상이 아닙니다.
+            if resolved_path:
+                logger.info(
+                    "[KIS][HOLDINGS] parsed path=%s count=0",
+                    resolved_path,
+                )
+                return []
             logger.warning(
                 "[KIS][HOLDINGS] 보유 배열 경로를 찾지 못함: candidates=%s",
                 ["/".join(path) for path in candidate_paths],

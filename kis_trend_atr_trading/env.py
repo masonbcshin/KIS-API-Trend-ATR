@@ -37,6 +37,12 @@ from pathlib import Path
 from enum import Enum
 from typing import Optional
 
+# `env` / `kis_trend_atr_trading.env` 이중 임포트로 모듈이 2번 로드되는 것을 방지합니다.
+_this_module = sys.modules.get(__name__)
+if _this_module is not None:
+    sys.modules.setdefault("env", _this_module)
+    sys.modules.setdefault("kis_trend_atr_trading.env", _this_module)
+
 
 class Environment(Enum):
     """

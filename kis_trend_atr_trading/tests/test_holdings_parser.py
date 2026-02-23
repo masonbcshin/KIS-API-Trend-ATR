@@ -1,3 +1,4 @@
+import logging
 from decimal import Decimal
 
 from api.kis_api import KISApi
@@ -60,3 +61,14 @@ def test_array_path_is_resolved_before_key_candidates():
 
     # output1 경로가 먼저 확정되므로 output2로 넘어가지 않고 빈 결과여야 함
     assert holdings == []
+
+
+def test_empty_holdings_list_does_not_log_missing_path_warning(caplog):
+    payload = {"output1": []}
+    api = _build_api_with_payload(payload)
+
+    with caplog.at_level(logging.WARNING, logger="kis_api"):
+        holdings = api.get_holdings()
+
+    assert holdings == []
+    assert "보유 배열 경로를 찾지 못함" not in caplog.text

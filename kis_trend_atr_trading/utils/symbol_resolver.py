@@ -4,9 +4,11 @@ KIS Trend-ATR Trading System - 종목명 Resolver
 알림 메시지에서 종목코드를 `종목명(종목코드)` 형태로 통일하기 위한 모듈입니다.
 """
 
+import json
 import threading
 from datetime import datetime, timedelta
-from typing import Dict, Optional
+from pathlib import Path
+from typing import Dict, Optional, Set
 
 from api.kis_api import KISApi
 from db.repository import (
@@ -21,6 +23,7 @@ from utils.market_hours import KST
 logger = get_logger("symbol_resolver")
 
 DEFAULT_SYMBOL_CACHE_TTL_DAYS = 30
+DEFAULT_UNIVERSE_CACHE_FILE = Path(__file__).resolve().parents[1] / "data" / "universe_cache.json"
 
 
 class SymbolResolver:
@@ -31,7 +34,9 @@ class SymbolResolver:
         1) 메모리 캐시
         2) SSOT DB symbol_cache
         3) KIS API(get_account_balance -> holdings[].stock_name)
-        4) 실패 시 UNKNOWN(code)
+        4) KIS API(get_current_price -> stock_name)
+        5) universe_cache 종목 선조회 후 재시도
+        6) 실패 시 UNKNOWN(code)
     """
 
     def __init__(
@@ -39,14 +44,18 @@ class SymbolResolver:
         cache_repo: SymbolCacheRepository = None,
         api_client: KISApi = None,
         ttl_days: int = DEFAULT_SYMBOL_CACHE_TTL_DAYS,
+        universe_cache_file: Optional[str] = None,
     ):
         self._cache_repo = cache_repo or get_symbol_cache_repository()
         self._api_client = api_client
         self._ttl = timedelta(days=max(int(ttl_days), 1))
+        self._universe_cache_file = self._resolve_universe_cache_file(universe_cache_file)
 
         self._memory_cache: Dict[str, SymbolCacheRecord] = {}
         self._locks: Dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
+        self._universe_seeded = False
+        self._universe_seed_lock = threading.Lock()
 
     def format_symbol(self, stock_code: str, refresh: bool = True) -> str:
         """
@@ -133,26 +142,128 @@ class SymbolResolver:
         if client is None:
             return None
 
-        balance = client.get_account_balance()
-        if not isinstance(balance, dict) or not balance.get("success"):
+        matched_name: Optional[str] = None
+        try:
+            balance = client.get_account_balance()
+        except Exception as e:
+            logger.warning(f"[SYMBOL] 보유 종목 조회 실패: code={stock_code}, err={e}")
+            balance = {}
+
+        if isinstance(balance, dict) and balance.get("success"):
+            now = datetime.now(KST)
+            holdings = balance.get("holdings") or []
+
+            for item in holdings:
+                code = str(item.get("stock_code", "")).strip()
+                name = str(item.get("stock_name", "")).strip()
+                if not code or not name:
+                    continue
+
+                # 한번의 API 호출 결과로 보유종목명을 모두 캐시에 반영합니다.
+                self._save_cache(code, name, updated_at=now)
+                if code == stock_code:
+                    matched_name = name
+
+        if matched_name:
+            return matched_name
+
+        # 비보유 종목은 현재가 API의 종목명 필드로 보강 시도합니다.
+        quote_name = self._lookup_name_via_quote(stock_code, client=client)
+        if quote_name:
+            return quote_name
+
+        # universe_cache의 오늘 대상 종목을 1회 선조회 후 다시 확인합니다.
+        self._seed_from_universe_cache(client=client)
+        cached = self._memory_cache.get(stock_code) or self._load_from_persistent_cache(stock_code)
+        if cached:
+            self._memory_cache[stock_code] = cached
+            return cached.stock_name
+
+        return None
+
+    def _lookup_name_via_quote(self, stock_code: str, client: Optional[KISApi] = None) -> Optional[str]:
+        api_client = client or self._get_api_client()
+        if api_client is None:
+            return None
+        try:
+            quote = api_client.get_current_price(stock_code)
+        except Exception:
+            return None
+        if not isinstance(quote, dict):
             return None
 
-        matched_name: Optional[str] = None
-        now = datetime.now(KST)
-        holdings = balance.get("holdings") or []
+        stock_name = str(
+            quote.get("stock_name")
+            or quote.get("name")
+            or quote.get("hts_kor_isnm")
+            or quote.get("prdt_name")
+            or ""
+        ).strip()
+        if not stock_name:
+            return None
 
-        for item in holdings:
-            code = str(item.get("stock_code", "")).strip()
-            name = str(item.get("stock_name", "")).strip()
-            if not code or not name:
+        self._save_cache(stock_code, stock_name)
+        return stock_name
+
+    def _seed_from_universe_cache(self, client: Optional[KISApi] = None) -> None:
+        if self._universe_seeded:
+            return
+
+        with self._universe_seed_lock:
+            if self._universe_seeded:
+                return
+            self._universe_seeded = True
+            symbols = self._load_symbols_from_universe_cache()
+
+        if not symbols:
+            return
+
+        seeded = 0
+        for code in symbols:
+            if not code:
                 continue
+            if code in self._memory_cache:
+                continue
+            persisted = self._load_from_persistent_cache(code)
+            if persisted:
+                self._memory_cache[code] = persisted
+                continue
+            if self._lookup_name_via_quote(code, client=client):
+                seeded += 1
 
-            # 한번의 API 호출 결과로 보유종목명을 모두 캐시에 반영합니다.
-            self._save_cache(code, name, updated_at=now)
-            if code == stock_code:
-                matched_name = name
+        if seeded > 0:
+            logger.info(f"[SYMBOL] universe_cache 선조회 완료: symbols={len(symbols)}, seeded={seeded}")
 
-        return matched_name
+    def _load_symbols_from_universe_cache(self) -> Set[str]:
+        cache_file = self._universe_cache_file
+        if not cache_file.exists():
+            return set()
+
+        try:
+            raw = json.loads(cache_file.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning(f"[SYMBOL] universe_cache 로드 실패: file={cache_file}, err={e}")
+            return set()
+
+        symbols: Set[str] = set()
+        for key in ("stocks", "universe_symbols", "symbols", "holdings_symbols"):
+            values = raw.get(key)
+            if not isinstance(values, list):
+                continue
+            for value in values:
+                code = self._normalize_stock_code(value)
+                if code:
+                    symbols.add(code)
+        return symbols
+
+    @staticmethod
+    def _resolve_universe_cache_file(universe_cache_file: Optional[str]) -> Path:
+        if not universe_cache_file:
+            return DEFAULT_UNIVERSE_CACHE_FILE
+        candidate = Path(str(universe_cache_file)).expanduser()
+        if candidate.is_absolute():
+            return candidate
+        return Path(__file__).resolve().parents[1] / candidate
 
     def _save_cache(
         self,

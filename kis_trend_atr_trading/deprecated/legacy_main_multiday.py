@@ -353,21 +353,29 @@ def run_trade(
         rest_provider = KISRestMarketDataProvider(api=api)
         ws_provider = None
         if runtime_config.data_feed_default == "ws" or runtime_config.offsession_ws_enabled:
-            ws_client = KISWSClient(
-                app_key=settings.APP_KEY,
-                app_secret=settings.APP_SECRET,
-                is_paper_trading=(trading_mode != "REAL"),
-                max_reconnect_attempts=runtime_config.ws_reconnect_max_attempts,
-                reconnect_base_delay=float(runtime_config.ws_reconnect_backoff_base_sec),
-                failure_policy="rest_fallback",
-                approval_key_refresh_margin_min=30,
-            )
-            ws_provider = KISWSMarketDataProvider(
-                ws_client=ws_client,
-                rest_fallback_provider=rest_provider,
-                max_reconnect_attempts=runtime_config.ws_reconnect_max_attempts,
-                reconnect_base_delay=float(runtime_config.ws_reconnect_backoff_base_sec),
-            )
+            try:
+                import websockets  # noqa: F401
+            except Exception as ws_dep_err:
+                logger.warning(
+                    "[WS] websockets 패키지 미설치: WS feed 비활성화, REST 고정 사용(err=%s)",
+                    ws_dep_err,
+                )
+            else:
+                ws_client = KISWSClient(
+                    app_key=settings.APP_KEY,
+                    app_secret=settings.APP_SECRET,
+                    is_paper_trading=(trading_mode != "REAL"),
+                    max_reconnect_attempts=runtime_config.ws_reconnect_max_attempts,
+                    reconnect_base_delay=float(runtime_config.ws_reconnect_backoff_base_sec),
+                    failure_policy="rest_fallback",
+                    approval_key_refresh_margin_min=30,
+                )
+                ws_provider = KISWSMarketDataProvider(
+                    ws_client=ws_client,
+                    rest_fallback_provider=rest_provider,
+                    max_reconnect_attempts=runtime_config.ws_reconnect_max_attempts,
+                    reconnect_base_delay=float(runtime_config.ws_reconnect_backoff_base_sec),
+                )
         
         # Universe 서비스 (일자별 1회 생성 + 재사용, 보유종목/신규진입 분리)
         universe_yaml = Path(__file__).resolve().parent / "config" / "universe.yaml"
@@ -541,6 +549,7 @@ def run_trade(
                     MarketSessionState.IN_SESSION,
                     MarketSessionState.AUCTION_GUARD,
                 ))
+                and ws_provider.is_ws_connected()
             ):
                 return "ws"
             return "rest"

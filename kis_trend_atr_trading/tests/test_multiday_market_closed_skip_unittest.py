@@ -76,21 +76,21 @@ class _DummyMarketChecker:
 
 
 class TestMultidayMarketClosedSkip(unittest.TestCase):
-    def test_resync_mode_overrides_cbt_to_real_with_injected_real_api(self):
+    def test_resync_mode_keeps_cbt_with_injected_real_api(self):
         mode = MultidayExecutor._resolve_resync_mode(
             trading_mode="CBT",
             api_obj=SimpleNamespace(is_paper_trading=False),
             api_was_injected=True,
         )
-        self.assertEqual(mode, "REAL")
+        self.assertEqual(mode, "CBT")
 
-    def test_resync_mode_overrides_cbt_to_paper_with_injected_paper_api(self):
+    def test_resync_mode_keeps_cbt_with_injected_paper_api(self):
         mode = MultidayExecutor._resolve_resync_mode(
             trading_mode="CBT",
             api_obj=SimpleNamespace(is_paper_trading=True),
             api_was_injected=True,
         )
-        self.assertEqual(mode, "PAPER")
+        self.assertEqual(mode, "CBT")
 
     def test_resync_mode_keeps_cbt_without_injected_api(self):
         mode = MultidayExecutor._resolve_resync_mode(

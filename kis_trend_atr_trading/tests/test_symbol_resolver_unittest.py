@@ -104,3 +104,56 @@ def test_format_symbol_api_failure_without_cache_returns_unknown():
     formatted = resolver.format_symbol("005930")
 
     assert formatted == "UNKNOWN(005930)"
+
+
+def test_format_symbol_uses_quote_name_when_not_in_holdings():
+    repo = InMemorySymbolCacheRepo()
+    api_client = MagicMock()
+    api_client.get_account_balance.return_value = {
+        "success": True,
+        "holdings": [],
+    }
+    api_client.get_current_price.return_value = {
+        "stock_code": "005930",
+        "stock_name": "삼성전자",
+        "current_price": 65000.0,
+    }
+    resolver = SymbolResolver(cache_repo=repo, api_client=api_client)
+
+    formatted = resolver.format_symbol("005930")
+
+    assert formatted == "삼성전자(005930)"
+    assert ("005930", "삼성전자") in repo.upsert_calls
+
+
+def test_format_symbol_seeds_from_universe_cache_file(tmp_path):
+    universe_cache = tmp_path / "universe_cache.json"
+    universe_cache.write_text(
+        '{"stocks":["000660"],"date":"2026-02-23"}',
+        encoding="utf-8",
+    )
+
+    repo = InMemorySymbolCacheRepo()
+    api_client = MagicMock()
+    api_client.get_account_balance.return_value = {
+        "success": True,
+        "holdings": [],
+    }
+
+    def _price_by_code(code: str):
+        table = {
+            "000660": {"stock_code": "000660", "stock_name": "SK하이닉스", "current_price": 200000.0},
+            "005930": {"stock_code": "005930", "current_price": 65000.0},
+        }
+        return table.get(str(code), {"stock_code": str(code), "current_price": 0.0})
+
+    api_client.get_current_price.side_effect = _price_by_code
+    resolver = SymbolResolver(
+        cache_repo=repo,
+        api_client=api_client,
+        universe_cache_file=str(universe_cache),
+    )
+
+    # 1차 조회에서 universe_cache 종목명이 선반영되어야 합니다.
+    assert resolver.format_symbol("005930") == "UNKNOWN(005930)"
+    assert resolver.format_symbol("000660", refresh=False) == "SK하이닉스(000660)"

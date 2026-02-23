@@ -107,11 +107,18 @@ class MultidayExecutor:
         """
         포지션 복원용 동기화 모드를 결정합니다.
 
-        기본은 설정값(trading_mode)을 따르되, 외부에서 API 객체를 주입했고
-        설정 모드가 CBT 계열이면 API의 실제 계좌 모드(PAPER/REAL)로 보정합니다.
+        기본은 설정값(trading_mode)을 따릅니다.
+        CBT는 절대 계좌 동기화 모드(PAPER/REAL)로 보정하지 않습니다.
+
+        NOTE:
+            이전 구현은 외부 API 객체 주입 시 CBT를 PAPER/REAL로 보정했지만,
+            이 경우 포지션 자동정리 로직이 활성화되어 CBT 포지션 지속성이 깨질 수 있습니다.
         """
         normalized_mode = cls._normalize_mode_label(trading_mode)
-        if not api_was_injected or normalized_mode in ("PAPER", "REAL"):
+        if normalized_mode in ("CBT", "PAPER", "REAL"):
+            return normalized_mode
+
+        if not api_was_injected:
             return normalized_mode
 
         api_is_paper = getattr(api_obj, "is_paper_trading", None)
