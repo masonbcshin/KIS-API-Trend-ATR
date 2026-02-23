@@ -1250,6 +1250,76 @@ class MultidayExecutor:
             return max(parsed, 0)
         return 0
 
+    @staticmethod
+    def _extract_holding_avg_price(holding: Dict[str, Any]) -> float:
+        raw_values = (
+            holding.get("avg_price"),
+            holding.get("pchs_avg_pric"),
+            holding.get("avg_buy_price"),
+            holding.get("pchs_avrg_pric"),
+            holding.get("entry_price"),
+        )
+        for raw in raw_values:
+            if raw is None:
+                continue
+            try:
+                parsed = float(str(raw).replace(",", "").strip())
+            except (TypeError, ValueError):
+                continue
+            if parsed > 0:
+                return parsed
+        return 0.0
+
+    def _get_account_holding(self, stock_code: str) -> Optional[Dict[str, Any]]:
+        """API 계좌 기준 특정 종목 보유 스냅샷을 반환합니다."""
+        try:
+            if hasattr(self.api, "get_holdings"):
+                payload = self.api.get_holdings()
+            else:
+                balance = self.api.get_account_balance()
+                if not isinstance(balance, dict) or not balance.get("success"):
+                    return None
+                payload = balance.get("holdings", [])
+        except Exception as e:
+            logger.warning(
+                "[AUTO_RECOVER] 계좌 보유 상세 확인 실패: symbol=%s, err=%s",
+                stock_code,
+                e,
+            )
+            return None
+
+        holdings = payload if isinstance(payload, list) else []
+        for raw_holding in holdings:
+            if not isinstance(raw_holding, dict):
+                continue
+            symbol = str(
+                raw_holding.get("stock_code")
+                or raw_holding.get("pdno")
+                or raw_holding.get("symbol")
+                or ""
+            ).strip()
+            if symbol != stock_code:
+                continue
+            qty = self._extract_holding_qty(raw_holding)
+            if qty <= 0:
+                continue
+            avg_price = self._extract_holding_avg_price(raw_holding)
+            try:
+                current_price = float(
+                    raw_holding.get("current_price")
+                    or raw_holding.get("prpr")
+                    or 0.0
+                )
+            except (TypeError, ValueError):
+                current_price = 0.0
+            return {
+                "stock_code": symbol,
+                "qty": qty,
+                "avg_price": avg_price,
+                "current_price": current_price,
+            }
+        return None
+
     def _account_has_holding(self, stock_code: str) -> Optional[bool]:
         """API 계좌 기준으로 특정 종목 보유 여부를 확인합니다."""
         try:
@@ -1329,6 +1399,81 @@ class MultidayExecutor:
         try:
             self.telegram.notify_warning(
                 f"포지션 자동정리\n종목: {self.stock_code}\n사유: API 계좌 무보유 확인"
+            )
+        except Exception:
+            pass
+        return True
+
+    def _auto_reconcile_stale_position_after_buy_failure(
+        self,
+        signal: TradingSignal,
+        error_message: str,
+    ) -> bool:
+        """
+        매수 실패가 타임아웃/취소 성격이고 계좌 보유가 확인되면 로컬 포지션을 자동 복구합니다.
+        """
+        lower = (error_message or "").lower()
+        is_timeout_like = ("타임아웃" in lower) or ("timeout" in lower)
+        is_cancel_like = ("미체결로 주문 취소" in lower) or ("cancelled" in lower)
+        should_reconcile = is_timeout_like or is_cancel_like
+        if not should_reconcile:
+            return False
+        if self._is_market_unavailable_error(error_message):
+            return False
+
+        has_holding = self._account_has_holding(self.stock_code)
+        if has_holding is None or not has_holding:
+            return False
+
+        holding = self._get_account_holding(self.stock_code) or {}
+        recovered_qty = int(holding.get("qty") or self.order_quantity or 0)
+        recovered_avg = float(holding.get("avg_price") or 0.0)
+        if recovered_avg <= 0:
+            recovered_avg = float(getattr(signal, "price", 0.0) or 0.0)
+        if recovered_qty <= 0 or recovered_avg <= 0:
+            return False
+
+        atr = float(getattr(signal, "atr", 0.0) or 0.0)
+        if atr <= 0:
+            atr = max(recovered_avg * 0.01, 1.0)
+        stop_loss = recovered_avg - (atr * settings.ATR_MULTIPLIER_SL)
+        take_profit = recovered_avg + (atr * settings.ATR_MULTIPLIER_TP)
+
+        try:
+            self.strategy.open_position(
+                symbol=self.stock_code,
+                entry_price=recovered_avg,
+                quantity=recovered_qty,
+                atr=atr,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+            )
+        except Exception as e:
+            logger.warning(
+                "[AUTO_RECOVER] 매수 자동복구 실패: symbol=%s, err=%s",
+                self.stock_code,
+                e,
+            )
+            return False
+
+        self._save_position_on_exit()
+        self._sync_db_position_from_strategy()
+        self._persist_account_snapshot(force=True)
+
+        logger.warning(
+            "[AUTO_RECOVER] 계좌 보유 확인으로 로컬 포지션 자동 복구: symbol=%s, qty=%s, avg=%s, error=%s",
+            self.stock_code,
+            recovered_qty,
+            recovered_avg,
+            error_message,
+        )
+        try:
+            self.telegram.notify_warning(
+                "포지션 자동복구\n"
+                f"종목: {self.stock_code}\n"
+                f"수량: {recovered_qty}주\n"
+                f"평단가: {recovered_avg:,.2f}원\n"
+                "사유: 체결조회 타임아웃/취소 후 API 계좌 보유 확인"
             )
         except Exception:
             pass
@@ -1669,6 +1814,18 @@ class MultidayExecutor:
             
             else:
                 # 완전 실패 - 포지션 상태 변경 없음
+                if self._auto_reconcile_stale_position_after_buy_failure(signal, sync_result.message):
+                    reconciled_pos = self.strategy.position if self.strategy.has_position else None
+                    return {
+                        "success": True,
+                        "reconciled": True,
+                        "order_no": sync_result.order_no,
+                        "exec_qty": int(getattr(reconciled_pos, "quantity", 0) or 0),
+                        "exec_price": float(getattr(reconciled_pos, "entry_price", 0.0) or 0.0),
+                        "message": (
+                            "API 계좌 보유 확인으로 로컬 포지션을 자동 복구했습니다."
+                        ),
+                    }
                 logger.error(f"매수 실패: {sync_result.message}")
                 return {
                     "success": False,
