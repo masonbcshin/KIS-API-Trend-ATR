@@ -120,7 +120,7 @@ class _DummyStrategy:
 
 
 class TestMultidaySellNoHoldingReconcile(unittest.TestCase):
-    def _make_executor(self, holdings):
+    def _make_executor(self, holdings, failure_message="주문 전송 실패: 모의투자 잔고내역이 없습니다."):
         ex = MultidayExecutor.__new__(MultidayExecutor)
         ex.trading_mode = "PAPER"
         ex.stock_code = "000660"
@@ -138,7 +138,7 @@ class TestMultidaySellNoHoldingReconcile(unittest.TestCase):
                 success=False,
                 result_type=OrderExecutionResult.FAILED,
                 order_no="",
-                message="주문 전송 실패: 모의투자 잔고내역이 없습니다.",
+                message=failure_message,
             )
         )
         ex.api = SimpleNamespace(get_holdings=lambda: holdings)
@@ -182,6 +182,22 @@ class TestMultidaySellNoHoldingReconcile(unittest.TestCase):
         self.assertEqual(ex.position_store.clear_position_calls, 0)
         self.assertEqual(ex.db_sync_calls, 0)
         self.assertEqual(ex.snapshot_calls, 0)
+
+    def test_execute_sell_timeout_auto_reconciles_when_api_confirms_no_holding(self):
+        ex = self._make_executor(
+            holdings=[],
+            failure_message="타임아웃 - 마지막 확인 체결수량: 0주",
+        )
+        signal = SimpleNamespace(exit_reason=None, price=957000.0)
+
+        result = ex.execute_sell(signal)
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result.get("reconciled"))
+        self.assertFalse(ex.strategy.has_position)
+        self.assertEqual(ex.position_store.clear_position_calls, 1)
+        self.assertEqual(ex.db_sync_calls, 1)
+        self.assertEqual(ex.snapshot_calls, 1)
 
 
 if __name__ == "__main__":

@@ -1289,7 +1289,17 @@ class MultidayExecutor:
         """
         매도 실패가 '계좌 무보유' 원인으로 확인되면 로컬 포지션을 자동 정리합니다.
         """
-        if not self._is_no_holding_error(error_message):
+        lower = (error_message or "").lower()
+        is_timeout_like = ("타임아웃" in lower) or ("timeout" in lower)
+        is_cancel_like = ("미체결로 주문 취소" in lower) or ("cancelled" in lower)
+        should_reconcile = (
+            self._is_no_holding_error(error_message)
+            or is_timeout_like
+            or is_cancel_like
+        )
+        if not should_reconcile:
+            return False
+        if self._is_market_unavailable_error(error_message):
             return False
 
         has_holding = self._account_has_holding(self.stock_code)
