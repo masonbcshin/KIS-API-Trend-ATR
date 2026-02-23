@@ -155,7 +155,10 @@ class DailyReportService:
 
         risk_events: List[str] = []
         try:
-            risk_events = self._load_risk_events(trade_date)
+            risk_events = self._load_risk_events(
+                trade_date=trade_date,
+                total_trades=int(computed.get("total_trades", 0) or 0),
+            )
         except Exception as err:
             logger.warning(f"[REPORT] 리스크 이벤트 조회 실패 - 빈 목록 처리: {err}")
 
@@ -222,6 +225,7 @@ class DailyReportService:
 
         lines.append("")
         lines.append("리스크 이벤트:")
+        lines.append("- 집계기준: 거래/손익=trades(체결), 주문차단/실패=order_state(주문시도)")
         if report.risk_events:
             limited_events = report.risk_events[: max(risk_event_limit, 1)]
             for event in limited_events:
@@ -433,12 +437,19 @@ class DailyReportService:
             for row in (rows or [])
         }
 
-    def _load_risk_events(self, trade_date: date) -> List[str]:
+    def _load_risk_events(self, trade_date: date, total_trades: int) -> List[str]:
         events: List[str] = []
         events.extend(self._load_risk_reason_events(trade_date))
-        order_state_event = self._load_order_state_event(trade_date)
+        order_state_stats = self._load_order_state_stats(trade_date)
+        order_state_event = self._build_order_state_event(order_state_stats)
         if order_state_event:
             events.append(order_state_event)
+        events.extend(
+            self._build_order_state_anomaly_events(
+                order_state_stats=order_state_stats,
+                total_trades=total_trades,
+            )
+        )
         return events
 
     def _load_risk_reason_events(self, trade_date: date) -> List[str]:
@@ -466,30 +477,106 @@ class DailyReportService:
             events.append(f"{label}: {cnt}건")
         return events
 
-    def _load_order_state_event(self, trade_date: date) -> Optional[str]:
+    def _load_order_state_stats(self, trade_date: date) -> Dict[str, Any]:
         if not self._db.table_exists("order_state"):
-            return None
+            return {
+                "failed_count": 0,
+                "cancelled_count": 0,
+                "total_count": 0,
+                "unique_signal_count": 0,
+            }
 
-        row = self._db.execute_query(
-            """
-            SELECT
-                SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) AS failed_count,
-                SUM(CASE WHEN status = 'CANCELLED' THEN 1 ELSE 0 END) AS cancelled_count
-            FROM order_state
-            WHERE DATE(requested_at) = %s AND mode = %s
-            """,
-            (trade_date, self._mode),
-            fetch_one=True,
-        )
+        try:
+            row = self._db.execute_query(
+                """
+                SELECT
+                    SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) AS failed_count,
+                    SUM(CASE WHEN status = 'CANCELLED' THEN 1 ELSE 0 END) AS cancelled_count,
+                    COUNT(
+                        DISTINCT CASE
+                            WHEN status IN ('FAILED', 'CANCELLED')
+                            THEN COALESCE(NULLIF(signal_id, ''), idempotency_key)
+                            ELSE NULL
+                        END
+                    ) AS unique_signal_count
+                FROM order_state
+                WHERE DATE(requested_at) = %s AND mode = %s
+                """,
+                (trade_date, self._mode),
+                fetch_one=True,
+            )
+        except Exception:
+            # 구스키마(order_state.signal_id 없음) 호환
+            row = self._db.execute_query(
+                """
+                SELECT
+                    SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) AS failed_count,
+                    SUM(CASE WHEN status = 'CANCELLED' THEN 1 ELSE 0 END) AS cancelled_count,
+                    COUNT(
+                        DISTINCT CASE
+                            WHEN status IN ('FAILED', 'CANCELLED')
+                            THEN idempotency_key
+                            ELSE NULL
+                        END
+                    ) AS unique_signal_count
+                FROM order_state
+                WHERE DATE(requested_at) = %s AND mode = %s
+                """,
+                (trade_date, self._mode),
+                fetch_one=True,
+            )
+
         failed_count = int((row or {}).get("failed_count", 0) or 0)
         cancelled_count = int((row or {}).get("cancelled_count", 0) or 0)
+        unique_signal_count = int((row or {}).get("unique_signal_count", 0) or 0)
+        total = failed_count + cancelled_count
+        return {
+            "failed_count": failed_count,
+            "cancelled_count": cancelled_count,
+            "total_count": total,
+            "unique_signal_count": unique_signal_count,
+        }
+
+    @staticmethod
+    def _build_order_state_event(order_state_stats: Dict[str, Any]) -> Optional[str]:
+        failed_count = int(order_state_stats.get("failed_count", 0) or 0)
+        cancelled_count = int(order_state_stats.get("cancelled_count", 0) or 0)
         total = failed_count + cancelled_count
         if total <= 0:
             return None
         return (
-            "주문차단/실패: "
+            "주문차단/실패(order_state, 주문 시도 기준): "
             f"{total}건 (FAILED {failed_count}건, CANCELLED {cancelled_count}건)"
         )
+
+    @staticmethod
+    def _build_order_state_anomaly_events(
+        order_state_stats: Dict[str, Any],
+        total_trades: int,
+    ) -> List[str]:
+        events: List[str] = []
+        total = int(order_state_stats.get("total_count", 0) or 0)
+        unique_signal_count = int(order_state_stats.get("unique_signal_count", 0) or 0)
+
+        if total <= 0:
+            return events
+
+        if total_trades <= 0:
+            events.append(
+                f"체결 0건인데 주문 실패/취소 {total}건 발생 "
+                "(체결지연/주문번호 불일치/반복시도 점검 권장)"
+            )
+
+        if unique_signal_count > 0 and total >= 20:
+            retry_ratio = total / unique_signal_count
+            if retry_ratio >= 3.0:
+                events.append(
+                    "주문 재시도 집중: "
+                    f"{total}건 / 고유 신호 {unique_signal_count}건 "
+                    f"(신호당 {retry_ratio:.1f}건)"
+                )
+
+        return events
 
     def _daily_summary_exists(self) -> bool:
         return self._db.table_exists("daily_summary")

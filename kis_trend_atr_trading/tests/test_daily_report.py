@@ -216,3 +216,34 @@ def test_unrealized_falls_back_to_latest_account_snapshot():
     report = service.build_report(date(2026, 2, 15))
 
     assert report.unrealized_pnl == 4321.0
+
+
+def test_order_state_basis_and_zero_fill_gap_message():
+    db = DummyDB(
+        trades=[],
+        order_state_row={"failed_count": 173, "cancelled_count": 62, "unique_signal_count": 80},
+        table_exists_map={"daily_summary": False, "positions": False, "order_state": True},
+    )
+    service = _create_service(db)
+
+    report = service.build_report(date(2026, 2, 23))
+    message = service.render_message(report)
+
+    assert "거래 횟수: 총 0회" in message
+    assert "집계기준: 거래/손익=trades(체결), 주문차단/실패=order_state(주문시도)" in message
+    assert "주문차단/실패(order_state, 주문 시도 기준): 235건 (FAILED 173건, CANCELLED 62건)" in message
+    assert "체결 0건인데 주문 실패/취소 235건 발생" in message
+
+
+def test_order_state_retry_concentration_event():
+    db = DummyDB(
+        trades=[{"symbol": "005930", "side": "SELL", "pnl": 5000, "reason": "TAKE_PROFIT"}],
+        order_state_row={"failed_count": 84, "cancelled_count": 36, "unique_signal_count": 20},
+        table_exists_map={"daily_summary": False, "positions": False, "order_state": True},
+    )
+    service = _create_service(db)
+
+    report = service.build_report(date(2026, 2, 23))
+    message = service.render_message(report)
+
+    assert "주문 재시도 집중: 120건 / 고유 신호 20건 (신호당 6.0건)" in message
