@@ -1397,11 +1397,16 @@ class TelegramNotifier:
     
     @staticmethod
     def _escape_markdown(text: str) -> str:
-        """마크다운 특수문자 이스케이프"""
-        special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
-        for char in special_chars:
-            text = text.replace(char, f'\\{char}')
-        return text
+        """
+        Telegram Markdown(legacy) 기준 최소 이스케이프.
+
+        NOTE:
+            send_message 기본 parse_mode는 "Markdown"이며, MarkdownV2가 아닙니다.
+            V2 전용 문자까지 이스케이프하면 백슬래시가 본문에 노출됩니다.
+        """
+        raw = str(text or "")
+        # Telegram Markdown(legacy)에서 의미를 갖는 핵심 문자만 이스케이프.
+        return re.sub(r"([_*`\[])", r"\\\1", raw)
     
     def test_connection(self) -> bool:
         """
