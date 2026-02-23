@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -85,6 +86,32 @@ def main() -> int:
     logger.info(f"[DAILY_REPORT] 대상일={target_date}, dry_run={args.dry_run}")
 
     try:
+        reconcile_enabled = str(
+            os.getenv("DAILY_REPORT_BROKER_RECONCILE", "true")
+        ).strip().lower() in ("true", "1", "yes")
+        if reconcile_enabled:
+            try:
+                reconcile_attempts = max(
+                    int(os.getenv("DAILY_REPORT_RECONCILE_ATTEMPTS", "2")),
+                    1,
+                )
+            except ValueError:
+                reconcile_attempts = 2
+            try:
+                reconcile_interval = max(
+                    float(os.getenv("DAILY_REPORT_RECONCILE_INTERVAL_SEC", "1.0")),
+                    0.0,
+                )
+            except ValueError:
+                reconcile_interval = 1.0
+
+            reconcile_stats = service.reconcile_trades_from_broker(
+                trade_date=target_date,
+                attempts=reconcile_attempts,
+                interval_seconds=reconcile_interval,
+            )
+            logger.info(f"[DAILY_REPORT] 브로커 체결 리컨실: {reconcile_stats}")
+
         report = service.build_report(target_date)
         message = service.render_message(report)
     except Exception as exc:

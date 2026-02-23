@@ -13,7 +13,7 @@ import json
 import time
 import threading
 from copy import deepcopy
-from datetime import datetime, timedelta
+from datetime import date as dt_date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Any, List
@@ -211,6 +211,36 @@ class KISApi:
                 return int(float(raw))
             except (TypeError, ValueError):
                 return default
+
+    @staticmethod
+    def _format_order_query_date(value: Any) -> str:
+        """
+        주문/체결 조회용 날짜 인자를 YYYYMMDD 문자열로 정규화합니다.
+
+        허용 입력:
+            - datetime/date
+            - "YYYYMMDD" / "YYYY-MM-DD" 문자열
+            - None(호출 시점 KST 오늘)
+        """
+        if value in (None, ""):
+            return datetime.now(KST).strftime("%Y%m%d")
+
+        if isinstance(value, datetime):
+            dt = value.astimezone(KST) if value.tzinfo else KST.localize(value)
+            return dt.strftime("%Y%m%d")
+
+        if isinstance(value, dt_date):
+            return value.strftime("%Y%m%d")
+
+        raw = str(value).strip()
+        if not raw:
+            return datetime.now(KST).strftime("%Y%m%d")
+
+        compact = raw.replace("-", "")
+        if len(compact) == 8 and compact.isdigit():
+            return compact
+
+        raise ValueError(f"지원하지 않는 날짜 형식: {value}")
 
     @staticmethod
     def _normalize_order_no(value: Any) -> str:
@@ -1159,7 +1189,12 @@ class KISApi:
                 "data": {}
             }
     
-    def get_order_status(self, order_no: str = None) -> Dict:
+    def get_order_status(
+        self,
+        order_no: str = None,
+        trade_date: Any = None,
+        end_date: Any = None,
+    ) -> Dict:
         """
         주문 체결 내역을 조회합니다 (모의투자 전용).
         
@@ -1170,6 +1205,8 @@ class KISApi:
         
         Args:
             order_no: 주문 번호 (미입력 시 당일 전체 조회)
+            trade_date: 조회 시작일 (미입력 시 오늘)
+            end_date: 조회 종료일 (미입력 시 trade_date와 동일)
         
         Returns:
             Dict: 주문 체결 내역
@@ -1179,13 +1216,14 @@ class KISApi:
         tr_id = self._resolve_tr_id("order_status")
         headers = self._get_auth_headers(tr_id)
         
-        today = datetime.now(KST).strftime("%Y%m%d")
-        
+        start_date = self._format_order_query_date(trade_date)
+        query_end_date = self._format_order_query_date(end_date) if end_date is not None else start_date
+
         params = {
             "CANO": self.account_no,
             "ACNT_PRDT_CD": self.account_product_code,
-            "INQR_STRT_DT": today,
-            "INQR_END_DT": today,
+            "INQR_STRT_DT": start_date,
+            "INQR_END_DT": query_end_date,
             "SLL_BUY_DVSN_CD": "00",  # 전체
             "INQR_DVSN": "00",  # 역순
             "PDNO": "",
@@ -1211,7 +1249,7 @@ class KISApi:
             if requested_order_no and not self._order_no_matches(row_order_no, requested_order_no):
                 continue
 
-            order_date = str(item.get("ord_dt") or today).strip()
+            order_date = str(item.get("ord_dt") or start_date).strip()
             order_time = str(item.get("ord_tmd") or item.get("ord_tm") or "").strip()
             executed_at_iso = None
             try:

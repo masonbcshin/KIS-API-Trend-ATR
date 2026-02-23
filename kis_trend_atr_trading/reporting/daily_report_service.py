@@ -8,13 +8,15 @@ it can run as an external scheduler task (cron/systemd timer).
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from db.mysql import MySQLManager, get_db_manager
 from env import get_db_namespace_mode
 from utils.logger import get_logger
+from utils.market_hours import KST
 from utils.symbol_resolver import SymbolResolver, get_symbol_resolver
 from utils.telegram_notifier import TelegramNotifier, get_telegram_notifier
 
@@ -251,6 +253,193 @@ class DailyReportService:
     def test_telegram_connection(self) -> bool:
         """Run Telegram connectivity test via existing notifier."""
         return self._notifier.test_connection()
+
+    @staticmethod
+    def _normalize_order_no(value: Any) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        if not digits:
+            return raw
+        try:
+            return str(int(digits))
+        except Exception:
+            return digits.lstrip("0") or "0"
+
+    @classmethod
+    def _build_broker_order_key(cls, row: Dict[str, Any]) -> Optional[Tuple[Any, ...]]:
+        if not isinstance(row, dict):
+            return None
+        symbol = str(row.get("stock_code") or "").strip()
+        side = str(row.get("side") or "").upper().strip()
+        if not symbol or side not in ("BUY", "SELL"):
+            return None
+
+        order_no = cls._normalize_order_no(row.get("order_no"))
+        exec_id = str(row.get("exec_id") or "").strip()
+        if exec_id:
+            return (symbol, side, order_no, exec_id)
+
+        executed_at = str(row.get("executed_at") or "").strip()
+        qty = int(row.get("exec_qty") or 0)
+        price = float(row.get("exec_price") or 0.0)
+        return (symbol, side, order_no, executed_at, qty, round(price, 2))
+
+    @staticmethod
+    def _parse_broker_executed_at(raw: Any, fallback_date: date) -> datetime:
+        if isinstance(raw, datetime):
+            return raw if raw.tzinfo is not None else KST.localize(raw)
+
+        if raw not in (None, ""):
+            try:
+                parsed = datetime.fromisoformat(str(raw))
+                if parsed.tzinfo is None:
+                    return KST.localize(parsed)
+                return parsed.astimezone(KST)
+            except Exception:
+                pass
+
+        return KST.localize(datetime.combine(fallback_date, datetime.min.time()))
+
+    def reconcile_trades_from_broker(
+        self,
+        trade_date: date,
+        *,
+        attempts: int = 2,
+        interval_seconds: float = 1.0,
+        api_client: Optional[Any] = None,
+        trade_repo: Optional[Any] = None,
+    ) -> Dict[str, int]:
+        """
+        주식일별주문체결조회 결과를 trades 테이블에 보강 반영합니다.
+
+        목적:
+            - 메인 프로세스 타임아웃/지연으로 누락된 체결을 cron 리포트 직전에 보강
+            - idempotency_key 기반 중복 삽입 방지
+        """
+        stats = {
+            "attempted_calls": 0,
+            "fetched_orders": 0,
+            "unique_orders": 0,
+            "filled_orders": 0,
+            "inserted_trades": 0,
+            "duplicate_trades": 0,
+            "skipped_orders": 0,
+            "errors": 0,
+            "skipped_mode": 0,
+        }
+
+        mode = str(self._mode or "").upper().strip()
+        if mode not in ("PAPER", "REAL"):
+            stats["skipped_mode"] = 1
+            logger.info(
+                "[REPORT_RECONCILE] skip mode=%s date=%s (broker reconcile disabled)",
+                mode,
+                trade_date,
+            )
+            return stats
+
+        attempts = max(int(attempts or 1), 1)
+        interval_seconds = max(float(interval_seconds or 0.0), 0.0)
+        stats["attempted_calls"] = attempts
+
+        if api_client is None:
+            from api.kis_api import KISApi
+
+            api_client = KISApi(is_paper_trading=(mode != "REAL"))
+
+        if trade_repo is None:
+            from db.repository import TradeRepository
+
+            trade_repo = TradeRepository(db=self._db)
+        if hasattr(trade_repo, "mode"):
+            trade_repo.mode = mode
+
+        deduped_orders: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+        for idx in range(attempts):
+            try:
+                payload = api_client.get_order_status(
+                    order_no=None,
+                    trade_date=trade_date,
+                    end_date=trade_date,
+                )
+                orders = payload.get("orders") or []
+                stats["fetched_orders"] += len(orders)
+                for row in orders:
+                    key = self._build_broker_order_key(row)
+                    if key is None:
+                        stats["skipped_orders"] += 1
+                        continue
+                    deduped_orders[key] = row
+            except Exception as err:
+                stats["errors"] += 1
+                logger.warning(
+                    "[REPORT_RECONCILE] broker fetch failed attempt=%s/%s date=%s err=%s",
+                    idx + 1,
+                    attempts,
+                    trade_date,
+                    err,
+                )
+            if idx + 1 < attempts and interval_seconds > 0:
+                time.sleep(interval_seconds)
+
+        stats["unique_orders"] = len(deduped_orders)
+
+        for row in deduped_orders.values():
+            symbol = str(row.get("stock_code") or "").strip()
+            side = str(row.get("side") or "").upper().strip()
+            qty = int(row.get("exec_qty") or 0)
+            price = float(row.get("exec_price") or 0.0)
+            order_no = str(row.get("order_no") or "").strip() or None
+            exec_id = str(row.get("exec_id") or "").strip() or None
+
+            if not symbol or side not in ("BUY", "SELL") or qty <= 0 or price <= 0:
+                stats["skipped_orders"] += 1
+                continue
+
+            stats["filled_orders"] += 1
+            executed_at = self._parse_broker_executed_at(row.get("executed_at"), trade_date)
+            reason = "BROKER_RECONCILE" if side == "SELL" else None
+
+            try:
+                _, created = trade_repo.save_execution_fill(
+                    symbol=symbol,
+                    side=side,
+                    price=price,
+                    quantity=qty,
+                    executed_at=executed_at,
+                    order_no=order_no,
+                    exec_id=exec_id,
+                    reason=reason,
+                )
+                if created:
+                    stats["inserted_trades"] += 1
+                else:
+                    stats["duplicate_trades"] += 1
+            except Exception as err:
+                stats["errors"] += 1
+                logger.warning(
+                    "[REPORT_RECONCILE] trade save failed symbol=%s side=%s order_no=%s err=%s",
+                    symbol,
+                    side,
+                    order_no,
+                    err,
+                )
+
+        logger.info(
+            "[REPORT_RECONCILE] done date=%s mode=%s fetched=%s unique=%s filled=%s inserted=%s duplicate=%s skipped=%s errors=%s",
+            trade_date,
+            mode,
+            stats["fetched_orders"],
+            stats["unique_orders"],
+            stats["filled_orders"],
+            stats["inserted_trades"],
+            stats["duplicate_trades"],
+            stats["skipped_orders"],
+            stats["errors"],
+        )
+        return stats
 
     def _load_trades(self, trade_date: date) -> List[Dict[str, Any]]:
         rows = self._db.execute_query(

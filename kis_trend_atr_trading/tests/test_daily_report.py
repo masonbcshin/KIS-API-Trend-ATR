@@ -247,3 +247,100 @@ def test_order_state_retry_concentration_event():
     message = service.render_message(report)
 
     assert "주문 재시도 집중: 120건 / 고유 신호 20건 (신호당 6.0건)" in message
+
+
+def test_reconcile_trades_from_broker_inserts_filled_orders_only():
+    db = DummyDB(table_exists_map={"daily_summary": False, "positions": False, "order_state": False})
+    service = _create_service(db)
+
+    class FakeApi:
+        def get_order_status(self, order_no=None, trade_date=None, end_date=None):
+            assert order_no is None
+            assert trade_date == date(2026, 2, 23)
+            assert end_date == date(2026, 2, 23)
+            return {
+                "success": True,
+                "orders": [
+                    {
+                        "order_no": "0000015963",
+                        "stock_code": "000660",
+                        "side": "SELL",
+                        "exec_qty": 1,
+                        "exec_price": 957000.0,
+                        "executed_at": "2026-02-23T11:05:35+09:00",
+                        "exec_id": "A1",
+                    },
+                    {
+                        # duplicate row (same fill)
+                        "order_no": "15963",
+                        "stock_code": "000660",
+                        "side": "SELL",
+                        "exec_qty": 1,
+                        "exec_price": 957000.0,
+                        "executed_at": "2026-02-23T11:05:35+09:00",
+                        "exec_id": "A1",
+                    },
+                    {
+                        # unfilled row must be skipped
+                        "order_no": "0000015964",
+                        "stock_code": "005930",
+                        "side": "BUY",
+                        "exec_qty": 0,
+                        "exec_price": 0.0,
+                        "executed_at": "2026-02-23T11:06:00+09:00",
+                        "exec_id": "B0",
+                    },
+                ],
+            }
+
+    class FakeTradeRepo:
+        def __init__(self):
+            self.mode = "PAPER"
+            self.saved = []
+
+        def save_execution_fill(self, **kwargs):
+            self.saved.append(kwargs)
+            return None, True
+
+    fake_repo = FakeTradeRepo()
+    stats = service.reconcile_trades_from_broker(
+        trade_date=date(2026, 2, 23),
+        attempts=1,
+        interval_seconds=0.0,
+        api_client=FakeApi(),
+        trade_repo=fake_repo,
+    )
+
+    assert stats["fetched_orders"] == 3
+    assert stats["unique_orders"] == 2
+    assert stats["filled_orders"] == 1
+    assert stats["inserted_trades"] == 1
+    assert stats["duplicate_trades"] == 0
+    assert len(fake_repo.saved) == 1
+    assert fake_repo.saved[0]["symbol"] == "000660"
+    assert fake_repo.saved[0]["side"] == "SELL"
+
+
+def test_reconcile_trades_from_broker_skips_non_order_modes():
+    db = DummyDB(table_exists_map={"daily_summary": False, "positions": False, "order_state": False})
+    notifier = MagicMock()
+    resolver = MagicMock()
+    service = DailyReportService(
+        db=db,
+        notifier=notifier,
+        symbol_resolver=resolver,
+        mode="DRY_RUN",
+    )
+
+    class FailingApi:
+        def get_order_status(self, **_kwargs):
+            raise AssertionError("DRY_RUN 모드에서는 브로커 조회를 호출하면 안 됩니다.")
+
+    stats = service.reconcile_trades_from_broker(
+        trade_date=date(2026, 2, 23),
+        api_client=FailingApi(),
+    )
+
+    assert stats["skipped_mode"] == 1
+    assert stats["fetched_orders"] == 0
+    assert stats["inserted_trades"] == 0

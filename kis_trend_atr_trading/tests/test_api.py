@@ -415,6 +415,29 @@ class TestExecutionStatusResponses:
         assert result["orders"][0]["order_no"] == "15963"
         assert result["orders"][0]["exec_qty"] == 1
 
+    @patch('api.kis_api.requests.get')
+    def test_get_order_status_accepts_custom_date_range(self, mock_get):
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"rt_cd": "0", "output1": []}
+        mock_get.return_value = mock_response
+
+        with patch.object(KISApi, '_wait_for_rate_limit', return_value=None):
+            api = KISApi(is_paper_trading=True)
+            api.access_token = "test_token"
+            with patch.object(api, "get_access_token", return_value="test_token"):
+                result = api.get_order_status(
+                    order_no=None,
+                    trade_date="2026-02-22",
+                    end_date="2026-02-23",
+                )
+
+        assert result["success"] is True
+        assert result["total_count"] == 0
+        params = mock_get.call_args.kwargs.get("params") or {}
+        assert params.get("INQR_STRT_DT") == "20260222"
+        assert params.get("INQR_END_DT") == "20260223"
+
     def test_wait_for_execution_ignores_unmatched_rows(self):
         with patch.object(KISApi, '_wait_for_rate_limit', return_value=None):
             api = KISApi(is_paper_trading=True)
