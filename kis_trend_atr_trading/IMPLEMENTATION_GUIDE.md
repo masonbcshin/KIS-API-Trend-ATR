@@ -1,6 +1,19 @@
 # 실계좌 투입 수정 가이드 (Implementation Guide)
 
 > 감사 보고서 지적 사항을 해결하기 위한 구체적인 수정 내용
+> 최신 운영 반영(2026-02-23)은 `README.md`, `USAGE_GUIDE.md`, `BEGINNER_GUIDE.md`를 우선 기준으로 확인하세요.
+
+## 최근 배포 반영 (2026-02-23)
+
+- 기준 커밋: `d14d305`, `84db5c2`, `d2b82b2`
+- 핵심 변경:
+  - CBT 재시작 동기화에서 `CBT -> PAPER/REAL` 강제 보정 제거
+  - 텔레그램 CBT 시그널 Markdown 이스케이프 안정화
+  - 종목명 resolver 보강(`holdings -> quote -> universe_cache`)
+  - 무보유 holdings 응답(`[]`) 처리 로그 정상화(WARN 오탐 축소)
+  - `websockets>=12.0` 의존성 명시 및 WS 미설치 시 안전한 REST 동작
+
+이 문서는 감사 대응/설계 배경 중심의 이력 문서이며, 운영 절차는 상단의 최신 가이드를 우선합니다.
 
 ---
 

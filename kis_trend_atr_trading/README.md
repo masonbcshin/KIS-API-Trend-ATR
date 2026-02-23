@@ -8,23 +8,45 @@
 - PAPER -> REAL 전환 체크리스트 제공
 - Universe 선정/재시작 정책을 코드 기준으로 명확화
 
-> 경고
-> - 이 문서는 2026-02-12 기준 `main_multiday.py` 실행 경로를 기준으로 작성됨
-> - 코드와 불일치하는 절차를 임의로 추가하지 마십시오
+> 기준
+> - 이 문서는 2026-02-23 배포 커밋(`d2b82b2`) 기준으로 갱신했습니다.
+> - 운영 표준 엔트리포인트는 `apps.kr_trade`이며, 멀티종목 운영은 `main_multiday.py`(deprecated wrapper) 경로도 계속 사용됩니다.
+> - 코드와 불일치하는 절차를 임의로 추가하지 마십시오.
 
 ---
 
 ## 통합 엔트리포인트 (신규)
 
-- 운영: `python -m kis_trend_atr_trading.apps.kr_trade --mode trade --feed rest`
-- 운영(WS): `python -m kis_trend_atr_trading.apps.kr_trade --mode trade --feed ws`
-- CBT: `python -m kis_trend_atr_trading.apps.kr_cbt --mode cbt`
+- 운영: `python3 -m kis_trend_atr_trading.apps.kr_trade --mode trade --feed rest`
+- 운영(WS): `python3 -m kis_trend_atr_trading.apps.kr_trade --mode trade --feed ws`
+- CBT: `python3 -m kis_trend_atr_trading.apps.kr_cbt --mode cbt`
+- 멀티종목 호환 실행: `python3 -m kis_trend_atr_trading.main_multiday --mode trade --interval 60`
+  - 시작 시 `[DEPRECATED] main_multiday.py -> use ...` 배너가 출력되는 것은 정상입니다.
 
 호환성 유지:
 
 - 기존 `main.py`, `main_v2.py`, `main_v3.py`, `main_multiday.py`, `main_cbt.py`는
   deprecated thin wrapper로 유지되며 기존 커맨드는 계속 실행 가능합니다.
 - 내부 구현은 `deprecated/legacy_main*.py`로 보존됩니다.
+
+---
+
+## 최근 배포 반영 (2026-02-23)
+
+- `d14d305`, `84db5c2`: CBT 텔레그램 시그널 Markdown 이스케이프 안정화
+- `d2b82b2`: CBT 재동기화 모드 강제보정 제거(CBT 유지), 종목명 resolver 보강, WS 의존성/폴백 정리
+- `kis_api.get_holdings()`:
+  - 무보유(`[]`)는 INFO 로그로 처리
+  - 실제 경로 파싱 실패일 때만 WARNING 출력
+- 종목명 해석:
+  - `holdings -> quote(stock_name) -> universe_cache 선조회` 순으로 보강
+  - 실패 시 최종적으로 `UNKNOWN(코드)` 표기
+
+## 배포/재시작 기준
+
+- 실운영 서버 재시작 기준: `sudo systemctl restart auto-trade`
+- 상태 확인: `sudo systemctl status auto-trade`
+- 참고: `.github/workflows/deploy.yml`, `.github/workflows/deploy-oci.yml`의 `nohup python main.py`는 legacy 경로이며, systemd 기반 운영 재기동을 대체하지 않습니다.
 
 ---
 
@@ -73,13 +95,14 @@
 - `RUNTIME_STATUS_LOG_INTERVAL_SEC=300`
 - `RUNTIME_STATUS_TELEGRAM=false`
 - `TOKEN_REFRESH_MARGIN_MINUTES=30`
+- `websockets>=12.0` 미설치 상태에서 `--feed ws` 요청 시, legacy 멀티데이 경로는 경고 후 REST 고정으로 동작
 
 ### 운영 스모크/테스트
 
 - Paper 스모크
-  - `python -m kis_trend_atr_trading.main_multiday --mode trade --max-runs 1 --interval 60`
+  - `python3 -m kis_trend_atr_trading.main_multiday --mode trade --max-runs 1 --interval 60`
 - 단위 테스트
-  - `python -m pytest kis_trend_atr_trading/tests/test_state_machine.py kis_trend_atr_trading/tests/test_feed_failover.py kis_trend_atr_trading/tests/test_token_refresh.py -q`
+  - `python3 -m pytest kis_trend_atr_trading/tests/test_state_machine.py kis_trend_atr_trading/tests/test_feed_failover.py kis_trend_atr_trading/tests/test_token_refresh.py -q`
 
 ---
 
@@ -113,7 +136,8 @@
 
 ### 모듈 구조
 
-- `main_multiday.py`: 엔트리포인트, CLI 파싱, 모드 검증, Universe 선정, 실행 시작
+- `apps/kr_trade.py`: 표준 엔트리포인트, feed(rest/ws) 실행
+- `main_multiday.py`: 하위호환 wrapper (`deprecated/legacy_main_multiday.py` 실행)
 - `engine/multiday_executor.py`: 전략 실행 루프, 주문 실행, 재시작 복원, 네트워크 단절 대응
 - `engine/order_synchronizer.py`: 주문 동기화, idempotency, `order_state` 복구, 단일 인스턴스 락
 - `engine/risk_manager.py`: 손실 한도/킬스위치
@@ -176,7 +200,9 @@ selection_method:
 ### 장 종료 후
 
 - 강제청산 없음
-- 포지션이 있으면 `data/positions.json`에 저장 유지
+- 포지션 파일 저장:
+  - 표준 단일 실행 경로: `data/positions.json`
+  - 멀티종목 호환(`main_multiday`) 경로: `data/positions_{symbol}.json`
 - 프로세스 종료 시 일일 요약 로그/알림
 
 ### 재시작 시 동작
@@ -393,7 +419,9 @@ selection_method:
 
 ### 포지션 정합성
 
-- 저장소: `data/positions.json`
+- 저장소:
+  - 표준 단일 실행 경로: `data/positions.json`
+  - 멀티종목 호환(`main_multiday`) 경로: `data/positions_{symbol}.json`
 - REAL 모드: 실계좌 보유와 저장 포지션 비교
   - 불일치 시 경고/정리/중단 액션 분기
   - DB `positions`를 실계좌 기준으로 upsert/close 동기화
@@ -431,6 +459,8 @@ selection_method:
   - 메모리 캐시 (`utils/symbol_resolver.py`)
   - SSOT DB 캐시 (`symbol_cache` 테이블)
   - KIS API 재조회 (`KISApi.get_account_balance()`의 `holdings[].stock_name`, 원본 키: `output1[].prdt_name`)
+  - KIS 현재가 조회 (`get_current_price()`의 `stock_name/name/hts_kor_isnm/prdt_name`)
+  - `data/universe_cache.json` 종목 선조회 후 재시도
   - 실패 폴백: 기존 캐시값 유지, 없으면 `UNKNOWN(코드)`
 - TTL 정책:
   - `updated_at` 기준 30일 이내는 캐시값 즉시 사용
@@ -454,19 +484,19 @@ selection_method:
 
 - 목표: 기본 주문 사이클 확인
 - 자동 테스트: 부분 가능
-  - `python -m pytest kis_trend_atr_trading/tests/test_integration.py -q`
+  - `python3 -m pytest kis_trend_atr_trading/tests/test_integration.py -q`
 
 ### Day2 손절 트리거
 
 - 목표: 손절 시그널과 청산 흐름 확인
 - 자동 테스트: 부분 가능
-  - `python -m pytest kis_trend_atr_trading/tests/test_integration.py::TestCompleteTradingCycle::test_stop_loss_cycle -q`
+  - `python3 -m pytest kis_trend_atr_trading/tests/test_integration.py::TestCompleteTradingCycle::test_stop_loss_cycle -q`
 
 ### Day3 장중 재시작
 
 - 목표: 재시작 후 포지션/미종결 주문 정합성 확인
 - 자동 테스트: 부분 가능
-  - `python -m pytest kis_trend_atr_trading/tests/test_executor.py::TestPositionRecognitionAfterRestart::test_position_lost_after_restart_simulation -q`
+  - `python3 -m pytest kis_trend_atr_trading/tests/test_executor.py::TestPositionRecognitionAfterRestart::test_position_lost_after_restart_simulation -q`
 - 운영 점검(수동):
   - 장중 프로세스 재시작 후 Universe가 캐시 재사용되는지
   - `order_state` 복구 로그가 출력되는지
@@ -483,7 +513,7 @@ selection_method:
 
 - 목표: timeout/retry/backoff 및 거래중단 플래그 확인
 - 자동 테스트: 가능
-  - `python -m pytest kis_trend_atr_trading/tests/test_api.py::TestRetryLogic::test_retry_on_timeout -q`
+  - `python3 -m pytest kis_trend_atr_trading/tests/test_api.py::TestRetryLogic::test_retry_on_timeout -q`
 
 ---
 
@@ -534,37 +564,44 @@ selection_method:
 ### 거래 실행 (PAPER)
 
 ```bash
-cd /home/user/KIS-API-Trend-ATR/kis_trend_atr_trading
-TRADING_MODE=PAPER python main_multiday.py --mode trade --interval 60
+cd /home/user/KIS-API-Trend-ATR
+TRADING_MODE=PAPER python3 -m kis_trend_atr_trading.main_multiday --mode trade --interval 60
 ```
 
 ### 거래 실행 (REAL)
 
 ```bash
-cd /home/user/KIS-API-Trend-ATR/kis_trend_atr_trading
-TRADING_MODE=REAL python main_multiday.py --mode trade \
+cd /home/user/KIS-API-Trend-ATR
+TRADING_MODE=REAL python3 -m kis_trend_atr_trading.main_multiday --mode trade \
   --confirm-real-trading \
   --real-first-order-percent 10 \
   --real-limit-symbols-first-day
 ```
 
+### 거래 실행 (표준 단일 엔트리포인트)
+
+```bash
+cd /home/user/KIS-API-Trend-ATR
+TRADING_MODE=PAPER python3 -m kis_trend_atr_trading.apps.kr_trade --mode trade --feed rest --interval 60
+```
+
 ### 핵심 테스트
 
 ```bash
-python -m unittest kis_trend_atr_trading.tests.test_universe_selector_unittest -v
-python -m unittest kis_trend_atr_trading.tests.test_gap_protection_unittest -v
-python -m unittest kis_trend_atr_trading.tests.test_gap_notification_alignment_unittest -v
-python -m unittest kis_trend_atr_trading.tests.test_main_multiday_multi_symbols_unittest -v
-python -m unittest kis_trend_atr_trading.tests.test_pending_exit_unittest -v
-python -m pytest kis_trend_atr_trading/tests/test_api.py -q
-python -m pytest kis_trend_atr_trading/tests/test_executor.py::TestPositionRecognitionAfterRestart::test_position_lost_after_restart_simulation -q
+python3 -m unittest kis_trend_atr_trading.tests.test_universe_selector_unittest -v
+python3 -m unittest kis_trend_atr_trading.tests.test_gap_protection_unittest -v
+python3 -m unittest kis_trend_atr_trading.tests.test_gap_notification_alignment_unittest -v
+python3 -m unittest kis_trend_atr_trading.tests.test_main_multiday_multi_symbols_unittest -v
+python3 -m unittest kis_trend_atr_trading.tests.test_pending_exit_unittest -v
+python3 -m pytest kis_trend_atr_trading/tests/test_api.py -q
+python3 -m pytest kis_trend_atr_trading/tests/test_executor.py::TestPositionRecognitionAfterRestart::test_position_lost_after_restart_simulation -q
 ```
 
 ---
 
 ## 운영자가 먼저 확인할 파일
 
-- 실행/안전 가드: `main_multiday.py`, `env.py`
+- 실행/안전 가드: `apps/kr_trade.py`, `main_multiday.py`, `deprecated/legacy_main_multiday.py`, `env.py`
 - 주문 동기화/복구: `engine/order_synchronizer.py`
 - 멀티데이 루프: `engine/multiday_executor.py`
 - Universe 정책: `universe/universe_selector.py`, `config/universe.yaml`

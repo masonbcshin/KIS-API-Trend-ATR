@@ -1,11 +1,18 @@
 # KIS 자동매매 프로그램 - 완전 초보자용 최신 가이드
 
-이 문서는 `2026-02` 기준 최신 실행 흐름에 맞춘 초보자 가이드입니다.
+이 문서는 `2026-02-23` 배포 기준 최신 실행 흐름에 맞춘 초보자 가이드입니다.
 
 ## 0. 먼저 꼭 읽기
 - 이 프로그램은 자동으로 매수/매도를 실행할 수 있습니다.
 - `REAL` 모드에서는 실제 돈이 거래됩니다.
 - 초보자는 반드시 `DRY_RUN -> PAPER -> REAL` 순서로 진행하세요.
+
+## 0-1. 최근 배포에서 바뀐 핵심
+- CBT 재시작 시 `CBT -> PAPER`로 강제 보정되던 문제가 수정되었습니다.
+- 종목명 조회가 강화되어 `UNKNOWN(코드)` 빈도가 줄었습니다.
+- 텔레그램 CBT 시그널 이스케이프가 정리되었습니다.
+- WS 의존성(`websockets>=12.0`)이 `requirements.txt`에 명시되었습니다.
+- 멀티종목 실행 시 포지션 저장 파일이 `positions_{symbol}.json` 단위로 관리됩니다.
 
 ---
 
@@ -16,7 +23,7 @@
 - 재시작해도 포지션과 주문 상태를 복구합니다.
 
 핵심 구성:
-- 실행 앱: `python -m kis_trend_atr_trading.apps.kr_trade`
+- 실행 앱: `python3 -m kis_trend_atr_trading.apps.kr_trade`
 - 전략: `strategy/multiday_trend_atr.py`
 - 실행 엔진: `engine/multiday_executor.py`
 - 주문/동기화: `engine/order_synchronizer.py`
@@ -31,8 +38,12 @@
 
 지금은 아래를 표준으로 사용하세요.
 ```bash
-python -m kis_trend_atr_trading.apps.kr_trade --mode trade --feed rest
+python3 -m kis_trend_atr_trading.apps.kr_trade --mode trade --feed rest
 ```
+
+참고:
+- 멀티종목 운영에서는 `python3 -m kis_trend_atr_trading.main_multiday --mode trade` 경로를 계속 사용할 수 있습니다.
+- 이 경우 시작 시 `[DEPRECATED] main_multiday.py -> use ...` 문구가 뜨는 것은 정상입니다.
 
 ---
 
@@ -47,6 +58,11 @@ python -m kis_trend_atr_trading.apps.kr_trade --mode trade --feed rest
 ```bash
 cd /home/deploy/KIS-API-Trend-ATR/kis_trend_atr_trading
 python3 -m pip install -r requirements.txt
+```
+
+WS 모드까지 사용할 계획이면 `websockets` 설치 여부를 같이 확인하세요:
+```bash
+python3 -m pip show websockets
 ```
 
 ---
@@ -125,6 +141,13 @@ EXECUTION_MODE=PAPER TRADING_MODE=PAPER \
 python3 -m kis_trend_atr_trading.apps.kr_trade --mode trade --feed ws --interval 60
 ```
 
+### 5-5. 멀티종목 호환 실행(레거시 wrapper)
+```bash
+cd /home/deploy/KIS-API-Trend-ATR
+EXECUTION_MODE=PAPER TRADING_MODE=PAPER \
+python3 -m kis_trend_atr_trading.main_multiday --mode trade --interval 60
+```
+
 옵션 요약:
 - `--mode {trade,paper,cbt}`
 - `--feed {rest,ws}`
@@ -149,6 +172,11 @@ python3 -m kis_trend_atr_trading.apps.kr_trade --mode trade --feed ws --interval
 - 종목은 1~2개부터
 - `max_positions`를 작게 유지
 
+포지션 파일 확인 팁:
+- 단일 경로(`apps.kr_trade`) 기본: `kis_trend_atr_trading/data/positions.json`
+- 멀티종목 경로(`main_multiday`) 기본: `kis_trend_atr_trading/data/positions_{symbol}.json`
+- 멀티종목 실행 중 `positions.json`이 비어 있어도 `positions_*.json`이 갱신되면 정상입니다.
+
 ---
 
 ## 7. 로그 읽는 법 (실전에서 자주 보는 것)
@@ -162,6 +190,8 @@ python3 -m kis_trend_atr_trading.apps.kr_trade --mode trade --feed ws --interval
 - `kis_api | [KIS][BAL] 캐시 재사용: age=1.93s`
   - 의미: 잔고 API를 다시 호출하지 않고 최근 결과를 재사용했다는 뜻
   - 오류가 아니라 성능 최적화 로그
+- `kis_api | [KIS][HOLDINGS] parsed path=... count=0`
+  - 의미: 무보유 상태(정상)입니다.
 
 ---
 
@@ -177,6 +207,10 @@ python3 -m kis_trend_atr_trading.apps.kr_trade --mode trade --feed ws --interval
 - 시작 시 `positions` 동기화 중 개별 DB upsert 실패
 - 이 경우는 현재 설계상 소프트 실패로 로그 경고만 남깁니다.
 - 대표 로그: `[RESYNC][DB] 포지션 저장 실패/보류: ...`
+
+`UNKNOWN(종목코드)`가 보이면:
+- 종목명 해석 캐시/조회가 일시적으로 실패한 상태일 수 있습니다.
+- 다음 사이클에서 API/캐시가 채워지면 자동으로 정상 종목명으로 바뀔 수 있습니다.
 
 자세한 배경: `kis_trend_atr_trading/LEGACY_DB_COMPATIBILITY.md`
 
@@ -205,12 +239,22 @@ python3 tools/daily_report.py --yesterday
 ## 10. 서버 재부팅 시
 - `crontab` 등록 내용은 유지됩니다.
 - `cron` 서비스만 정상 기동하면 스케줄은 계속 동작합니다.
+- 실운영 자동매매는 `auto-trade` systemd 서비스 기준으로 상태를 확인/재시작하세요.
 
 확인:
 ```bash
 systemctl status cron
 mkdir -p /home/deploy/KIS-API-Trend-ATR/logs
 crontab -l
+sudo systemctl status auto-trade
+```
+
+재배포 후 재시작:
+```bash
+cd /home/deploy/KIS-API-Trend-ATR
+git pull
+sudo systemctl restart auto-trade
+sudo systemctl status auto-trade --no-pager
 ```
 
 ---
@@ -264,6 +308,21 @@ python3 -m pip install -r kis_trend_atr_trading/requirements.txt
 - 절대경로 사용 확인
 - `logs/report.log` 생성/권한 확인
 - 필요 시 `CRON_TZ=Asia/Seoul` 사용
+
+### Q5) `Command 'python' not found`
+- 원인: 이 서버는 `python` 대신 `python3`만 제공
+- 해결:
+  - 문서/명령은 모두 `python3 ...`로 실행
+  - 필요하면(정책 허용 시) `python-is-python3` 패키지 설치
+
+### Q6) WS 모드에서 `websockets package is required for WS feed`
+- 원인: WS 의존 패키지 미설치
+- 해결:
+```bash
+cd /home/deploy/KIS-API-Trend-ATR/kis_trend_atr_trading
+python3 -m pip install -r requirements.txt
+python3 -m pip show websockets
+```
 
 ---
 

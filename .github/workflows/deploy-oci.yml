@@ -22,5 +22,9 @@ jobs:
             echo ">>> Git pull"
             git pull
 
-            echo ">>> Start new process"
-            nohup python main.py > app.log 2>&1 &
+            echo ">>> Restart service"
+            sudo systemctl restart auto-trade
+
+            echo ">>> Check status"
+            sudo systemctl is-active --quiet auto-trade
+            sudo systemctl --no-pager --full status auto-trade || true

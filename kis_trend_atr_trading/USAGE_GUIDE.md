@@ -1,12 +1,19 @@
 # KIS Trend-ATR Trading System 사용 가이드 (최신)
 
-이 문서는 `2026-02` 기준 최신 실행 흐름을 설명합니다.
+이 문서는 `2026-02-23` 배포 기준 최신 실행 흐름을 설명합니다.
 
 ## 1. 빠른 개요
-- 표준 실행 엔트리포인트: `python -m kis_trend_atr_trading.apps.kr_trade`
+- 표준 실행 엔트리포인트: `python3 -m kis_trend_atr_trading.apps.kr_trade`
 - 전략 엔진: 멀티데이 Trend + ATR
 - 권장 진행 순서: `DRY_RUN -> PAPER -> REAL`
 - Deprecated 래퍼(`main_multiday.py`, `main_v2.py` 등)는 하위호환용으로만 유지
+
+## 1-1. 최근 배포 반영 요약 (`d14d305`, `84db5c2`, `d2b82b2`)
+- CBT 재시작 동기화 시 `CBT -> PAPER` 강제 보정 제거
+- 텔레그램 CBT 시그널 Markdown 이스케이프 안정화
+- 종목명 해석 보강: `holdings -> quote -> universe_cache` 순서로 조회
+- `websockets>=12.0` 의존성 명시, WS 미사용/미설치 시 REST 경로로 안전 동작
+- 멀티종목 호환 실행(`main_multiday`)에서 포지션 파일은 `positions_{symbol}.json` 단위로 저장
 
 ---
 
@@ -36,6 +43,9 @@
 cd /home/deploy/KIS-API-Trend-ATR/kis_trend_atr_trading
 python3 -m pip install -r requirements.txt
 ```
+
+참고:
+- WS 피드를 사용할 계획이면 `requirements.txt`의 `websockets>=12.0`가 반드시 설치되어야 합니다.
 
 ### 3-2. .env 생성
 ```bash
@@ -104,6 +114,21 @@ cd /home/deploy/KIS-API-Trend-ATR
 python3 -m kis_trend_atr_trading.apps.kr_cbt --mode cbt --stock 005930 --interval 60
 ```
 
+### 4-5. 멀티종목 호환 실행(레거시 wrapper)
+```bash
+cd /home/deploy/KIS-API-Trend-ATR
+TRADING_MODE=PAPER python3 -m kis_trend_atr_trading.main_multiday --mode trade --interval 60
+```
+
+참고:
+- 시작 시 `[DEPRECATED] main_multiday.py -> use ...` 문구가 출력되는 것은 정상입니다.
+- 멀티종목 운영은 내부적으로 `deprecated/legacy_main_multiday.py` 경로가 계속 사용됩니다.
+
+### 4-6. 포지션 파일 확인 기준
+- 표준 단일 엔트리포인트(`apps.kr_trade`) 기본 경로: `kis_trend_atr_trading/data/positions.json`
+- 멀티종목 호환 경로(`main_multiday`) 기본 경로: `kis_trend_atr_trading/data/positions_{symbol}.json`
+- 따라서 멀티종목 실행 중에는 `positions.json`이 비어 있어도 `positions_*.json`이 갱신되면 정상입니다.
+
 도움말:
 ```bash
 python3 -m kis_trend_atr_trading.apps.kr_trade --help
@@ -138,11 +163,16 @@ python3 -m kis_trend_atr_trading.apps.kr_cbt --help
 ### 6-2. 자주 보는 정상 메시지
 - `kis_api | [KIS][BAL] 캐시 재사용: age=1.93s`
 - 의미: 최근 잔고 조회 결과를 재사용 (API 호출 절약), 오류 아님
+- `kis_api | [KIS][HOLDINGS] parsed path=... count=0`
+- 의미: 응답 경로는 정상으로 찾았고 현재 무보유 상태라는 뜻 (오류 아님)
 
 ### 6-3. 텔레그램 알림 규칙
 - 발송: 시스템/전략 예외, 주문 실패, 주요 복원/청산 이벤트
 - 미발송(현재 설계): 시작 시 계좌→DB 재동기화 중 개별 upsert 실패
   - 이 경우 경고 로그(`포지션 저장 실패/보류`)만 남고 Telegram ERROR는 보내지 않음
+- `UNKNOWN(종목코드)`는 종목명 해석 실패 시의 최종 폴백 표기입니다.
+  - 일시적 API 실패, 비보유/비캐시 상태에서 발생할 수 있습니다.
+  - 다음 사이클에서 캐시가 채워지면 정상 종목명으로 복구될 수 있습니다.
 
 상세 배경: `kis_trend_atr_trading/LEGACY_DB_COMPATIBILITY.md`
 
@@ -185,13 +215,27 @@ python3 tools/daily_report.py --yesterday
 ## 9. 재부팅 시 동작
 - `crontab` 등록 항목은 유지됩니다.
 - `cron` 서비스가 올라오면 스케줄은 계속 실행됩니다.
+- 실운영 트레이딩 프로세스는 systemd 서비스(`auto-trade`) 기준으로 관리하는 것을 권장합니다.
 
 점검 명령:
 ```bash
 systemctl status cron
 crontab -l
 mkdir -p /home/deploy/KIS-API-Trend-ATR/logs
+sudo systemctl status auto-trade
 ```
+
+재배포 후 재시작(운영 기준):
+```bash
+cd /home/deploy/KIS-API-Trend-ATR
+git pull
+sudo systemctl restart auto-trade
+sudo systemctl status auto-trade --no-pager
+```
+
+참고:
+- `.github/workflows/deploy.yml`, `.github/workflows/deploy-oci.yml`의 `nohup python main.py`는 legacy 경로입니다.
+- systemd로 운영 중이면 위 `systemctl restart auto-trade`가 실제 재기동 기준입니다.
 
 ---
 
@@ -222,6 +266,24 @@ python3 -m pip install -r kis_trend_atr_trading/requirements.txt
 - 절대경로 사용 여부 확인
 - `logs/report.log` 경로/권한 확인
 - 필요 시 `CRON_TZ=Asia/Seoul` 적용
+
+### 10-5. `Command 'python' not found`
+- 원인: 서버에 `python` 심볼릭 링크가 없고 `python3`만 설치된 환경
+- 조치:
+  - 실행 명령을 모두 `python3 ...` 형태로 사용
+  - 필요 시(시스템 정책 허용 시) `python-is-python3` 패키지 설치
+
+### 10-6. WS 모드에서 `websockets package is required for WS feed`
+- 원인: WS 의존 패키지 미설치
+- 조치:
+```bash
+cd /home/deploy/KIS-API-Trend-ATR/kis_trend_atr_trading
+python3 -m pip install -r requirements.txt
+```
+- 확인:
+```bash
+python3 -m pip show websockets
+```
 
 ---
 
