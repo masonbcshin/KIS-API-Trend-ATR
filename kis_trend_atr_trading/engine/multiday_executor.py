@@ -1215,6 +1215,115 @@ class MultidayExecutor:
         ]
         return any(k in lower for k in keywords)
 
+    @staticmethod
+    def _is_no_holding_error(message: str) -> bool:
+        """매도 주문 실패가 계좌 무보유(잔고 없음) 케이스인지 판별합니다."""
+        lower = (message or "").lower()
+        keywords = [
+            "잔고내역이 없습니다",
+            "잔고 내역이 없습니다",
+            "보유내역이 없습니다",
+            "보유 내역이 없습니다",
+            "no holding",
+            "no holdings",
+            "insufficient holding",
+        ]
+        return any(k in lower for k in keywords)
+
+    @staticmethod
+    def _extract_holding_qty(holding: Dict[str, Any]) -> int:
+        raw_values = (
+            holding.get("qty"),
+            holding.get("quantity"),
+            holding.get("holding_qty"),
+            holding.get("sellable_qty"),
+            holding.get("hldg_qty"),
+            holding.get("ord_psbl_qty"),
+        )
+        for raw in raw_values:
+            if raw is None:
+                continue
+            try:
+                parsed = int(float(str(raw).replace(",", "").strip()))
+            except (TypeError, ValueError):
+                continue
+            return max(parsed, 0)
+        return 0
+
+    def _account_has_holding(self, stock_code: str) -> Optional[bool]:
+        """API 계좌 기준으로 특정 종목 보유 여부를 확인합니다."""
+        try:
+            if hasattr(self.api, "get_holdings"):
+                payload = self.api.get_holdings()
+            else:
+                balance = self.api.get_account_balance()
+                if not isinstance(balance, dict) or not balance.get("success"):
+                    return None
+                payload = balance.get("holdings", [])
+        except Exception as e:
+            logger.warning(
+                "[AUTO_RECOVER] 계좌 보유 확인 실패(보수적 유지): symbol=%s, err=%s",
+                stock_code,
+                e,
+            )
+            return None
+
+        holdings = payload if isinstance(payload, list) else []
+        for raw_holding in holdings:
+            if not isinstance(raw_holding, dict):
+                continue
+            symbol = str(
+                raw_holding.get("stock_code")
+                or raw_holding.get("pdno")
+                or raw_holding.get("symbol")
+                or ""
+            ).strip()
+            if symbol != stock_code:
+                continue
+            if self._extract_holding_qty(raw_holding) > 0:
+                return True
+
+        return False
+
+    def _auto_reconcile_stale_position_after_sell_failure(self, error_message: str) -> bool:
+        """
+        매도 실패가 '계좌 무보유' 원인으로 확인되면 로컬 포지션을 자동 정리합니다.
+        """
+        if not self._is_no_holding_error(error_message):
+            return False
+
+        has_holding = self._account_has_holding(self.stock_code)
+        if has_holding is None or has_holding:
+            return False
+
+        try:
+            self.strategy.reset_to_wait()
+        except Exception as e:
+            logger.warning(
+                "[AUTO_RECOVER] 전략 포지션 정리 실패: symbol=%s, err=%s",
+                self.stock_code,
+                e,
+            )
+            return False
+
+        self.position_store.clear_position()
+        self._clear_pending_exit("api_holding_missing_after_sell_failure")
+        self._sync_db_position_from_strategy()
+        self._persist_account_snapshot(force=True)
+
+        logger.warning(
+            "[AUTO_RECOVER] 계좌 무보유 확인으로 로컬 포지션 자동 정리: symbol=%s, error=%s",
+            self.stock_code,
+            error_message,
+        )
+        try:
+            self.telegram.notify_warning(
+                f"포지션 자동정리\n종목: {self.stock_code}\n사유: API 계좌 무보유 확인"
+            )
+        except Exception:
+            pass
+        return True
+
     def _activate_pending_exit(self, signal: TradingSignal, error_message: str) -> None:
         now = datetime.now(KST)
         retry_key = self._build_exit_retry_key(signal)
@@ -1828,6 +1937,16 @@ class MultidayExecutor:
             
             else:
                 # 완전 실패 - 포지션 상태 변경 없음 (매우 위험!)
+                if self._auto_reconcile_stale_position_after_sell_failure(sync_result.message):
+                    return {
+                        "success": True,
+                        "reconciled": True,
+                        "order_no": sync_result.order_no,
+                        "message": (
+                            "API 계좌 무보유 확인으로 로컬 포지션을 자동 정리했습니다."
+                        ),
+                    }
+
                 market_unavailable = self._is_market_unavailable_error(sync_result.message)
                 if market_unavailable:
                     logger.warning(f"매도 실패(주문불가/장종료): {sync_result.message}")
