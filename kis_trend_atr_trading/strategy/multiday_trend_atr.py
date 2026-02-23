@@ -384,6 +384,26 @@ class MultidayTrendATRStrategy:
             float: 트레일링 스탑 가격
         """
         return highest_price - (atr_at_entry * self.trailing_stop_multiplier)
+
+    @staticmethod
+    def _is_overnight_position(position: MultidayPosition) -> bool:
+        """
+        갭 보호 적용 대상(익일 보유 포지션) 여부를 반환합니다.
+
+        같은 날 진입한 신규 포지션은 장중 갭 보호 대상에서 제외합니다.
+        """
+        entry_date_raw = str(getattr(position, "entry_date", "") or "").strip()
+        if not entry_date_raw:
+            return False
+        try:
+            entry_date = datetime.strptime(entry_date_raw, "%Y-%m-%d").date()
+        except ValueError:
+            logger.warning(
+                f"[GAP_CHECK_SKIP] symbol={position.symbol}, "
+                f"reason=invalid_entry_date, entry_date={entry_date_raw}"
+            )
+            return False
+        return entry_date < datetime.now(KST).date()
     
     # ════════════════════════════════════════════════════════════════
     # Exit 조건 체크 (핵심)
@@ -423,40 +443,46 @@ class MultidayTrendATRStrategy:
         
         # 1. 갭 보호 체크 (옵션)
         if self.enable_gap_protection and open_price:
-            reference_kind, reference_price = self._resolve_gap_reference_price(pos, df)
-            if reference_price is None or reference_price <= 0:
+            if not self._is_overnight_position(pos):
                 logger.info(
-                    f"[{GAP_REASON_DISABLED}] invalid gap reference: "
-                    f"kind={reference_kind}, ref={reference_price}"
+                    f"[GAP_CHECK_SKIP] symbol={pos.symbol}, reason=same_day_entry, "
+                    f"entry_date={pos.entry_date}"
                 )
             else:
-                triggered, reason_code, raw_gap_pct = should_trigger_gap_protection(
-                    position=pos,
-                    open_price=open_price,
-                    reference_price=reference_price,
-                    threshold_pct=self.gap_threshold_pct,
-                    epsilon_pct=self.gap_epsilon_pct,
-                )
-                formatted_gap_pct = round(raw_gap_pct, 3)
-                logger.info(
-                    f"[GAP_CHECK] symbol={pos.symbol}, open={float(open_price):.6f}, "
-                    f"base_label={reference_kind}, base_price={float(reference_price):.6f}, "
-                    f"gap_pct={raw_gap_pct:.6f}, threshold={float(self.gap_threshold_pct):.6f}, "
-                    f"triggered={triggered}, reason={reason_code}"
-                )
-                if reason_code == GAP_REASON_DISABLED:
+                reference_kind, reference_price = self._resolve_gap_reference_price(pos, df)
+                if reference_price is None or reference_price <= 0:
                     logger.info(
-                        f"[{GAP_REASON_DISABLED}] 기준={reference_kind}, ref={reference_price}, "
-                        f"threshold={self.gap_threshold_pct}, epsilon={self.gap_epsilon_pct}"
+                        f"[{GAP_REASON_DISABLED}] invalid gap reference: "
+                        f"kind={reference_kind}, ref={reference_price}"
                     )
-                if triggered:
-                    return True, ExitReason.GAP_PROTECTION, (
-                        f"[{GAP_REASON_TRIGGERED}] 시가 {open_price:,.0f}원, "
-                        f"기준({reference_kind}) {float(reference_price):,.0f}원, "
-                        f"raw_gap_pct={raw_gap_pct:.6f}%, display_gap_pct={formatted_gap_pct:.3f}%, "
-                        f"threshold={float(self.gap_threshold_pct):.3f}%, "
-                        f"epsilon={float(self.gap_epsilon_pct):.6f}%"
+                else:
+                    triggered, reason_code, raw_gap_pct = should_trigger_gap_protection(
+                        position=pos,
+                        open_price=open_price,
+                        reference_price=reference_price,
+                        threshold_pct=self.gap_threshold_pct,
+                        epsilon_pct=self.gap_epsilon_pct,
                     )
+                    formatted_gap_pct = round(raw_gap_pct, 3)
+                    logger.info(
+                        f"[GAP_CHECK] symbol={pos.symbol}, open={float(open_price):.6f}, "
+                        f"base_label={reference_kind}, base_price={float(reference_price):.6f}, "
+                        f"gap_pct={raw_gap_pct:.6f}, threshold={float(self.gap_threshold_pct):.6f}, "
+                        f"triggered={triggered}, reason={reason_code}"
+                    )
+                    if reason_code == GAP_REASON_DISABLED:
+                        logger.info(
+                            f"[{GAP_REASON_DISABLED}] 기준={reference_kind}, ref={reference_price}, "
+                            f"threshold={self.gap_threshold_pct}, epsilon={self.gap_epsilon_pct}"
+                        )
+                    if triggered:
+                        return True, ExitReason.GAP_PROTECTION, (
+                            f"[{GAP_REASON_TRIGGERED}] 시가 {open_price:,.0f}원, "
+                            f"기준({reference_kind}) {float(reference_price):,.0f}원, "
+                            f"raw_gap_pct={raw_gap_pct:.6f}%, display_gap_pct={formatted_gap_pct:.3f}%, "
+                            f"threshold={float(self.gap_threshold_pct):.3f}%, "
+                            f"epsilon={float(self.gap_epsilon_pct):.6f}%"
+                        )
         
         # 2. ATR 손절 체크
         if current_price <= pos.stop_loss:

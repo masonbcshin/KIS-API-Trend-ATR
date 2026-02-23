@@ -1361,6 +1361,8 @@ class MultidayExecutor:
                 stop_loss=signal.stop_loss,
                 take_profit=signal.take_profit
             )
+            # 단발 실행/비정상 종료에도 복원 가능하도록 매수 직후 체크포인트 저장
+            self._save_position_on_exit()
             self._persist_trade_record(
                 side="BUY",
                 price=signal.price,
@@ -1618,9 +1620,8 @@ class MultidayExecutor:
                     holding_days=int(result.get("holding_days") or 0),
                 )
                 self._persist_account_snapshot(force=True)
-            
-            # 포지션 저장 파일 클리어
-            self.position_store.clear_position()
+            # 포지션/보류상태를 저장소와 동기화
+            self._save_position_on_exit()
             
             return {"success": True, "message": "[CBT] 가상 청산", "order_no": "CBT-VIRTUAL"}
         

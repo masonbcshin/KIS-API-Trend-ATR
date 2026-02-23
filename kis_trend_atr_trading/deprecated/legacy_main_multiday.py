@@ -435,18 +435,20 @@ def run_trade(
         shared_risk_manager = create_risk_manager_from_settings()
         executors_by_symbol = {}
         for symbol in run_symbols:
+            symbol_store = _symbol_position_store(symbol)
+            logger.info(f"[POSITION_FILE] symbol={symbol}, path={symbol_store.file_path}")
             executor = MultidayExecutor(
                 api=api,
                 strategy=MultidayTrendATRStrategy(),
                 stock_code=symbol,
                 order_quantity=order_quantity,
                 risk_manager=shared_risk_manager,
-                position_store=_symbol_position_store(symbol),
+                position_store=symbol_store,
                 market_data_provider=rest_provider,
             )
             restored = executor.restore_position_on_start()
             state_msg = "복원 완료 - Exit 조건 감시" if restored else "복원 포지션 없음 - Entry 조건 감시"
-            print(f"  - {symbol}: {state_msg}")
+            print(f"  - {symbol}: {state_msg} (저장파일: {symbol_store.file_path})")
             executors.append(executor)
             executors_by_symbol[symbol] = executor
         print("")

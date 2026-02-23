@@ -154,6 +154,11 @@ def run_trade_app(args: argparse.Namespace) -> int:
     finally:
         if stop_ws:
             stop_ws()
+        try:
+            # WS/단발 실행 경로에서도 포지션 체크포인트 저장 보장
+            executor._save_position_on_exit()
+        except Exception:
+            pass
     return 0
 
 

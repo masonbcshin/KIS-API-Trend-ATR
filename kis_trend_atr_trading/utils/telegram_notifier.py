@@ -546,7 +546,7 @@ class TelegramNotifier:
             lambda m: f"{m.group(1)}{self._format_symbol(m.group(2))}{m.group(3)}",
             text,
         )
-    
+
     # ════════════════════════════════════════════════════════════════
     # 핵심 전송 메서드
     # ════════════════════════════════════════════════════════════════
@@ -1213,16 +1213,19 @@ class TelegramNotifier:
         """
         tp_str = f"{int(take_profit):,}원" if take_profit else "트레일링만"
         display_symbol = self._format_symbol(stock_code)
+        safe_signal_type = self._escape_markdown(signal_type)
+        safe_trend = self._escape_markdown(trend)
+        safe_reason = self._escape_markdown(reason)
         
         message = MESSAGE_TEMPLATES["cbt_signal"].format(
-            signal_type=signal_type,
+            signal_type=safe_signal_type,
             stock_code=display_symbol,
             price=int(price),
             stop_loss=int(stop_loss),
             take_profit=tp_str,
             atr=atr,
-            trend=trend,
-            reason=reason,
+            trend=safe_trend,
+            reason=safe_reason,
             timestamp=self._get_timestamp()
         )
         return self.send_message(message)
