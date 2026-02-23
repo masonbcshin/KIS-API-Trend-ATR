@@ -367,6 +367,139 @@ class TestOrderAPIResponses:
         assert result["order_no"] == "0001234568"
 
 
+class TestExecutionStatusResponses:
+    """체결 조회/대기 응답 해석 테스트"""
+
+    @patch('api.kis_api.requests.get')
+    def test_get_order_status_filters_target_order_no_with_zero_padding(self, mock_get):
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "rt_cd": "0",
+            "output1": [
+                {
+                    "odno": "0000015962",
+                    "pdno": "005930",
+                    "sll_buy_dvsn_cd": "01",
+                    "ord_qty": "1",
+                    "tot_ccld_qty": "0",
+                    "ord_unpr": "0",
+                    "avg_prvs": "0",
+                    "ord_dt": "20260223",
+                    "ord_tmd": "110400",
+                },
+                {
+                    "odno": "15963",
+                    "pdno": "000660",
+                    "sll_buy_dvsn_cd": "01",
+                    "ord_qty": "1",
+                    "tot_ccld_qty": "1",
+                    "ord_unpr": "0",
+                    "avg_prvs": "957000",
+                    "ord_dt": "20260223",
+                    "ord_tmd": "110535",
+                },
+            ],
+        }
+        mock_get.return_value = mock_response
+
+        with patch.object(KISApi, '_wait_for_rate_limit', return_value=None):
+            api = KISApi(is_paper_trading=True)
+            api.access_token = "test_token"
+            with patch.object(api, "get_access_token", return_value="test_token"):
+                result = api.get_order_status("0000015963")
+
+        assert result["success"] is True
+        assert result["total_count"] == 1
+        assert len(result["orders"]) == 1
+        assert result["orders"][0]["order_no"] == "15963"
+        assert result["orders"][0]["exec_qty"] == 1
+
+    def test_wait_for_execution_ignores_unmatched_rows(self):
+        with patch.object(KISApi, '_wait_for_rate_limit', return_value=None):
+            api = KISApi(is_paper_trading=True)
+            api.access_token = "test_token"
+
+        def _fake_get_order_status(_query_order_no=None):
+            return {
+                "success": True,
+                "orders": [
+                    {
+                        "order_no": "0000015962",
+                        "exec_qty": 0,
+                        "exec_price": 0.0,
+                        "remain_qty": 1,
+                        "side": "SELL",
+                        "executed_at": None,
+                    },
+                    {
+                        "order_no": "15963",
+                        "exec_qty": 1,
+                        "exec_price": 957000.0,
+                        "remain_qty": 0,
+                        "side": "SELL",
+                        "executed_at": None,
+                    },
+                ],
+            }
+
+        api.get_order_status = _fake_get_order_status
+        api.cancel_order = lambda _order_no: {"success": True}
+
+        result = api.wait_for_execution(
+            order_no="0000015963",
+            expected_qty=1,
+            timeout_seconds=1,
+            check_interval=0,
+        )
+
+        assert result["success"] is True
+        assert result["status"] == "FILLED"
+        assert result["exec_qty"] == 1
+        assert result["exec_price"] == 957000.0
+
+    def test_wait_for_execution_uses_final_fallback_scan(self):
+        with patch.object(KISApi, '_wait_for_rate_limit', return_value=None):
+            api = KISApi(is_paper_trading=True)
+            api.access_token = "test_token"
+
+        calls = {"filtered": 0, "all": 0}
+
+        def _fake_get_order_status(query_order_no=None):
+            if query_order_no:
+                calls["filtered"] += 1
+                return {"success": True, "orders": []}
+            calls["all"] += 1
+            return {
+                "success": True,
+                "orders": [
+                    {
+                        "order_no": "15963",
+                        "exec_qty": 1,
+                        "exec_price": 957000.0,
+                        "remain_qty": 0,
+                        "side": "SELL",
+                        "executed_at": None,
+                    }
+                ],
+            }
+
+        api.get_order_status = _fake_get_order_status
+        api.cancel_order = lambda _order_no: {"success": True}
+
+        result = api.wait_for_execution(
+            order_no="0000015963",
+            expected_qty=1,
+            timeout_seconds=0,
+            check_interval=0,
+        )
+
+        assert result["success"] is True
+        assert result["status"] == "FILLED"
+        assert calls["filtered"] >= 1
+        assert calls["all"] >= 1
+
+
 class TestCurrentPriceAPI:
     """현재가 조회 API 테스트"""
     

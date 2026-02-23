@@ -213,6 +213,37 @@ class KISApi:
                 return default
 
     @staticmethod
+    def _normalize_order_no(value: Any) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        if not digits:
+            return raw
+
+        try:
+            return str(int(digits))
+        except (TypeError, ValueError):
+            return digits.lstrip("0") or "0"
+
+    @classmethod
+    def _order_no_matches(cls, actual: Any, expected: Any) -> bool:
+        if expected in (None, ""):
+            return True
+
+        actual_raw = str(actual or "").strip()
+        expected_raw = str(expected or "").strip()
+        if not actual_raw or not expected_raw:
+            return False
+        if actual_raw == expected_raw:
+            return True
+
+        actual_norm = cls._normalize_order_no(actual_raw)
+        expected_norm = cls._normalize_order_no(expected_raw)
+        return bool(actual_norm and expected_norm and actual_norm == expected_norm)
+
+    @staticmethod
     def _parse_numeric_decimal(
         value: Any,
         default: Optional[Decimal] = Decimal("0"),
@@ -1173,8 +1204,13 @@ class KISApi:
         if data.get("rt_cd") != "0":
             raise KISApiError(f"주문 조회 실패: {data.get('msg1', 'Unknown error')}")
         
+        requested_order_no = str(order_no or "").strip()
         orders = []
         for item in data.get("output1", []):
+            row_order_no = str(item.get("odno") or "").strip()
+            if requested_order_no and not self._order_no_matches(row_order_no, requested_order_no):
+                continue
+
             order_date = str(item.get("ord_dt") or today).strip()
             order_time = str(item.get("ord_tmd") or item.get("ord_tm") or "").strip()
             executed_at_iso = None
@@ -1194,20 +1230,22 @@ class KISApi:
                     exec_id = str(raw_exec_id).strip()
                     break
 
+            order_qty = self._parse_numeric_int(item.get("ord_qty"), 0)
+            exec_qty = self._parse_numeric_int(item.get("tot_ccld_qty"), 0)
             orders.append({
-                "order_no": item.get("odno"),
+                "order_no": row_order_no,
                 "stock_code": item.get("pdno"),
                 "order_type": "매수" if item.get("sll_buy_dvsn_cd") == "02" else "매도",
                 "side": "BUY" if item.get("sll_buy_dvsn_cd") == "02" else "SELL",
-                "order_qty": int(item.get("ord_qty", 0)),
-                "exec_qty": int(item.get("tot_ccld_qty", 0)),
-                "remain_qty": int(item.get("ord_qty", 0)) - int(item.get("tot_ccld_qty", 0)),
-                "order_price": float(item.get("ord_unpr", 0)),
-                "exec_price": float(item.get("avg_prvs", 0)),
+                "order_qty": order_qty,
+                "exec_qty": exec_qty,
+                "remain_qty": max(order_qty - exec_qty, 0),
+                "order_price": self._parse_numeric_float(item.get("ord_unpr"), 0.0),
+                "exec_price": self._parse_numeric_float(item.get("avg_prvs"), 0.0),
                 "executed_at": executed_at_iso,
                 "exec_id": exec_id,
-                "status": "체결완료" if int(item.get("tot_ccld_qty", 0)) == int(item.get("ord_qty", 0)) else (
-                    "부분체결" if int(item.get("tot_ccld_qty", 0)) > 0 else "미체결"
+                "status": "체결완료" if exec_qty == order_qty else (
+                    "부분체결" if exec_qty > 0 else "미체결"
                 ),
             })
         
@@ -1249,6 +1287,14 @@ class KISApi:
         start_time = time.time()
         last_exec_qty = 0
 
+        def _target_orders(order_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            matches = [
+                row
+                for row in (order_rows or [])
+                if self._order_no_matches(row.get("order_no"), order_no)
+            ]
+            return matches
+
         def _collect_fills(order_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             fills: List[Dict[str, Any]] = []
             for row in order_rows:
@@ -1277,8 +1323,16 @@ class KISApi:
                 if not status_result.get("success") or not status_result.get("orders"):
                     time.sleep(check_interval)
                     continue
-                
-                order = status_result["orders"][0]
+
+                matched_orders = _target_orders(status_result.get("orders", []))
+                if not matched_orders:
+                    time.sleep(check_interval)
+                    continue
+
+                order = max(
+                    matched_orders,
+                    key=lambda row: self._parse_numeric_int(row.get("exec_qty"), 0),
+                )
                 exec_qty = order.get("exec_qty", 0)
                 exec_price = order.get("exec_price", 0)
                 remain_qty = order.get("remain_qty", expected_qty)
@@ -1286,7 +1340,7 @@ class KISApi:
                 # 완전 체결
                 if exec_qty >= expected_qty:
                     logger.info(f"체결 완료: {exec_qty}주 @ {exec_price:,.0f}원")
-                    fills = _collect_fills(status_result.get("orders", []))
+                    fills = _collect_fills(matched_orders)
                     if not fills and exec_qty > 0 and exec_price > 0:
                         fills = [
                             {
@@ -1324,18 +1378,47 @@ class KISApi:
         # 최종 상태 확인
         try:
             final_status = self.get_order_status(order_no)
-            if final_status.get("orders"):
-                final_order = final_status["orders"][0]
+            final_orders = _target_orders(final_status.get("orders", []))
+            if not final_orders:
+                fallback_status = self.get_order_status(None)
+                final_orders = _target_orders(fallback_status.get("orders", []))
+
+            if final_orders:
+                final_order = max(
+                    final_orders,
+                    key=lambda row: self._parse_numeric_int(row.get("exec_qty"), 0),
+                )
                 final_exec_qty = final_order.get("exec_qty", 0)
                 final_exec_price = final_order.get("exec_price", 0)
                 final_remain = final_order.get("remain_qty", 0)
                 
-                if final_exec_qty > 0:
+                if final_exec_qty >= expected_qty:
+                    fills = _collect_fills(final_orders)
+                    if not fills and final_exec_qty > 0 and final_exec_price > 0:
+                        fills = [
+                            {
+                                "order_no": order_no,
+                                "exec_id": None,
+                                "executed_at": datetime.now(KST).isoformat(),
+                                "price": final_exec_price,
+                                "qty": final_exec_qty,
+                                "side": final_order.get("side", "BUY"),
+                            }
+                        ]
+                    return {
+                        "success": True,
+                        "exec_qty": final_exec_qty,
+                        "exec_price": final_exec_price,
+                        "status": "FILLED",
+                        "message": f"최종 확인 완전 체결: {final_exec_qty}주 @ {final_exec_price:,.0f}원",
+                        "fills": fills,
+                    }
+                elif final_exec_qty > 0:
                     # 부분 체결된 경우 - 미체결분 취소 시도
                     if final_remain > 0:
                         cancel_result = self.cancel_order(order_no)
                         logger.info(f"미체결분 취소 시도: {cancel_result}")
-                    fills = _collect_fills(final_status.get("orders", []))
+                    fills = _collect_fills(final_orders)
                     if not fills and final_exec_qty > 0 and final_exec_price > 0:
                         fills = [
                             {
