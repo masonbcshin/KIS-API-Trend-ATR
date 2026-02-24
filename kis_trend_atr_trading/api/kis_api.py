@@ -338,6 +338,18 @@ class KISApi:
     def _should_log_order_status_raw(cls) -> bool:
         return cls._is_truthy(os.getenv("KIS_ORDER_STATUS_DEBUG_RAW", "false"))
 
+    @classmethod
+    def _should_log_order_request(cls) -> bool:
+        return cls._is_truthy(os.getenv("KIS_ORDER_API_DEBUG_REQUEST", "false")) or cls._is_truthy(
+            os.getenv("KIS_API_DEBUG_REQUEST", "false")
+        )
+
+    @classmethod
+    def _should_log_order_status_request(cls) -> bool:
+        return cls._is_truthy(os.getenv("KIS_ORDER_STATUS_DEBUG_REQUEST", "false")) or cls._is_truthy(
+            os.getenv("KIS_API_DEBUG_REQUEST", "false")
+        )
+
     @staticmethod
     def _order_status_raw_log_max_len() -> int:
         raw = str(os.getenv("KIS_ORDER_STATUS_DEBUG_RAW_MAX_LEN", "30000")).strip()
@@ -345,6 +357,15 @@ class KISApi:
             parsed = int(raw)
         except (TypeError, ValueError):
             return 30000
+        return max(parsed, 1000)
+
+    @staticmethod
+    def _api_request_log_max_len() -> int:
+        raw = str(os.getenv("KIS_API_DEBUG_REQUEST_MAX_LEN", "12000")).strip()
+        try:
+            parsed = int(raw)
+        except (TypeError, ValueError):
+            return 12000
         return max(parsed, 1000)
 
     @staticmethod
@@ -360,6 +381,33 @@ class KISApi:
             return json.dumps(data, ensure_ascii=False, default=str)
         except Exception:
             return str(data)
+
+    @staticmethod
+    def _mask_sensitive_value(key: str, value: Any) -> Any:
+        key_upper = str(key or "").upper()
+        raw = str(value or "")
+        if key_upper in ("CANO", "ACCOUNT_NO"):
+            if len(raw) <= 4:
+                return "***"
+            return f"{raw[:4]}***"
+        if key_upper in ("ACNT_PRDT_CD", "ACCOUNT_PRODUCT_CODE"):
+            return "***"
+        if any(token in key_upper for token in ("APPKEY", "APPSECRET", "TOKEN", "AUTH")):
+            if not raw:
+                return ""
+            return "***"
+        return value
+
+    @classmethod
+    def _sanitize_for_log(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            return {
+                str(key): cls._sanitize_for_log(cls._mask_sensitive_value(str(key), value))
+                for key, value in data.items()
+            }
+        if isinstance(data, list):
+            return [cls._sanitize_for_log(item) for item in data]
+        return data
 
     def _request_balance_payload(self) -> Dict[str, Any]:
         """잔고/보유현황 원본 payload를 조회합니다."""
@@ -1181,6 +1229,21 @@ class KISApi:
         
         order_side = "매수" if is_buy else "매도"
         logger.info(f"{order_side} 주문 요청: {stock_code}, {quantity}주, 가격: {price}")
+        if self._should_log_order_request():
+            req_payload = {
+                "endpoint": "/uapi/domestic-stock/v1/trading/order-cash",
+                "tr_id": tr_id,
+                "side": order_side,
+                "is_paper_trading": bool(self.is_paper_trading),
+                "body": self._sanitize_for_log(body),
+            }
+            logger.info(
+                "[KIS][ORDER][REQ] %s",
+                self._truncate_for_log(
+                    self._safe_json_dumps(req_payload),
+                    self._api_request_log_max_len(),
+                ),
+            )
         
         try:
             # 주문 API는 재시도 시 중복 주문 위험이 있어 무조건 1회 호출
@@ -1267,6 +1330,20 @@ class KISApi:
             "CTX_AREA_FK100": "",
             "CTX_AREA_NK100": "",
         }
+        if self._should_log_order_status_request():
+            req_payload = {
+                "endpoint": "/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
+                "tr_id": tr_id,
+                "is_paper_trading": bool(self.is_paper_trading),
+                "params": self._sanitize_for_log(params),
+            }
+            logger.info(
+                "[KIS][ORDER_STATUS][REQ] %s",
+                self._truncate_for_log(
+                    self._safe_json_dumps(req_payload),
+                    self._api_request_log_max_len(),
+                ),
+            )
         
         response = self._request_with_retry("GET", url, headers, params=params)
         data = response.json()
