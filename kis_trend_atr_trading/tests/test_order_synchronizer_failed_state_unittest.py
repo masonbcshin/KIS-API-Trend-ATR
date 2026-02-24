@@ -72,6 +72,31 @@ class _FailingApi:
         return {"success": False, "message": "모의투자 장종료 입니다."}
 
 
+class _BuyTimeoutWithHoldingIncreaseApi:
+    def __init__(self):
+        self._holding_call_count = 0
+
+    def get_holdings(self):
+        self._holding_call_count += 1
+        # 1st call: 주문 전 무보유, 2nd call: 주문 후 1주 보유
+        if self._holding_call_count == 1:
+            return []
+        return [{"stock_code": "024060", "qty": 1, "avg_price": 21900.0}]
+
+    def place_buy_order(self, *args, **kwargs):
+        return {"success": True, "order_no": "0000014023", "message": "ok"}
+
+    def wait_for_execution(self, *args, **kwargs):
+        return {
+            "success": False,
+            "status": "TIMEOUT",
+            "exec_qty": 0,
+            "exec_price": 0.0,
+            "message": "타임아웃 - 마지막 확인 체결수량: 0주",
+            "fills": [],
+        }
+
+
 class TestOrderSynchronizerFailedState(unittest.TestCase):
     def test_sell_send_failure_marks_failed_state(self):
         syncer = OrderSynchronizer(api=_FailingApi())
@@ -93,6 +118,32 @@ class TestOrderSynchronizerFailedState(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertEqual(result.result_type, OrderExecutionResult.FAILED)
         self.assertEqual(statuses, ["PENDING", "FAILED"])
+
+    def test_buy_timeout_reconciles_from_holdings_delta(self):
+        syncer = OrderSynchronizer(api=_BuyTimeoutWithHoldingIncreaseApi())
+        syncer.mode = "PAPER"
+        statuses = []
+
+        syncer._get_order_state = lambda _k: None  # type: ignore
+
+        def _capture_upsert(**kwargs):
+            statuses.append(kwargs.get("status"))
+
+        syncer._upsert_order_state = _capture_upsert  # type: ignore
+
+        result = syncer.execute_buy_order(
+            stock_code="024060",
+            quantity=1,
+            signal_id="unit-test-buy-timeout-holding",
+            skip_market_check=True,
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.result_type, OrderExecutionResult.SUCCESS)
+        self.assertEqual(result.exec_qty, 1)
+        self.assertGreater(float(result.exec_price), 0.0)
+        self.assertIn("보유수량 변동", result.message)
+        self.assertEqual(statuses, ["PENDING", "SUBMITTED", "FILLED"])
 
 
 if __name__ == "__main__":

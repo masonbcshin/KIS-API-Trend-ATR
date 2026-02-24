@@ -494,6 +494,146 @@ class OrderSynchronizer:
         raw = f"{self.mode}|{side}|{stock_code}|{quantity}|{signal_id}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
+    @staticmethod
+    def _to_int(value: Any, default: int = 0) -> int:
+        try:
+            if value in (None, ""):
+                return default
+            return int(float(str(value).replace(",", "").strip()))
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _to_float(value: Any, default: float = 0.0) -> float:
+        try:
+            if value in (None, ""):
+                return default
+            return float(str(value).replace(",", "").strip())
+        except (TypeError, ValueError):
+            return default
+
+    def _get_holding_snapshot(self, stock_code: str) -> Optional[Dict[str, float]]:
+        """
+        지정 종목의 보유 수량/평단을 조회합니다.
+
+        Returns:
+            {"qty": int, "avg_price": float} 또는 조회 실패 시 None
+        """
+        if not hasattr(self.api, "get_holdings"):
+            return None
+
+        try:
+            holdings = self.api.get_holdings()
+        except Exception as e:
+            logger.warning(f"[SYNC] 보유 조회 실패(holdings fallback skip): {e}")
+            return None
+
+        target = str(stock_code or "").strip()
+        if not target:
+            return None
+
+        for row in holdings or []:
+            if not isinstance(row, dict):
+                continue
+            symbol = str(
+                row.get("stock_code")
+                or row.get("pdno")
+                or row.get("symbol")
+                or ""
+            ).strip()
+            if symbol != target:
+                continue
+            qty = self._to_int(
+                row.get("qty")
+                or row.get("hldg_qty")
+                or row.get("hold_qty")
+                or row.get("quantity"),
+                0,
+            )
+            avg_price = self._to_float(
+                row.get("avg_price")
+                or row.get("pchs_avg_pric")
+                or row.get("avg_buy_price")
+                or row.get("pchs_avrg_pric"),
+                0.0,
+            )
+            return {"qty": max(qty, 0), "avg_price": max(avg_price, 0.0)}
+
+        return {"qty": 0, "avg_price": 0.0}
+
+    def _infer_buy_fill_from_holdings(
+        self,
+        *,
+        stock_code: str,
+        requested_qty: int,
+        before_snapshot: Optional[Dict[str, float]],
+        order_no: str,
+    ) -> Optional[SynchronizedOrderResult]:
+        """
+        PAPER 모드에서 체결조회가 비어도 보유수량 증가로 매수 체결을 보정합니다.
+        """
+        if str(self.mode).upper() != "PAPER":
+            return None
+        if before_snapshot is None:
+            return None
+
+        after_snapshot = self._get_holding_snapshot(stock_code)
+        if after_snapshot is None:
+            return None
+
+        before_qty = self._to_int(before_snapshot.get("qty"), 0)
+        after_qty = self._to_int(after_snapshot.get("qty"), 0)
+        delta_qty = max(after_qty - before_qty, 0)
+        if delta_qty <= 0:
+            return None
+
+        exec_qty = min(delta_qty, max(int(requested_qty), 0))
+        if exec_qty <= 0:
+            return None
+
+        exec_price = self._to_float(after_snapshot.get("avg_price"), 0.0)
+        if exec_price <= 0:
+            exec_price = self._to_float(before_snapshot.get("avg_price"), 0.0)
+        if exec_price <= 0:
+            return None
+
+        is_filled = exec_qty >= requested_qty
+        result_type = (
+            OrderExecutionResult.SUCCESS if is_filled else OrderExecutionResult.PARTIAL
+        )
+        status = "FILLED" if is_filled else "PARTIAL"
+        msg = (
+            f"체결조회 미응답 - 보유수량 변동으로 {status} 보정: "
+            f"{before_qty}→{after_qty} (Δ{delta_qty})"
+        )
+        logger.warning(
+            "[SYNC] holdings 기반 매수 체결 보정: symbol=%s, order_no=%s, before=%s, after=%s, exec_qty=%s, exec_price=%s",
+            stock_code,
+            order_no,
+            before_qty,
+            after_qty,
+            exec_qty,
+            exec_price,
+        )
+        return SynchronizedOrderResult(
+            success=is_filled,
+            result_type=result_type,
+            order_no=order_no,
+            exec_qty=exec_qty,
+            exec_price=exec_price,
+            message=msg,
+            fills=[
+                {
+                    "order_no": order_no,
+                    "exec_id": None,
+                    "executed_at": datetime.now(KST).isoformat(),
+                    "price": exec_price,
+                    "qty": exec_qty,
+                    "side": "BUY",
+                }
+            ],
+        )
+
     def _upsert_order_state(
         self,
         idempotency_key: str,
@@ -669,6 +809,7 @@ class OrderSynchronizer:
             filled_qty=0,
             remaining_qty=quantity
         )
+        holding_before = self._get_holding_snapshot(stock_code)
 
         # 2. 매수 주문 전송
         logger.info(f"[SYNC] 매수 주문 시작: {stock_code} {quantity}주")
@@ -785,6 +926,29 @@ class OrderSynchronizer:
             )
         
         else:
+            inferred = self._infer_buy_fill_from_holdings(
+                stock_code=stock_code,
+                requested_qty=quantity,
+                before_snapshot=holding_before,
+                order_no=order_no,
+            )
+            if inferred is not None:
+                inferred_filled_qty = int(inferred.exec_qty or 0)
+                inferred_remaining = max(quantity - inferred_filled_qty, 0)
+                inferred_status = "FILLED" if inferred.success else "PARTIAL"
+                self._upsert_order_state(
+                    idempotency_key=idempotency_key,
+                    signal_id=signal_id,
+                    stock_code=stock_code,
+                    side="BUY",
+                    quantity=quantity,
+                    status=inferred_status,
+                    order_no=order_no,
+                    filled_qty=inferred_filled_qty,
+                    remaining_qty=inferred_remaining,
+                )
+                return inferred
+
             self._upsert_order_state(
                 idempotency_key=idempotency_key,
                 signal_id=signal_id,
