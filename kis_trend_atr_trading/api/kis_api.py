@@ -10,6 +10,7 @@ API 문서 참고: https://apiportal.koreainvestment.com/
 """
 
 import json
+import os
 import time
 import threading
 from copy import deepcopy
@@ -328,6 +329,37 @@ class KISApi:
                             path = f"{key}.{sub_key}"
                             return [row for row in sub_value if isinstance(row, dict)], path
         return [], ""
+
+    @staticmethod
+    def _is_truthy(value: Any) -> bool:
+        return str(value or "").strip().lower() in ("1", "true", "yes", "on", "y")
+
+    @classmethod
+    def _should_log_order_status_raw(cls) -> bool:
+        return cls._is_truthy(os.getenv("KIS_ORDER_STATUS_DEBUG_RAW", "false"))
+
+    @staticmethod
+    def _order_status_raw_log_max_len() -> int:
+        raw = str(os.getenv("KIS_ORDER_STATUS_DEBUG_RAW_MAX_LEN", "30000")).strip()
+        try:
+            parsed = int(raw)
+        except (TypeError, ValueError):
+            return 30000
+        return max(parsed, 1000)
+
+    @staticmethod
+    def _truncate_for_log(text: str, max_len: int) -> str:
+        if len(text) <= max_len:
+            return text
+        omitted = len(text) - max_len
+        return f"{text[:max_len]}... <truncated {omitted} chars>"
+
+    @staticmethod
+    def _safe_json_dumps(data: Any) -> str:
+        try:
+            return json.dumps(data, ensure_ascii=False, default=str)
+        except Exception:
+            return str(data)
 
     def _request_balance_payload(self) -> Dict[str, Any]:
         """잔고/보유현황 원본 payload를 조회합니다."""
@@ -1333,6 +1365,19 @@ class KISApi:
                 resolved_path or "N/A",
                 len(rows),
             )
+            if self._should_log_order_status_raw():
+                raw_log_payload = {
+                    "requested_order_no": requested_order_no,
+                    "resolved_path": resolved_path or "N/A",
+                    "raw_rows_count": len(rows),
+                    "top_level_keys": list(data.keys()) if isinstance(data, dict) else [],
+                    "raw_payload": data,
+                }
+                raw_text = self._safe_json_dumps(raw_log_payload)
+                logger.warning(
+                    "[KIS][ORDER_STATUS][RAW] %s",
+                    self._truncate_for_log(raw_text, self._order_status_raw_log_max_len()),
+                )
         
         return {
             "success": True,

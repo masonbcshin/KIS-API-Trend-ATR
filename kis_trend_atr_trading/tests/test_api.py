@@ -512,6 +512,47 @@ class TestExecutionStatusResponses:
         assert row["exec_qty"] == 51
         assert row["exec_price"] == 18180.0
 
+    @patch('api.kis_api.requests.get')
+    def test_get_order_status_logs_raw_payload_when_debug_enabled(self, mock_get):
+        """주문번호 미매칭 시 디버그 플래그가 켜져 있으면 원문 payload를 경고 로그로 남깁니다."""
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "rt_cd": "0",
+            "output1": [
+                {
+                    "odno": "0000001111",
+                    "pdno": "024060",
+                    "sll_buy_dvsn_cd": "02",
+                    "ord_qty": "1",
+                    "tot_ccld_qty": "0",
+                    "ord_dt": "20260224",
+                    "ord_tmd": "133504",
+                }
+            ],
+        }
+        mock_get.return_value = mock_response
+
+        with patch.dict(
+            "os.environ",
+            {
+                "KIS_ORDER_STATUS_DEBUG_RAW": "true",
+                "KIS_ORDER_STATUS_DEBUG_RAW_MAX_LEN": "5000",
+            },
+            clear=False,
+        ):
+            with patch("api.kis_api.logger.warning") as mock_warning:
+                with patch.object(KISApi, "_wait_for_rate_limit", return_value=None):
+                    api = KISApi(is_paper_trading=True)
+                    api.access_token = "test_token"
+                    with patch.object(api, "get_access_token", return_value="test_token"):
+                        result = api.get_order_status("0000009999")
+
+        assert result["success"] is True
+        assert result["total_count"] == 0
+        warning_headers = [str(call.args[0]) for call in mock_warning.call_args_list if call.args]
+        assert any("[KIS][ORDER_STATUS][RAW]" in header for header in warning_headers)
+
     def test_wait_for_execution_ignores_unmatched_rows(self):
         with patch.object(KISApi, '_wait_for_rate_limit', return_value=None):
             api = KISApi(is_paper_trading=True)
