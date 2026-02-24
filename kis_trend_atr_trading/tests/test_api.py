@@ -403,6 +403,43 @@ class TestOrderAPIResponses:
         info_headers = [str(call.args[0]) for call in mock_info.call_args_list if call.args]
         assert any("[KIS][ORDER][REQ]" in header for header in info_headers)
 
+    @patch('api.kis_api.requests.post')
+    def test_buy_order_logs_response_when_debug_enabled(self, mock_post):
+        """주문 응답 디버그 플래그가 켜지면 응답값 로그가 출력되어야 합니다."""
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "rt_cd": "0",
+            "msg_cd": "APBK0013",
+            "msg1": "주문 접수 완료",
+            "output": {"ODNO": "0001234570"},
+        }
+        mock_post.return_value = mock_response
+
+        with patch.dict(
+            "os.environ",
+            {
+                "KIS_ORDER_API_DEBUG_RESPONSE": "true",
+                "KIS_API_DEBUG_RESPONSE_MAX_LEN": "5000",
+            },
+            clear=False,
+        ):
+            with patch("api.kis_api.logger.info") as mock_info:
+                with patch.object(KISApi, '_wait_for_rate_limit', return_value=None):
+                    api = KISApi(is_paper_trading=True)
+                    api.access_token = "test_token"
+                    with patch.object(api, "get_access_token", return_value="test_token"):
+                        result = api.place_buy_order(
+                            stock_code="005930",
+                            quantity=1,
+                            price=0,
+                            order_type="01"
+                        )
+
+        assert result["success"] is True
+        info_headers = [str(call.args[0]) for call in mock_info.call_args_list if call.args]
+        assert any("[KIS][ORDER][RESP]" in header for header in info_headers)
+
 
 class TestExecutionStatusResponses:
     """체결 조회/대기 응답 해석 테스트"""
@@ -580,45 +617,35 @@ class TestExecutionStatusResponses:
         assert any("[KIS][ORDER_STATUS][REQ]" in header for header in info_headers)
 
     @patch('api.kis_api.requests.get')
-    def test_get_order_status_logs_raw_payload_when_debug_enabled(self, mock_get):
-        """주문번호 미매칭 시 디버그 플래그가 켜져 있으면 원문 payload를 경고 로그로 남깁니다."""
+    def test_get_order_status_logs_response_when_debug_enabled(self, mock_get):
+        """체결조회 응답 디버그 플래그가 켜지면 응답값 로그가 출력되어야 합니다."""
         mock_response = Mock()
         mock_response.status_code = 200
         mock_response.json.return_value = {
             "rt_cd": "0",
-            "output1": [
-                {
-                    "odno": "0000001111",
-                    "pdno": "024060",
-                    "sll_buy_dvsn_cd": "02",
-                    "ord_qty": "1",
-                    "tot_ccld_qty": "0",
-                    "ord_dt": "20260224",
-                    "ord_tmd": "133504",
-                }
-            ],
+            "output1": [],
         }
         mock_get.return_value = mock_response
 
         with patch.dict(
             "os.environ",
             {
-                "KIS_ORDER_STATUS_DEBUG_RAW": "true",
-                "KIS_ORDER_STATUS_DEBUG_RAW_MAX_LEN": "5000",
+                "KIS_ORDER_STATUS_DEBUG_RESPONSE": "true",
+                "KIS_API_DEBUG_RESPONSE_MAX_LEN": "5000",
             },
             clear=False,
         ):
-            with patch("api.kis_api.logger.warning") as mock_warning:
+            with patch("api.kis_api.logger.info") as mock_info:
                 with patch.object(KISApi, "_wait_for_rate_limit", return_value=None):
                     api = KISApi(is_paper_trading=True)
                     api.access_token = "test_token"
                     with patch.object(api, "get_access_token", return_value="test_token"):
-                        result = api.get_order_status("0000009999")
+                        result = api.get_order_status("0000001640")
 
         assert result["success"] is True
         assert result["total_count"] == 0
-        warning_headers = [str(call.args[0]) for call in mock_warning.call_args_list if call.args]
-        assert any("[KIS][ORDER_STATUS][RAW]" in header for header in warning_headers)
+        info_headers = [str(call.args[0]) for call in mock_info.call_args_list if call.args]
+        assert any("[KIS][ORDER_STATUS][RESP]" in header for header in info_headers)
 
     def test_wait_for_execution_ignores_unmatched_rows(self):
         with patch.object(KISApi, '_wait_for_rate_limit', return_value=None):

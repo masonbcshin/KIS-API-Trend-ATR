@@ -335,10 +335,6 @@ class KISApi:
         return str(value or "").strip().lower() in ("1", "true", "yes", "on", "y")
 
     @classmethod
-    def _should_log_order_status_raw(cls) -> bool:
-        return cls._is_truthy(os.getenv("KIS_ORDER_STATUS_DEBUG_RAW", "false"))
-
-    @classmethod
     def _should_log_order_request(cls) -> bool:
         return cls._is_truthy(os.getenv("KIS_ORDER_API_DEBUG_REQUEST", "false")) or cls._is_truthy(
             os.getenv("KIS_API_DEBUG_REQUEST", "false")
@@ -350,18 +346,30 @@ class KISApi:
             os.getenv("KIS_API_DEBUG_REQUEST", "false")
         )
 
-    @staticmethod
-    def _order_status_raw_log_max_len() -> int:
-        raw = str(os.getenv("KIS_ORDER_STATUS_DEBUG_RAW_MAX_LEN", "30000")).strip()
-        try:
-            parsed = int(raw)
-        except (TypeError, ValueError):
-            return 30000
-        return max(parsed, 1000)
+    @classmethod
+    def _should_log_order_response(cls) -> bool:
+        return cls._is_truthy(os.getenv("KIS_ORDER_API_DEBUG_RESPONSE", "false")) or cls._is_truthy(
+            os.getenv("KIS_API_DEBUG_RESPONSE", "false")
+        )
+
+    @classmethod
+    def _should_log_order_status_response(cls) -> bool:
+        return cls._is_truthy(os.getenv("KIS_ORDER_STATUS_DEBUG_RESPONSE", "false")) or cls._is_truthy(
+            os.getenv("KIS_API_DEBUG_RESPONSE", "false")
+        )
 
     @staticmethod
     def _api_request_log_max_len() -> int:
         raw = str(os.getenv("KIS_API_DEBUG_REQUEST_MAX_LEN", "12000")).strip()
+        try:
+            parsed = int(raw)
+        except (TypeError, ValueError):
+            return 12000
+        return max(parsed, 1000)
+
+    @staticmethod
+    def _api_response_log_max_len() -> int:
+        raw = str(os.getenv("KIS_API_DEBUG_RESPONSE_MAX_LEN", "12000")).strip()
         try:
             parsed = int(raw)
         except (TypeError, ValueError):
@@ -1251,6 +1259,21 @@ class KISApi:
                 "POST", url, headers, json_data=body, max_retries=0
             )
             data = response.json()
+            if self._should_log_order_response():
+                resp_payload = {
+                    "endpoint": "/uapi/domestic-stock/v1/trading/order-cash",
+                    "tr_id": tr_id,
+                    "side": order_side,
+                    "is_paper_trading": bool(self.is_paper_trading),
+                    "response": self._sanitize_for_log(data),
+                }
+                logger.info(
+                    "[KIS][ORDER][RESP] %s",
+                    self._truncate_for_log(
+                        self._safe_json_dumps(resp_payload),
+                        self._api_response_log_max_len(),
+                    ),
+                )
             
             success = data.get("rt_cd") == "0"
             order_no = data.get("output", {}).get("ODNO", "")
@@ -1347,6 +1370,20 @@ class KISApi:
         
         response = self._request_with_retry("GET", url, headers, params=params)
         data = response.json()
+        if self._should_log_order_status_response():
+            resp_payload = {
+                "endpoint": "/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
+                "tr_id": tr_id,
+                "is_paper_trading": bool(self.is_paper_trading),
+                "response": self._sanitize_for_log(data),
+            }
+            logger.info(
+                "[KIS][ORDER_STATUS][RESP] %s",
+                self._truncate_for_log(
+                    self._safe_json_dumps(resp_payload),
+                    self._api_response_log_max_len(),
+                ),
+            )
         
         if data.get("rt_cd") != "0":
             raise KISApiError(f"주문 조회 실패: {data.get('msg1', 'Unknown error')}")
@@ -1442,19 +1479,6 @@ class KISApi:
                 resolved_path or "N/A",
                 len(rows),
             )
-            if self._should_log_order_status_raw():
-                raw_log_payload = {
-                    "requested_order_no": requested_order_no,
-                    "resolved_path": resolved_path or "N/A",
-                    "raw_rows_count": len(rows),
-                    "top_level_keys": list(data.keys()) if isinstance(data, dict) else [],
-                    "raw_payload": data,
-                }
-                raw_text = self._safe_json_dumps(raw_log_payload)
-                logger.warning(
-                    "[KIS][ORDER_STATUS][RAW] %s",
-                    self._truncate_for_log(raw_text, self._order_status_raw_log_max_len()),
-                )
         
         return {
             "success": True,
