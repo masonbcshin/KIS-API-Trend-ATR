@@ -108,6 +108,18 @@ class TestTelegramNotifierInit:
         )
         assert notifier._bot_token == 'param_token'
         assert notifier._chat_id == '67890'
+
+    def test_init_enabled_with_whitespace_env(self):
+        """TELEGRAM_ENABLED 공백 포함 값도 활성화로 해석되는지 테스트"""
+        with patch.dict('os.environ', {
+            'TELEGRAM_BOT_TOKEN': ' test_token ',
+            'TELEGRAM_CHAT_ID': ' 12345 ',
+            'TELEGRAM_ENABLED': ' TRUE '
+        }, clear=True):
+            notifier = TelegramNotifier()
+            assert notifier.enabled is True
+            assert notifier._bot_token == 'test_token'
+            assert notifier._chat_id == '12345'
     
     def test_init_disabled_without_token(self):
         """토큰 없이 초기화하면 비활성화되는지 테스트"""
@@ -278,6 +290,38 @@ class TestTradeNotifications:
         assert "삼성전자(005930)" in text
         assert "익절 도달" in text
         assert "+50,000" in text
+
+    def test_notify_sell_order_escapes_reason(self, mock_telegram_notifier, mock_requests_post):
+        """매도 사유의 마크다운 특수문자 이스케이프 테스트"""
+        result = mock_telegram_notifier.notify_sell_order(
+            stock_code="005930",
+            price=75000,
+            quantity=10,
+            reason="TAKE_PROFIT[FAST]",
+            pnl=50000,
+            pnl_pct=7.14,
+        )
+
+        assert result is True
+        text = mock_requests_post.call_args[1]['json']['text']
+        assert "TAKE\\_PROFIT\\[FAST\\]" in text
+
+    def test_notify_cbt_signal_uses_markdown_safe_header(self, mock_telegram_notifier, mock_requests_post):
+        """CBT 시그널 헤더가 Markdown 링크 파싱과 충돌하지 않는지 테스트"""
+        result = mock_telegram_notifier.notify_cbt_signal(
+            signal_type="BUY",
+            stock_code="005930",
+            price=70000,
+            stop_loss=68000,
+            take_profit=74000,
+            atr=1200,
+            trend="UPTREND",
+            reason="test",
+        )
+
+        assert result is True
+        text = mock_requests_post.call_args[1]['json']['text']
+        assert "(CBT) 매매 시그널" in text
     
     def test_notify_stop_loss(self, mock_telegram_notifier, mock_requests_post):
         """손절 청산 알림 테스트"""

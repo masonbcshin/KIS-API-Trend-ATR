@@ -438,6 +438,80 @@ class TestExecutionStatusResponses:
         assert params.get("INQR_STRT_DT") == "20260222"
         assert params.get("INQR_END_DT") == "20260223"
 
+    @patch('api.kis_api.requests.get')
+    def test_get_order_status_parses_output2_alt_fields(self, mock_get):
+        """output2/대체 키 포맷도 체결 행으로 파싱해야 합니다."""
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "rt_cd": "0",
+            "output2": [
+                {
+                    "order_no": "0000001896",
+                    "stock_code": "032820",
+                    "side": "BUY",
+                    "order_qty": "1",
+                    "exec_qty": "1",
+                    "remain_qty": "0",
+                    "order_price": "0",
+                    "exec_price": "17960",
+                    "order_date": "20260224",
+                    "order_time": "090823",
+                }
+            ],
+        }
+        mock_get.return_value = mock_response
+
+        with patch.object(KISApi, '_wait_for_rate_limit', return_value=None):
+            api = KISApi(is_paper_trading=True)
+            api.access_token = "test_token"
+            with patch.object(api, "get_access_token", return_value="test_token"):
+                result = api.get_order_status("0000001896")
+
+        assert result["success"] is True
+        assert result["total_count"] == 1
+        assert result["resolved_path"] == "output2"
+        row = result["orders"][0]
+        assert row["order_no"] == "0000001896"
+        assert row["stock_code"] == "032820"
+        assert row["side"] == "BUY"
+        assert row["exec_qty"] == 1
+        assert row["exec_price"] == 17960.0
+
+    @patch('api.kis_api.requests.get')
+    def test_get_order_status_uses_requested_order_no_when_row_missing_odno(self, mock_get):
+        """응답에 odno 키가 없더라도 요청 주문번호 기준으로 매칭되어야 합니다."""
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "rt_cd": "0",
+            "output1": [
+                {
+                    "pdno": "032820",
+                    "sll_buy_dvsn_cd": "01",
+                    "ord_qty": "51",
+                    "tot_ccld_qty": "51",
+                    "avg_prvs": "18180",
+                    "ord_dt": "20260224",
+                    "ord_tmd": "090622",
+                }
+            ],
+        }
+        mock_get.return_value = mock_response
+
+        with patch.object(KISApi, '_wait_for_rate_limit', return_value=None):
+            api = KISApi(is_paper_trading=True)
+            api.access_token = "test_token"
+            with patch.object(api, "get_access_token", return_value="test_token"):
+                result = api.get_order_status("0000001640")
+
+        assert result["success"] is True
+        assert result["total_count"] == 1
+        row = result["orders"][0]
+        assert row["order_no"] == "0000001640"
+        assert row["exec_qty"] == 51
+        assert row["exec_price"] == 18180.0
+
     def test_wait_for_execution_ignores_unmatched_rows(self):
         with patch.object(KISApi, '_wait_for_rate_limit', return_value=None):
             api = KISApi(is_paper_trading=True)

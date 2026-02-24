@@ -1243,14 +1243,42 @@ class KISApi:
             raise KISApiError(f"주문 조회 실패: {data.get('msg1', 'Unknown error')}")
         
         requested_order_no = str(order_no or "").strip()
+        candidate_paths: List[Tuple[str, ...]] = [
+            ("output1",),
+            ("output2",),
+            ("output",),
+            ("output", "output1"),
+            ("output", "output2"),
+        ]
+        rows, resolved_path = self._resolve_first_list_path(data, candidate_paths)
+
+        order_no_keys = ["odno", "ODNO", "order_no", "ord_no", "odno1", "ordn_no", "orgn_odno"]
+        stock_code_keys = ["pdno", "PDNO", "stock_code", "symbol", "iscd", "mksc_shrn_iscd"]
+        side_code_keys = ["sll_buy_dvsn_cd", "sll_buy_dvsn", "side", "order_type", "buy_sell_type"]
+        order_qty_keys = ["ord_qty", "order_qty", "tot_ord_qty", "qty", "ord_qty1"]
+        exec_qty_keys = ["tot_ccld_qty", "ccld_qty", "exec_qty", "filled_qty", "tot_ccld_qty1"]
+        remain_qty_keys = ["remain_qty", "remaining_qty", "ord_remn_qty", "rmn_qty"]
+        order_price_keys = ["ord_unpr", "order_price", "ord_price", "unpr"]
+        exec_price_keys = ["avg_prvs", "avg_ccld_prc", "exec_price", "filled_price", "ccld_avg_pric"]
+        order_date_keys = ["ord_dt", "order_date", "ord_date", "trad_dt"]
+        order_time_keys = ["ord_tmd", "ord_tm", "order_time", "trad_tm", "ccld_tm"]
+        exec_id_keys = ["exec_id", "ccld_no", "exec_no", "ord_seqno", "trad_no", "odno2"]
+
         orders = []
-        for item in data.get("output1", []):
-            row_order_no = str(item.get("odno") or "").strip()
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+
+            row_order_no = str(self._pick_first_value(item, order_no_keys) or "").strip()
+            if not row_order_no and requested_order_no:
+                # 일부 응답 포맷은 주문번호 키가 비표준/누락일 수 있어 요청값으로 보정
+                row_order_no = requested_order_no
+
             if requested_order_no and not self._order_no_matches(row_order_no, requested_order_no):
                 continue
 
-            order_date = str(item.get("ord_dt") or start_date).strip()
-            order_time = str(item.get("ord_tmd") or item.get("ord_tm") or "").strip()
+            order_date = str(self._pick_first_value(item, order_date_keys) or start_date).strip()
+            order_time = str(self._pick_first_value(item, order_time_keys) or "").strip()
             executed_at_iso = None
             try:
                 if len(order_date) == 8 and order_time:
@@ -1261,36 +1289,56 @@ class KISApi:
             except Exception:
                 executed_at_iso = None
 
-            exec_id = None
-            for candidate in ("exec_id", "ccld_no", "exec_no", "ord_seqno", "trad_no"):
-                raw_exec_id = item.get(candidate)
-                if raw_exec_id not in (None, ""):
-                    exec_id = str(raw_exec_id).strip()
-                    break
+            raw_exec_id = self._pick_first_value(item, exec_id_keys)
+            exec_id = str(raw_exec_id).strip() if raw_exec_id not in (None, "") else None
 
-            order_qty = self._parse_numeric_int(item.get("ord_qty"), 0)
-            exec_qty = self._parse_numeric_int(item.get("tot_ccld_qty"), 0)
+            side_raw = str(self._pick_first_value(item, side_code_keys) or "").strip().upper()
+            if side_raw in ("02", "BUY", "B", "매수"):
+                side = "BUY"
+            elif side_raw in ("01", "SELL", "S", "매도"):
+                side = "SELL"
+            else:
+                side = "BUY" if "매수" in side_raw else "SELL"
+
+            order_qty = self._parse_numeric_int(self._pick_first_value(item, order_qty_keys), 0)
+            exec_qty = self._parse_numeric_int(self._pick_first_value(item, exec_qty_keys), 0)
+            remain_qty_raw = self._pick_first_value(item, remain_qty_keys)
+            remain_qty = self._parse_numeric_int(remain_qty_raw, max(order_qty - exec_qty, 0))
+
+            stock_code = str(self._pick_first_value(item, stock_code_keys) or "").strip()
+            order_price = self._parse_numeric_float(self._pick_first_value(item, order_price_keys), 0.0)
+            exec_price = self._parse_numeric_float(self._pick_first_value(item, exec_price_keys), 0.0)
+
             orders.append({
                 "order_no": row_order_no,
-                "stock_code": item.get("pdno"),
-                "order_type": "매수" if item.get("sll_buy_dvsn_cd") == "02" else "매도",
-                "side": "BUY" if item.get("sll_buy_dvsn_cd") == "02" else "SELL",
+                "stock_code": stock_code,
+                "order_type": "매수" if side == "BUY" else "매도",
+                "side": side,
                 "order_qty": order_qty,
                 "exec_qty": exec_qty,
-                "remain_qty": max(order_qty - exec_qty, 0),
-                "order_price": self._parse_numeric_float(item.get("ord_unpr"), 0.0),
-                "exec_price": self._parse_numeric_float(item.get("avg_prvs"), 0.0),
+                "remain_qty": max(remain_qty, 0),
+                "order_price": order_price,
+                "exec_price": exec_price,
                 "executed_at": executed_at_iso,
                 "exec_id": exec_id,
-                "status": "체결완료" if exec_qty == order_qty else (
+                "status": "체결완료" if (order_qty > 0 and exec_qty >= order_qty) else (
                     "부분체결" if exec_qty > 0 else "미체결"
                 ),
             })
+
+        if requested_order_no and not orders:
+            logger.warning(
+                "[KIS][ORDER_STATUS] 주문번호 미매칭: requested=%s, path=%s, raw_rows=%s",
+                requested_order_no,
+                resolved_path or "N/A",
+                len(rows),
+            )
         
         return {
             "success": True,
             "orders": orders,
-            "total_count": len(orders)
+            "total_count": len(orders),
+            "resolved_path": resolved_path,
         }
     
     def wait_for_execution(
@@ -1324,6 +1372,11 @@ class KISApi:
         """
         start_time = time.time()
         last_exec_qty = 0
+        poll_count = 0
+        empty_result_polls = 0
+        unmatched_result_polls = 0
+        last_total_count = 0
+        last_observed_order_nos: List[str] = []
 
         def _target_orders(order_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             matches = [
@@ -1357,13 +1410,24 @@ class KISApi:
         while time.time() - start_time < timeout_seconds:
             try:
                 status_result = self.get_order_status(order_no)
+                poll_count += 1
+                all_rows = status_result.get("orders") or []
+                last_total_count = int(
+                    status_result.get("total_count", len(all_rows)) or len(all_rows)
+                )
                 
-                if not status_result.get("success") or not status_result.get("orders"):
+                if not status_result.get("success") or not all_rows:
+                    empty_result_polls += 1
                     time.sleep(check_interval)
                     continue
 
-                matched_orders = _target_orders(status_result.get("orders", []))
+                matched_orders = _target_orders(all_rows)
                 if not matched_orders:
+                    unmatched_result_polls += 1
+                    last_observed_order_nos = [
+                        str(row.get("order_no") or "").strip()
+                        for row in all_rows[:5]
+                    ]
                     time.sleep(check_interval)
                     continue
 
@@ -1411,7 +1475,16 @@ class KISApi:
                 time.sleep(check_interval)
         
         # 타임아웃 - 미체결분 취소 시도
-        logger.warning(f"체결 타임아웃: {timeout_seconds}초 경과")
+        logger.warning(
+            "체결 타임아웃: %s초 경과 (order_no=%s, polls=%s, empty_polls=%s, unmatched_polls=%s, last_total=%s, sample_order_nos=%s)",
+            timeout_seconds,
+            order_no,
+            poll_count,
+            empty_result_polls,
+            unmatched_result_polls,
+            last_total_count,
+            last_observed_order_nos,
+        )
         
         # 최종 상태 확인
         try:
@@ -1420,6 +1493,15 @@ class KISApi:
             if not final_orders:
                 fallback_status = self.get_order_status(None)
                 final_orders = _target_orders(fallback_status.get("orders", []))
+            if not final_orders:
+                today = datetime.now(KST).date()
+                prev_day = today - timedelta(days=1)
+                window_status = self.get_order_status(
+                    order_no=None,
+                    trade_date=prev_day,
+                    end_date=today,
+                )
+                final_orders = _target_orders(window_status.get("orders", []))
 
             if final_orders:
                 final_order = max(

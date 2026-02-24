@@ -289,7 +289,7 @@ MESSAGE_TEMPLATES = {
 
     # CBT 모드 시그널 알림
     "cbt_signal": """
-📋 *[CBT] 매매 시그널*
+📋 *(CBT) 매매 시그널*
 ━━━━━━━━━━━━━━━━━━
 • 시그널: {signal_type}
 • 종목: `{stock_code}`
@@ -357,7 +357,7 @@ MESSAGE_TEMPLATES = {
 
     # CBT 거래 완료 알림
     "cbt_trade_complete": """
-🧪 *[CBT] 거래 완료*
+🧪 *(CBT) 거래 완료*
 ━━━━━━━━━━━━━━━━━━
 • 종목: `{stock_code}`
 • 방향: {trade_type}
@@ -446,12 +446,12 @@ class TelegramNotifier:
             retry_delay: 재시도 간 대기 시간 (초)
         """
         # 환경변수에서 로드
-        self._bot_token = bot_token or os.getenv("TELEGRAM_BOT_TOKEN", "")
-        self._chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID", "")
-        
+        self._bot_token = str(bot_token or os.getenv("TELEGRAM_BOT_TOKEN", "")).strip()
+        self._chat_id = str(chat_id or os.getenv("TELEGRAM_CHAT_ID", "")).strip()
+
         # 활성화 여부 (환경변수 우선)
-        env_enabled = os.getenv("TELEGRAM_ENABLED", "true").lower()
-        self._enabled = enabled and env_enabled in ("true", "1", "yes")
+        env_enabled = str(os.getenv("TELEGRAM_ENABLED", "true")).strip()
+        self._enabled = bool(enabled) and self._is_truthy(env_enabled)
         
         # API 설정
         self._timeout = timeout
@@ -728,11 +728,12 @@ class TelegramNotifier:
             bool: 전송 성공 여부
         """
         display_symbol = self._format_symbol(stock_code)
+        safe_reason = self._escape_markdown(str(reason or "청산"))
         message = MESSAGE_TEMPLATES["sell_order"].format(
             stock_code=display_symbol,
             price=int(price),
             quantity=quantity,
-            reason=reason,
+            reason=safe_reason,
             pnl=int(pnl),
             pnl_pct=pnl_pct,
             timestamp=self._get_timestamp()
@@ -1391,6 +1392,11 @@ class TelegramNotifier:
     # ════════════════════════════════════════════════════════════════
     
     @staticmethod
+    def _is_truthy(value: Any) -> bool:
+        """문자열 기반 환경값을 불리언으로 해석합니다."""
+        return str(value or "").strip().lower() in ("true", "1", "yes", "on", "y")
+
+    @staticmethod
     def _get_timestamp() -> str:
         """현재 시간 문자열 반환"""
         return datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
@@ -1405,8 +1411,8 @@ class TelegramNotifier:
             V2 전용 문자까지 이스케이프하면 백슬래시가 본문에 노출됩니다.
         """
         raw = str(text or "")
-        # Telegram Markdown(legacy)에서 의미를 갖는 핵심 문자만 이스케이프.
-        return re.sub(r"([_*`\[])", r"\\\1", raw)
+        # Telegram Markdown(legacy)에서 링크/스타일 파싱에 영향 주는 문자 이스케이프.
+        return re.sub(r"([_*`\[\]])", r"\\\1", raw)
     
     def test_connection(self) -> bool:
         """
