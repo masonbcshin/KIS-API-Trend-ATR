@@ -840,6 +840,7 @@ class OrderSynchronizer:
                 )
             
             order_no = order_result.get("order_no", "")
+            order_branch_no = str(order_result.get("branch_no") or "").strip()
             self._upsert_order_state(
                 idempotency_key=idempotency_key,
                 signal_id=signal_id,
@@ -876,7 +877,8 @@ class OrderSynchronizer:
         exec_result = self.api.wait_for_execution(
             order_no=order_no,
             expected_qty=quantity,
-            timeout_seconds=self.execution_timeout
+            timeout_seconds=self.execution_timeout,
+            ord_gno_brno=order_branch_no or None,
         )
         
         # 4. 결과 반환
@@ -1068,6 +1070,7 @@ class OrderSynchronizer:
                 )
             
             order_no = order_result.get("order_no", "")
+            order_branch_no = str(order_result.get("branch_no") or "").strip()
             self._upsert_order_state(
                 idempotency_key=idempotency_key,
                 signal_id=signal_id,
@@ -1104,7 +1107,8 @@ class OrderSynchronizer:
         exec_result = self.api.wait_for_execution(
             order_no=order_no,
             expected_qty=quantity,
-            timeout_seconds=timeout
+            timeout_seconds=timeout,
+            ord_gno_brno=order_branch_no or None,
         )
         
         # 4. 결과 반환

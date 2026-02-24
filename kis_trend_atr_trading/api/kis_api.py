@@ -1276,7 +1276,13 @@ class KISApi:
                 )
             
             success = data.get("rt_cd") == "0"
-            order_no = data.get("output", {}).get("ODNO", "")
+            output_data = data.get("output") if isinstance(data.get("output"), dict) else {}
+            order_no = str(output_data.get("ODNO") or "").strip()
+            branch_no = str(
+                output_data.get("KRX_FWDG_ORD_ORGNO")
+                or output_data.get("ORD_GNO_BRNO")
+                or ""
+            ).strip()
             message = data.get("msg1", "")
             
             if success:
@@ -1294,6 +1300,7 @@ class KISApi:
             return {
                 "success": success,
                 "order_no": order_no,
+                "branch_no": branch_no,
                 "message": message,
                 "data": data
             }
@@ -1303,6 +1310,7 @@ class KISApi:
             return {
                 "success": False,
                 "order_no": "",
+                "branch_no": "",
                 "message": str(e),
                 "data": {}
             }
@@ -1312,6 +1320,7 @@ class KISApi:
         order_no: str = None,
         trade_date: Any = None,
         end_date: Any = None,
+        ord_gno_brno: Optional[str] = None,
     ) -> Dict:
         """
         주문 체결 내역을 조회합니다 (모의투자 전용).
@@ -1325,6 +1334,7 @@ class KISApi:
             order_no: 주문 번호 (미입력 시 당일 전체 조회)
             trade_date: 조회 시작일 (미입력 시 오늘)
             end_date: 조회 종료일 (미입력 시 trade_date와 동일)
+            ord_gno_brno: 주문지점번호 (미입력 시 전체)
         
         Returns:
             Dict: 주문 체결 내역
@@ -1346,7 +1356,7 @@ class KISApi:
             "INQR_DVSN": "00",  # 역순
             "PDNO": "",
             "CCLD_DVSN": "00",  # 전체
-            "ORD_GNO_BRNO": "",
+            "ORD_GNO_BRNO": str(ord_gno_brno or "").strip(),
             "ODNO": order_no or "",
             "INQR_DVSN_3": "00",
             "INQR_DVSN_1": "",
@@ -1492,7 +1502,8 @@ class KISApi:
         order_no: str,
         expected_qty: int,
         timeout_seconds: int = 30,
-        check_interval: float = 2.0
+        check_interval: float = 2.0,
+        ord_gno_brno: Optional[str] = None,
     ) -> Dict:
         """
         주문 체결을 동기적으로 대기합니다.
@@ -1507,6 +1518,7 @@ class KISApi:
             expected_qty: 예상 체결 수량
             timeout_seconds: 최대 대기 시간 (초)
             check_interval: 체결 확인 간격 (초)
+            ord_gno_brno: 주문지점번호
         
         Returns:
             Dict: 체결 결과
@@ -1517,6 +1529,7 @@ class KISApi:
                 - message: 상세 메시지
         """
         start_time = time.time()
+        query_branch_no = str(ord_gno_brno or "").strip()
         last_exec_qty = 0
         poll_count = 0
         empty_result_polls = 0
@@ -1551,11 +1564,20 @@ class KISApi:
                 )
             return fills
         
-        logger.info(f"체결 대기 시작: 주문번호={order_no}, 예상수량={expected_qty}, 타임아웃={timeout_seconds}초")
+        logger.info(
+            "체결 대기 시작: 주문번호=%s, 주문지점=%s, 예상수량=%s, 타임아웃=%s초",
+            order_no,
+            query_branch_no or "-",
+            expected_qty,
+            timeout_seconds,
+        )
         
         while time.time() - start_time < timeout_seconds:
             try:
-                status_result = self.get_order_status(order_no)
+                status_result = self.get_order_status(
+                    order_no,
+                    ord_gno_brno=query_branch_no or None,
+                )
                 poll_count += 1
                 all_rows = status_result.get("orders") or []
                 last_total_count = int(
@@ -1634,10 +1656,16 @@ class KISApi:
         
         # 최종 상태 확인
         try:
-            final_status = self.get_order_status(order_no)
+            final_status = self.get_order_status(
+                order_no,
+                ord_gno_brno=query_branch_no or None,
+            )
             final_orders = _target_orders(final_status.get("orders", []))
             if not final_orders:
-                fallback_status = self.get_order_status(None)
+                fallback_status = self.get_order_status(
+                    None,
+                    ord_gno_brno=query_branch_no or None,
+                )
                 final_orders = _target_orders(fallback_status.get("orders", []))
             if not final_orders:
                 today = datetime.now(KST).date()
@@ -1646,8 +1674,13 @@ class KISApi:
                     order_no=None,
                     trade_date=prev_day,
                     end_date=today,
+                    ord_gno_brno=query_branch_no or None,
                 )
                 final_orders = _target_orders(window_status.get("orders", []))
+            if not final_orders and query_branch_no:
+                # 주문지점번호가 맞지 않는 경우를 대비해 마지막으로 지점번호 없이 재조회
+                unscoped_status = self.get_order_status(order_no)
+                final_orders = _target_orders(unscoped_status.get("orders", []))
 
             if final_orders:
                 final_order = max(

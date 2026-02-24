@@ -290,7 +290,8 @@ class TestOrderAPIResponses:
             "msg1": "주문 접수 완료",
             "output": {
                 "ODNO": "0001234567",
-                "ODRNO": "1"
+                "ODRNO": "1",
+                "KRX_FWDG_ORD_ORGNO": "00950",
             }
         }
         mock_post.return_value = mock_response
@@ -298,16 +299,17 @@ class TestOrderAPIResponses:
         with patch.object(KISApi, '_wait_for_rate_limit', return_value=None):
             api = KISApi(is_paper_trading=True)
             api.access_token = "test_token"
-            
-            result = api.place_buy_order(
-                stock_code="005930",
-                quantity=10,
-                price=0,
-                order_type="01"
-            )
+            with patch.object(api, "get_access_token", return_value="test_token"):
+                result = api.place_buy_order(
+                    stock_code="005930",
+                    quantity=10,
+                    price=0,
+                    order_type="01"
+                )
         
         assert result["success"] is True
         assert result["order_no"] == "0001234567"
+        assert result["branch_no"] == "00950"
     
     @patch('api.kis_api.requests.post')
     def test_buy_order_failure_response(self, mock_post):
@@ -325,13 +327,13 @@ class TestOrderAPIResponses:
         with patch.object(KISApi, '_wait_for_rate_limit', return_value=None):
             api = KISApi(is_paper_trading=True)
             api.access_token = "test_token"
-            
-            result = api.place_buy_order(
-                stock_code="005930",
-                quantity=10,
-                price=0,
-                order_type="01"
-            )
+            with patch.object(api, "get_access_token", return_value="test_token"):
+                result = api.place_buy_order(
+                    stock_code="005930",
+                    quantity=10,
+                    price=0,
+                    order_type="01"
+                )
         
         assert result["success"] is False
         assert "잔고 부족" in result["message"]
@@ -347,7 +349,8 @@ class TestOrderAPIResponses:
             "msg1": "주문 접수 완료",
             "output": {
                 "ODNO": "0001234568",
-                "ODRNO": "2"
+                "ODRNO": "2",
+                "KRX_FWDG_ORD_ORGNO": "00950",
             }
         }
         mock_post.return_value = mock_response
@@ -355,16 +358,17 @@ class TestOrderAPIResponses:
         with patch.object(KISApi, '_wait_for_rate_limit', return_value=None):
             api = KISApi(is_paper_trading=True)
             api.access_token = "test_token"
-            
-            result = api.place_sell_order(
-                stock_code="005930",
-                quantity=10,
-                price=0,
-                order_type="01"
-            )
+            with patch.object(api, "get_access_token", return_value="test_token"):
+                result = api.place_sell_order(
+                    stock_code="005930",
+                    quantity=10,
+                    price=0,
+                    order_type="01"
+                )
         
         assert result["success"] is True
         assert result["order_no"] == "0001234568"
+        assert result["branch_no"] == "00950"
 
     @patch('api.kis_api.requests.post')
     def test_buy_order_logs_request_when_debug_enabled(self, mock_post):
@@ -513,6 +517,27 @@ class TestExecutionStatusResponses:
         assert params.get("INQR_END_DT") == "20260223"
 
     @patch('api.kis_api.requests.get')
+    def test_get_order_status_accepts_order_branch_no(self, mock_get):
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"rt_cd": "0", "output1": []}
+        mock_get.return_value = mock_response
+
+        with patch.object(KISApi, '_wait_for_rate_limit', return_value=None):
+            api = KISApi(is_paper_trading=True)
+            api.access_token = "test_token"
+            with patch.object(api, "get_access_token", return_value="test_token"):
+                result = api.get_order_status(
+                    order_no="0000014023",
+                    ord_gno_brno="00950",
+                )
+
+        assert result["success"] is True
+        params = mock_get.call_args.kwargs.get("params") or {}
+        assert params.get("ODNO") == "0000014023"
+        assert params.get("ORD_GNO_BRNO") == "00950"
+
+    @patch('api.kis_api.requests.get')
     def test_get_order_status_parses_output2_alt_fields(self, mock_get):
         """output2/대체 키 포맷도 체결 행으로 파싱해야 합니다."""
         mock_response = Mock()
@@ -652,7 +677,7 @@ class TestExecutionStatusResponses:
             api = KISApi(is_paper_trading=True)
             api.access_token = "test_token"
 
-        def _fake_get_order_status(_query_order_no=None):
+        def _fake_get_order_status(_query_order_no=None, **_kwargs):
             return {
                 "success": True,
                 "orders": [
@@ -697,7 +722,7 @@ class TestExecutionStatusResponses:
 
         calls = {"filtered": 0, "all": 0}
 
-        def _fake_get_order_status(query_order_no=None):
+        def _fake_get_order_status(query_order_no=None, **_kwargs):
             if query_order_no:
                 calls["filtered"] += 1
                 return {"success": True, "orders": []}
@@ -730,6 +755,46 @@ class TestExecutionStatusResponses:
         assert result["status"] == "FILLED"
         assert calls["filtered"] >= 1
         assert calls["all"] >= 1
+
+    def test_wait_for_execution_passes_order_branch_no(self):
+        with patch.object(KISApi, '_wait_for_rate_limit', return_value=None):
+            api = KISApi(is_paper_trading=True)
+            api.access_token = "test_token"
+
+        observed = []
+
+        def _fake_get_order_status(query_order_no=None, **kwargs):
+            observed.append((query_order_no, kwargs.get("ord_gno_brno")))
+            return {
+                "success": True,
+                "orders": [
+                    {
+                        "order_no": query_order_no or "0000014023",
+                        "exec_qty": 1,
+                        "exec_price": 21900.0,
+                        "remain_qty": 0,
+                        "side": "BUY",
+                        "executed_at": None,
+                    }
+                ],
+            }
+
+        api.get_order_status = _fake_get_order_status
+        api.cancel_order = lambda _order_no: {"success": True}
+
+        result = api.wait_for_execution(
+            order_no="0000014023",
+            expected_qty=1,
+            timeout_seconds=1,
+            check_interval=0,
+            ord_gno_brno="00950",
+        )
+
+        assert result["success"] is True
+        assert result["status"] == "FILLED"
+        assert observed
+        assert observed[0][0] == "0000014023"
+        assert observed[0][1] == "00950"
 
 
 class TestCurrentPriceAPI:
