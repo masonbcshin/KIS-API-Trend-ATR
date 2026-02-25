@@ -29,6 +29,8 @@ class DummyDB:
         positions_rows=None,
         position_columns=None,
         table_exists_map=None,
+        sell_backfill_row=None,
+        latest_buy_row=None,
     ):
         self.trades = trades or []
         self.snapshot_first = snapshot_first
@@ -40,6 +42,8 @@ class DummyDB:
         self.positions_rows = positions_rows or []
         self.position_columns = position_columns or []
         self.table_exists_map = table_exists_map or {}
+        self.sell_backfill_row = sell_backfill_row
+        self.latest_buy_row = latest_buy_row
         self.commands = []
         self.config = SimpleNamespace(database="kis_trading")
 
@@ -71,6 +75,10 @@ class DummyDB:
             result = self.positions_rows
         elif "from trades" in q and "reason in" in q:
             result = self.risk_reason_rows
+        elif "from trades" in q and "side = 'sell'" in q and "order_no is not null" in q:
+            result = self.sell_backfill_row
+        elif "from trades" in q and "side = 'buy'" in q and "executed_at <=" in q:
+            result = self.latest_buy_row
         elif "from order_state" in q:
             result = self.order_state_row or {"failed_count": 0, "cancelled_count": 0}
         else:
@@ -115,6 +123,61 @@ def test_calculate_trade_metrics_with_sample_trades():
     assert metrics["buy_count"] == 2
     assert metrics["sell_count"] == 2
     assert metrics["win_rate"] == 50.0
+
+
+def test_calculate_trade_metrics_dedups_same_order_no_rows():
+    sample_trades = [
+        {
+            "symbol": "024060",
+            "side": "BUY",
+            "quantity": 1,
+            "price": 22200,
+            "order_no": "0000012426",
+            "pnl": None,
+            "reason": None,
+            "executed_at": "2026-02-25T12:06:33+09:00",
+        },
+        {
+            "symbol": "024060",
+            "side": "BUY",
+            "quantity": 1,
+            "price": 22200,
+            "order_no": "0000012426",
+            "pnl": None,
+            "reason": "BUY_FILLED",
+            "executed_at": "2026-02-25T12:06:33+09:00",
+        },
+        {
+            "symbol": "024060",
+            "side": "SELL",
+            "quantity": 1,
+            "price": 22200,
+            "entry_price": 22200,
+            "order_no": "0000012427",
+            "pnl": 0.0,
+            "reason": "MANUAL_EXIT",
+            "executed_at": "2026-02-25T12:06:36+09:00",
+        },
+        {
+            "symbol": "024060",
+            "side": "SELL",
+            "quantity": 1,
+            "price": 22200,
+            "order_no": "0000012427",
+            "pnl": None,
+            "reason": "BROKER_RECONCILE",
+            "executed_at": "2026-02-25T12:06:36+09:00",
+        },
+    ]
+
+    metrics = DailyReportService.calculate_trade_metrics(sample_trades)
+
+    assert metrics["total_trades"] == 2
+    assert metrics["buy_count"] == 1
+    assert metrics["sell_count"] == 1
+    assert metrics["realized_pnl"] == 0.0
+    assert metrics["win_count"] == 0
+    assert metrics["loss_count"] == 0
 
 
 def test_snapshot_missing_marks_na_in_message():
@@ -319,6 +382,57 @@ def test_reconcile_trades_from_broker_inserts_filled_orders_only():
     assert len(fake_repo.saved) == 1
     assert fake_repo.saved[0]["symbol"] == "000660"
     assert fake_repo.saved[0]["side"] == "SELL"
+    assert fake_repo.saved[0]["dedup_on_order_no"] is True
+    assert fake_repo.saved[0]["upsert_missing_fields"] is True
+
+
+def test_reconcile_trades_from_broker_backfills_sell_fields():
+    db = DummyDB(
+        table_exists_map={"daily_summary": False, "positions": False, "order_state": False},
+        sell_backfill_row={"entry_price": 22200.0, "pnl": 0.0, "pnl_percent": 0.0, "reason": "MANUAL_EXIT"},
+    )
+    service = _create_service(db)
+
+    class FakeApi:
+        def get_order_status(self, order_no=None, trade_date=None, end_date=None):
+            return {
+                "success": True,
+                "orders": [
+                    {
+                        "order_no": "0000012427",
+                        "stock_code": "024060",
+                        "side": "SELL",
+                        "exec_qty": 1,
+                        "exec_price": 22200.0,
+                        "executed_at": "2026-02-25T12:06:36+09:00",
+                        "exec_id": "A1",
+                    }
+                ],
+            }
+
+    class FakeTradeRepo:
+        def __init__(self):
+            self.mode = "PAPER"
+            self.saved = []
+
+        def save_execution_fill(self, **kwargs):
+            self.saved.append(kwargs)
+            return None, True
+
+    fake_repo = FakeTradeRepo()
+    stats = service.reconcile_trades_from_broker(
+        trade_date=date(2026, 2, 25),
+        attempts=1,
+        interval_seconds=0.0,
+        api_client=FakeApi(),
+        trade_repo=fake_repo,
+    )
+
+    assert stats["inserted_trades"] == 1
+    assert len(fake_repo.saved) == 1
+    assert fake_repo.saved[0]["entry_price"] == 22200.0
+    assert fake_repo.saved[0]["pnl"] == 0.0
+    assert fake_repo.saved[0]["pnl_percent"] == 0.0
 
 
 def test_reconcile_trades_from_broker_skips_non_order_modes():

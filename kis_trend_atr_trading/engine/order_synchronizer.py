@@ -873,12 +873,18 @@ class OrderSynchronizer:
         
         # 3. 체결 대기
         logger.info(f"[SYNC] 체결 대기 중: 주문번호={order_no}")
-        
+        before_qty = self._to_int(holding_before.get("qty"), 0) if holding_before else None
+        before_avg_price = self._to_float(holding_before.get("avg_price"), 0.0) if holding_before else None
+
         exec_result = self.api.wait_for_execution(
             order_no=order_no,
             expected_qty=quantity,
             timeout_seconds=self.execution_timeout,
             ord_gno_brno=order_branch_no or None,
+            stock_code=stock_code,
+            side="BUY",
+            holding_before_qty=before_qty,
+            holding_before_avg_price=before_avg_price,
         )
         
         # 4. 결과 반환
@@ -1039,6 +1045,7 @@ class OrderSynchronizer:
             filled_qty=0,
             remaining_qty=quantity
         )
+        holding_before = self._get_holding_snapshot(stock_code)
 
         # 2. 매도 주문 전송
         timeout = self.execution_timeout * 3 if is_emergency else self.execution_timeout
@@ -1103,12 +1110,18 @@ class OrderSynchronizer:
         
         # 3. 체결 대기
         logger.info(f"[SYNC] 체결 대기 중: 주문번호={order_no}, 타임아웃={timeout}초")
-        
+        before_qty = self._to_int(holding_before.get("qty"), 0) if holding_before else None
+        before_avg_price = self._to_float(holding_before.get("avg_price"), 0.0) if holding_before else None
+
         exec_result = self.api.wait_for_execution(
             order_no=order_no,
             expected_qty=quantity,
             timeout_seconds=timeout,
             ord_gno_brno=order_branch_no or None,
+            stock_code=stock_code,
+            side="SELL",
+            holding_before_qty=before_qty,
+            holding_before_avg_price=before_avg_price,
         )
         
         # 4. 결과 반환

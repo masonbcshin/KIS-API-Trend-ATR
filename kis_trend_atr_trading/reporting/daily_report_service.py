@@ -79,24 +79,80 @@ class DailyReportService:
         self._symbol_resolver = symbol_resolver or get_symbol_resolver()
         self._mode = mode or get_db_namespace_mode()
 
+    @classmethod
+    def _normalize_trade_row_for_report(cls, row: Dict[str, Any]) -> Dict[str, Any]:
+        side = str(row.get("side") or "").upper().strip()
+        reason = str(row.get("reason") or "").upper().strip()
+        quantity = int(row.get("quantity") or 0)
+        price = cls._to_float_or_none(row.get("price")) or 0.0
+
+        return {
+            "symbol": str(row.get("symbol") or "").strip(),
+            "side": side,
+            "quantity": quantity,
+            "price": float(price),
+            "entry_price": cls._to_float_or_none(row.get("entry_price")),
+            "pnl": cls._to_float_or_none(row.get("pnl")),
+            "reason": reason,
+            "order_no": cls._normalize_order_no(row.get("order_no")),
+            "executed_at": row.get("executed_at"),
+        }
+
     @staticmethod
-    def calculate_trade_metrics(trades: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
-        """Calculate realized PnL and trade stats from raw trades."""
-        normalized: List[Dict[str, Any]] = []
-        for row in trades:
-            reason = str(row.get("reason") or "").upper()
-            if reason == "SIGNAL_ONLY":
+    def _trade_row_priority(row: Dict[str, Any]) -> Tuple[int, int, int, int]:
+        reason = str(row.get("reason") or "").upper().strip()
+        return (
+            0 if reason == "BROKER_RECONCILE" else 1,
+            1 if row.get("pnl") is not None else 0,
+            1 if row.get("entry_price") is not None else 0,
+            1 if reason else 0,
+        )
+
+    @classmethod
+    def _build_trade_execution_key(cls, row: Dict[str, Any]) -> Tuple[Any, ...]:
+        side = str(row.get("side") or "").upper().strip()
+        order_no = cls._normalize_order_no(row.get("order_no"))
+        if order_no:
+            return ("ORDER", side, order_no)
+
+        executed_at = row.get("executed_at")
+        if isinstance(executed_at, datetime):
+            executed_at_key = executed_at.isoformat()
+        else:
+            executed_at_key = str(executed_at or "")
+
+        return (
+            "FALLBACK",
+            side,
+            str(row.get("symbol") or "").strip(),
+            executed_at_key,
+            int(row.get("quantity") or 0),
+            round(float(row.get("price") or 0.0), 2),
+        )
+
+    @classmethod
+    def _dedup_trades_for_report(cls, trades: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        deduped: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+        for raw in trades:
+            normalized = cls._normalize_trade_row_for_report(raw)
+            if normalized["reason"] == "SIGNAL_ONLY":
                 continue
-            side = str(row.get("side") or "").upper()
-            pnl_raw = row.get("pnl")
-            pnl = float(pnl_raw) if pnl_raw is not None else None
-            normalized.append(
-                {
-                    "symbol": str(row.get("symbol") or ""),
-                    "side": side,
-                    "pnl": pnl,
-                }
-            )
+
+            key = cls._build_trade_execution_key(normalized)
+            current = deduped.get(key)
+            if current is None:
+                deduped[key] = normalized
+                continue
+
+            if cls._trade_row_priority(normalized) > cls._trade_row_priority(current):
+                deduped[key] = normalized
+
+        return list(deduped.values())
+
+    @classmethod
+    def calculate_trade_metrics(cls, trades: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+        """Calculate realized PnL and trade stats from raw trades."""
+        normalized = cls._dedup_trades_for_report(trades)
 
         buy_count = sum(1 for row in normalized if row["side"] == "BUY")
         sell_rows = [row for row in normalized if row["side"] == "SELL"]
@@ -302,6 +358,130 @@ class DailyReportService:
 
         return KST.localize(datetime.combine(fallback_date, datetime.min.time()))
 
+    @classmethod
+    def _build_order_no_match_clause(cls, order_no: Optional[str]) -> Tuple[str, List[Any]]:
+        raw_order_no = str(order_no or "").strip()
+        normalized_order_no = cls._normalize_order_no(raw_order_no)
+        order_values: List[str] = []
+        for value in (raw_order_no, normalized_order_no):
+            if value and value not in order_values:
+                order_values.append(value)
+
+        if not order_values:
+            return "1 = 0", []
+
+        placeholders = ", ".join(["%s"] * len(order_values))
+        clauses = [f"order_no IN ({placeholders})"]
+        params: List[Any] = list(order_values)
+        if normalized_order_no.isdigit():
+            clauses.append("CAST(order_no AS UNSIGNED) = %s")
+            params.append(int(normalized_order_no))
+        return "(" + " OR ".join(clauses) + ")", params
+
+    def _find_sell_backfill_source(
+        self,
+        *,
+        symbol: str,
+        order_no: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        order_match_sql, order_params = self._build_order_no_match_clause(order_no)
+        if not order_params:
+            return None
+
+        try:
+            return self._db.execute_query(
+                f"""
+                SELECT entry_price, pnl, pnl_percent, reason
+                FROM trades
+                WHERE mode = %s
+                  AND symbol = %s
+                  AND side = 'SELL'
+                  AND order_no IS NOT NULL
+                  AND {order_match_sql}
+                  AND (entry_price IS NOT NULL OR pnl IS NOT NULL OR pnl_percent IS NOT NULL)
+                ORDER BY
+                    CASE WHEN UPPER(COALESCE(reason, '')) = 'BROKER_RECONCILE' THEN 1 ELSE 0 END ASC,
+                    executed_at DESC,
+                    id DESC
+                LIMIT 1
+                """,
+                (self._mode, symbol, *order_params),
+                fetch_one=True,
+            )
+        except Exception as err:
+            logger.warning(
+                "[REPORT_RECONCILE] sell 백필 소스 조회 실패: symbol=%s order_no=%s err=%s",
+                symbol,
+                order_no,
+                err,
+            )
+            return None
+
+    def _find_latest_buy_price(
+        self,
+        *,
+        symbol: str,
+        executed_at: datetime,
+    ) -> Optional[float]:
+        try:
+            row = self._db.execute_query(
+                """
+                SELECT price
+                FROM trades
+                WHERE mode = %s
+                  AND symbol = %s
+                  AND side = 'BUY'
+                  AND COALESCE(reason, '') != 'SIGNAL_ONLY'
+                  AND executed_at <= %s
+                ORDER BY executed_at DESC, id DESC
+                LIMIT 1
+                """,
+                (self._mode, symbol, executed_at),
+                fetch_one=True,
+            )
+        except Exception as err:
+            logger.warning(
+                "[REPORT_RECONCILE] 최근 BUY 조회 실패: symbol=%s executed_at=%s err=%s",
+                symbol,
+                executed_at,
+                err,
+            )
+            return None
+        return self._to_float_or_none((row or {}).get("price"))
+
+    def _build_reconcile_sell_backfill(
+        self,
+        *,
+        symbol: str,
+        order_no: Optional[str],
+        executed_at: datetime,
+        sell_price: float,
+        quantity: int,
+    ) -> Dict[str, Optional[float]]:
+        entry_price: Optional[float] = None
+        pnl: Optional[float] = None
+        pnl_percent: Optional[float] = None
+
+        source = self._find_sell_backfill_source(symbol=symbol, order_no=order_no)
+        if source:
+            entry_price = self._to_float_or_none(source.get("entry_price"))
+            pnl = self._to_float_or_none(source.get("pnl"))
+            pnl_percent = self._to_float_or_none(source.get("pnl_percent"))
+
+        if entry_price is None:
+            entry_price = self._find_latest_buy_price(symbol=symbol, executed_at=executed_at)
+
+        if pnl is None and entry_price is not None:
+            pnl = (float(sell_price) - float(entry_price)) * int(quantity)
+        if pnl_percent is None and entry_price not in (None, 0):
+            pnl_percent = ((float(sell_price) / float(entry_price)) - 1.0) * 100.0
+
+        return {
+            "entry_price": entry_price,
+            "pnl": pnl,
+            "pnl_percent": pnl_percent,
+        }
+
     def reconcile_trades_from_broker(
         self,
         trade_date: date,
@@ -401,6 +581,15 @@ class DailyReportService:
             stats["filled_orders"] += 1
             executed_at = self._parse_broker_executed_at(row.get("executed_at"), trade_date)
             reason = "BROKER_RECONCILE" if side == "SELL" else None
+            sell_backfill = {"entry_price": None, "pnl": None, "pnl_percent": None}
+            if side == "SELL":
+                sell_backfill = self._build_reconcile_sell_backfill(
+                    symbol=symbol,
+                    order_no=order_no,
+                    executed_at=executed_at,
+                    sell_price=price,
+                    quantity=qty,
+                )
 
             try:
                 _, created = trade_repo.save_execution_fill(
@@ -412,6 +601,11 @@ class DailyReportService:
                     order_no=order_no,
                     exec_id=exec_id,
                     reason=reason,
+                    entry_price=sell_backfill["entry_price"],
+                    pnl=sell_backfill["pnl"],
+                    pnl_percent=sell_backfill["pnl_percent"],
+                    dedup_on_order_no=True,
+                    upsert_missing_fields=True,
                 )
                 if created:
                     stats["inserted_trades"] += 1
@@ -444,7 +638,7 @@ class DailyReportService:
     def _load_trades(self, trade_date: date) -> List[Dict[str, Any]]:
         rows = self._db.execute_query(
             """
-            SELECT symbol, side, pnl, reason, executed_at
+            SELECT symbol, side, quantity, price, entry_price, pnl, reason, order_no, executed_at
             FROM trades
             WHERE DATE(executed_at) = %s AND mode = %s
             ORDER BY executed_at
@@ -455,23 +649,19 @@ class DailyReportService:
 
     def _build_symbol_summaries(self, trades: Iterable[Dict[str, Any]]) -> List[ReportSymbolSummary]:
         by_symbol: Dict[str, Dict[str, float]] = {}
-        for row in trades:
-            reason = str(row.get("reason") or "").upper()
-            if reason == "SIGNAL_ONLY":
+        for row in self._dedup_trades_for_report(trades):
+            if row["side"] != "SELL":
                 continue
-            if str(row.get("side") or "").upper() != "SELL":
-                continue
-            pnl_raw = row.get("pnl")
-            if pnl_raw is None:
+            pnl = self._to_float_or_none(row.get("pnl"))
+            if pnl is None:
                 continue
 
             symbol = str(row.get("symbol") or "").strip()
             if not symbol:
                 continue
-            pnl = float(pnl_raw)
 
             bucket = by_symbol.setdefault(symbol, {"pnl": 0.0, "sell_count": 0.0})
-            bucket["pnl"] += pnl
+            bucket["pnl"] += float(pnl)
             bucket["sell_count"] += 1.0
 
         summaries = [

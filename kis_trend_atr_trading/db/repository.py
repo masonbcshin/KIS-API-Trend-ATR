@@ -1001,6 +1001,119 @@ class TradeRepository:
         self.db = db or get_db_manager()
         self.mode = _get_namespace_mode()
 
+    @staticmethod
+    def _normalize_order_no(value: Any) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        if not digits:
+            return raw
+        try:
+            return str(int(digits))
+        except Exception:
+            return digits.lstrip("0") or "0"
+
+    def _find_trade_by_order_no_side(self, *, order_no: str, side: str) -> Optional[Dict[str, Any]]:
+        raw_order_no = str(order_no or "").strip()
+        normalized_order_no = self._normalize_order_no(raw_order_no)
+        candidates: List[str] = []
+        for value in (raw_order_no, normalized_order_no):
+            if value and value not in candidates:
+                candidates.append(value)
+        if not candidates:
+            return None
+
+        in_placeholders = ", ".join(["%s"] * len(candidates))
+        order_conditions = [f"order_no IN ({in_placeholders})"]
+        order_params: List[Any] = list(candidates)
+
+        if normalized_order_no.isdigit():
+            order_conditions.append("CAST(order_no AS UNSIGNED) = %s")
+            order_params.append(int(normalized_order_no))
+
+        try:
+            return self.db.execute_query(
+                f"""
+                SELECT *
+                FROM trades
+                WHERE mode = %s
+                  AND side = %s
+                  AND order_no IS NOT NULL
+                  AND ({' OR '.join(order_conditions)})
+                ORDER BY executed_at DESC, id DESC
+                LIMIT 1
+                """,
+                (self.mode, side, *order_params),
+                fetch_one=True,
+            )
+        except QueryError as e:
+            logger.warning(f"[REPO] order_no 중복 조회 실패: order_no={raw_order_no}, side={side}, err={e}")
+            return None
+
+    def _upsert_missing_fill_fields(
+        self,
+        existing_row: Dict[str, Any],
+        *,
+        reason: Optional[str] = None,
+        entry_price: Optional[float] = None,
+        holding_days: Optional[int] = None,
+        pnl: Optional[float] = None,
+        pnl_percent: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        if not existing_row:
+            return existing_row
+
+        trade_id = existing_row.get("id")
+        if trade_id is None:
+            return existing_row
+
+        updates: List[str] = []
+        params: List[Any] = []
+
+        existing_reason = str(existing_row.get("reason") or "").strip()
+        if reason and not existing_reason:
+            updates.append("reason = %s")
+            params.append(reason)
+
+        if entry_price is not None and existing_row.get("entry_price") is None:
+            updates.append("entry_price = %s")
+            params.append(float(entry_price))
+
+        if holding_days is not None and existing_row.get("holding_days") is None:
+            updates.append("holding_days = %s")
+            params.append(int(holding_days))
+
+        if pnl is not None and existing_row.get("pnl") is None:
+            updates.append("pnl = %s")
+            params.append(float(pnl))
+
+        if pnl_percent is not None and existing_row.get("pnl_percent") is None:
+            updates.append("pnl_percent = %s")
+            params.append(float(pnl_percent))
+
+        if not updates:
+            return existing_row
+
+        try:
+            self.db.execute_command(
+                f"""
+                UPDATE trades
+                SET {", ".join(updates)}
+                WHERE id = %s AND mode = %s
+                """,
+                (*params, trade_id, self.mode),
+            )
+            refreshed = self.db.execute_query(
+                "SELECT * FROM trades WHERE id = %s AND mode = %s LIMIT 1",
+                (trade_id, self.mode),
+                fetch_one=True,
+            )
+            return refreshed or existing_row
+        except QueryError as e:
+            logger.warning(f"[REPO] 체결 보강 업서트 실패: id={trade_id}, err={e}")
+            return existing_row
+
     def save_execution_fill(
         self,
         *,
@@ -1017,6 +1130,8 @@ class TradeRepository:
         pnl: Any = None,
         pnl_percent: Any = None,
         idempotency_key: str = None,
+        dedup_on_order_no: bool = False,
+        upsert_missing_fields: bool = False,
     ) -> Tuple[Optional[TradeRecord], bool]:
         """
         fill 단위 거래를 저장합니다.
@@ -1059,6 +1174,29 @@ class TradeRepository:
                         self.mode,
                     )
                 )
+
+        if dedup_on_order_no and order_no:
+            existing_order_row = self._find_trade_by_order_no_side(
+                order_no=order_no,
+                side=side_upper,
+            )
+            if existing_order_row:
+                if upsert_missing_fields:
+                    existing_order_row = self._upsert_missing_fill_fields(
+                        existing_order_row=existing_order_row,
+                        reason=reason,
+                        entry_price=float(entry_price_dec) if entry_price_dec is not None else None,
+                        holding_days=int(holding_days) if holding_days is not None else None,
+                        pnl=float(pnl_dec) if pnl_dec is not None else None,
+                        pnl_percent=float(pnl_pct_dec) if pnl_pct_dec is not None else None,
+                    )
+                logger.info(
+                    "[REPO] 체결 중복(order_no) skip: symbol=%s side=%s order_no=%s",
+                    symbol,
+                    side_upper,
+                    order_no,
+                )
+                return (self._to_record(existing_order_row) if existing_order_row else None, False)
 
         sql = """
             INSERT INTO trades (
