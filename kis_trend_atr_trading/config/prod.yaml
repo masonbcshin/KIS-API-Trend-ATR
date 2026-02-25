@@ -69,7 +69,8 @@ order:
     buy: "TTTC0802U"   # 실계좌 매수
     sell: "TTTC0801U"  # 실계좌 매도
     balance: "TTTC8434R"  # 실계좌 잔고조회
-    order_status: "TTTC8001R"  # 실계좌 주문조회
+    order_status: "TTTC0081R"  # 실계좌 주문조회 (최근 3개월)
+    order_status_historical: "CTSC9215R"  # 실계좌 주문조회 (3개월 이전)
 
 # ────────────────────────────────────────────────────────────────
 # 전략 파라미터

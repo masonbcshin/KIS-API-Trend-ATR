@@ -58,7 +58,8 @@ order:
     buy: "VTTC0802U"   # 모의투자 매수
     sell: "VTTC0801U"  # 모의투자 매도
     balance: "VTTC8434R"  # 모의투자 잔고조회
-    order_status: "VTTC8001R"  # 모의투자 주문조회
+    order_status: "VTTC0081R"  # 모의투자 주문조회 (최근 3개월)
+    order_status_historical: "VTSC9215R"  # 모의투자 주문조회 (3개월 이전)
 
 # ────────────────────────────────────────────────────────────────
 # 전략 파라미터

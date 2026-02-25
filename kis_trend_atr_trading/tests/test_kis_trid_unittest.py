@@ -67,7 +67,8 @@ class TestKISTrIdMapping(unittest.TestCase):
         api = KISApi(app_key="k", app_secret="s", account_no="00000000", is_paper_trading=True)
         self.assertEqual(api._resolve_tr_id("order_buy"), "VTTC0802U")
         self.assertEqual(api._resolve_tr_id("order_sell"), "VTTC0801U")
-        self.assertEqual(api._resolve_tr_id("order_status"), "VTTC8001R")
+        self.assertEqual(api._resolve_tr_id("order_status"), "VTTC0081R")
+        self.assertEqual(api._resolve_tr_id("order_status_historical"), "VTSC9215R")
         self.assertEqual(api._resolve_tr_id("order_cancel"), "VTTC0803U")
         self.assertEqual(api._resolve_tr_id("balance"), "VTTC8434R")
 
@@ -75,7 +76,8 @@ class TestKISTrIdMapping(unittest.TestCase):
         api = KISApi(app_key="k", app_secret="s", account_no="00000000", is_paper_trading=False)
         self.assertEqual(api._resolve_tr_id("order_buy"), "TTTC0802U")
         self.assertEqual(api._resolve_tr_id("order_sell"), "TTTC0801U")
-        self.assertEqual(api._resolve_tr_id("order_status"), "TTTC8001R")
+        self.assertEqual(api._resolve_tr_id("order_status"), "TTTC0081R")
+        self.assertEqual(api._resolve_tr_id("order_status_historical"), "CTSC9215R")
         self.assertEqual(api._resolve_tr_id("order_cancel"), "TTTC0803U")
         self.assertEqual(api._resolve_tr_id("balance"), "TTTC8434R")
 

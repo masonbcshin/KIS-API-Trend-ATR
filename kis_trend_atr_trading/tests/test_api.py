@@ -517,6 +517,54 @@ class TestExecutionStatusResponses:
         assert params.get("INQR_END_DT") == "20260223"
 
     @patch('api.kis_api.requests.get')
+    def test_get_order_status_uses_recent_tr_id_within_3_months(self, mock_get):
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"rt_cd": "0", "output1": []}
+        mock_get.return_value = mock_response
+
+        trade_day = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d")
+        end_day = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+        with patch.object(KISApi, '_wait_for_rate_limit', return_value=None):
+            api = KISApi(is_paper_trading=True)
+            api.access_token = "test_token"
+            with patch.object(api, "get_access_token", return_value="test_token"):
+                result = api.get_order_status(
+                    order_no=None,
+                    trade_date=trade_day,
+                    end_date=end_day,
+                )
+
+        assert result["success"] is True
+        headers = mock_get.call_args.kwargs.get("headers") or {}
+        assert headers.get("tr_id") == "VTTC0081R"
+
+    @patch('api.kis_api.requests.get')
+    def test_get_order_status_uses_historical_tr_id_over_3_months(self, mock_get):
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"rt_cd": "0", "output1": []}
+        mock_get.return_value = mock_response
+
+        trade_day = (datetime.now() - timedelta(days=130)).strftime("%Y-%m-%d")
+        end_day = (datetime.now() - timedelta(days=120)).strftime("%Y-%m-%d")
+
+        with patch.object(KISApi, '_wait_for_rate_limit', return_value=None):
+            api = KISApi(is_paper_trading=True)
+            api.access_token = "test_token"
+            with patch.object(api, "get_access_token", return_value="test_token"):
+                result = api.get_order_status(
+                    order_no=None,
+                    trade_date=trade_day,
+                    end_date=end_day,
+                )
+
+        assert result["success"] is True
+        headers = mock_get.call_args.kwargs.get("headers") or {}
+        assert headers.get("tr_id") == "VTSC9215R"
+
+    @patch('api.kis_api.requests.get')
     def test_get_order_status_accepts_order_branch_no(self, mock_get):
         mock_response = Mock()
         mock_response.status_code = 200
@@ -795,6 +843,98 @@ class TestExecutionStatusResponses:
         assert observed
         assert observed[0][0] == "0000014023"
         assert observed[0][1] == "00950"
+
+    def test_wait_for_execution_buy_holding_fallback_when_order_rows_empty(self):
+        with patch.object(KISApi, "_wait_for_rate_limit", return_value=None):
+            api = KISApi(is_paper_trading=True)
+            api.access_token = "test_token"
+
+        def _fake_get_order_status(_query_order_no=None, **_kwargs):
+            return {
+                "success": True,
+                "orders": [],
+                "summary": {
+                    "tot_ccld_qty": 6,
+                    "tot_ccld_amt": 756500,
+                },
+            }
+
+        api.get_order_status = _fake_get_order_status
+        api.get_holdings = lambda: [
+            {"stock_code": "024060", "qty": 1, "avg_price": 22050}
+        ]
+        api.cancel_order = lambda _order_no: {"success": True}
+
+        result = api.wait_for_execution(
+            order_no="0000009792",
+            expected_qty=1,
+            timeout_seconds=1,
+            check_interval=0,
+            stock_code="024060",
+            side="BUY",
+            holding_before_qty=0,
+            holding_before_avg_price=0.0,
+        )
+
+        assert result["success"] is True
+        assert result["status"] == "FILLED"
+        assert result["exec_qty"] == 1
+        assert result["exec_price"] == 22050.0
+
+    def test_wait_for_execution_sell_holding_fallback_uses_summary_delta_price(self):
+        with patch.object(KISApi, "_wait_for_rate_limit", return_value=None):
+            api = KISApi(is_paper_trading=True)
+            api.access_token = "test_token"
+
+        status_calls = {"count": 0}
+
+        def _fake_get_order_status(_query_order_no=None, **_kwargs):
+            status_calls["count"] += 1
+            if status_calls["count"] == 1:
+                return {
+                    "success": True,
+                    "orders": [],
+                    "summary": {
+                        "tot_ccld_qty": 6,
+                        "tot_ccld_amt": 756500,
+                    },
+                }
+            return {
+                "success": True,
+                "orders": [],
+                "summary": {
+                    "tot_ccld_qty": 7,
+                    "tot_ccld_amt": 778500,
+                },
+            }
+
+        holdings_calls = {"count": 0}
+
+        def _fake_get_holdings():
+            holdings_calls["count"] += 1
+            if holdings_calls["count"] == 1:
+                return [{"stock_code": "024060", "qty": 1, "avg_price": 22050}]
+            return []
+
+        api.get_order_status = _fake_get_order_status
+        api.get_holdings = _fake_get_holdings
+        api.cancel_order = lambda _order_no: {"success": True}
+
+        result = api.wait_for_execution(
+            order_no="0000009823",
+            expected_qty=1,
+            timeout_seconds=1,
+            check_interval=0,
+            stock_code="024060",
+            side="SELL",
+            holding_before_qty=1,
+            holding_before_avg_price=22050.0,
+        )
+
+        assert result["success"] is True
+        assert result["status"] == "FILLED"
+        assert result["exec_qty"] == 1
+        assert result["exec_price"] == 22000.0
 
 
 class TestCurrentPriceAPI:

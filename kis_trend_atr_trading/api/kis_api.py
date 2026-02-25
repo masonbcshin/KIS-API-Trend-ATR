@@ -135,14 +135,16 @@ class KISApi:
         paper_map = {
             "order_buy": "VTTC0802U",
             "order_sell": "VTTC0801U",
-            "order_status": "VTTC8001R",
+            "order_status": "VTTC0081R",
+            "order_status_historical": "VTSC9215R",
             "order_cancel": "VTTC0803U",
             "balance": "VTTC8434R",
         }
         real_map = {
             "order_buy": "TTTC0802U",
             "order_sell": "TTTC0801U",
-            "order_status": "TTTC8001R",
+            "order_status": "TTTC0081R",
+            "order_status_historical": "CTSC9215R",
             "order_cancel": "TTTC0803U",
             "balance": "TTTC8434R",
         }
@@ -243,6 +245,25 @@ class KISApi:
 
         raise ValueError(f"지원하지 않는 날짜 형식: {value}")
 
+    def _resolve_order_status_tr_id(self, start_date: str, end_date: str) -> str:
+        """
+        주문/체결 조회 TR_ID를 조회 기간에 맞춰 선택합니다.
+
+        - 최근 3개월 이내: order_status (TTTC/VTTC0081R)
+        - 3개월 이전 포함: order_status_historical (CTSC/VTSC9215R)
+        """
+        try:
+            start_dt = datetime.strptime(str(start_date), "%Y%m%d").date()
+            end_dt = datetime.strptime(str(end_date), "%Y%m%d").date()
+            oldest = min(start_dt, end_dt)
+            cutoff = datetime.now(KST).date() - timedelta(days=90)
+            if oldest <= cutoff:
+                return self._resolve_tr_id("order_status_historical")
+        except Exception:
+            # 날짜 파싱이 실패하면 기본(최근) TR로 폴백합니다.
+            pass
+        return self._resolve_tr_id("order_status")
+
     @staticmethod
     def _normalize_order_no(value: Any) -> str:
         raw = str(value or "").strip()
@@ -329,6 +350,45 @@ class KISApi:
                             path = f"{key}.{sub_key}"
                             return [row for row in sub_value if isinstance(row, dict)], path
         return [], ""
+
+    @staticmethod
+    def _resolve_first_dict_path(
+        payload: Dict[str, Any],
+        candidate_paths: List[Tuple[str, ...]],
+    ) -> Tuple[Dict[str, Any], str]:
+        def _walk(obj: Any, path: Tuple[str, ...]) -> Any:
+            current = obj
+            for key in path:
+                if not isinstance(current, dict):
+                    return None
+                current = current.get(key)
+            return current
+
+        for path in candidate_paths:
+            found = _walk(payload, path)
+            if isinstance(found, dict):
+                return found, ".".join(path)
+            if isinstance(found, list):
+                for idx, row in enumerate(found):
+                    if isinstance(row, dict):
+                        return row, f"{'.'.join(path)}[{idx}]"
+
+        if isinstance(payload, dict):
+            for key, value in payload.items():
+                if isinstance(value, dict):
+                    for sub_key, sub_value in value.items():
+                        if isinstance(sub_value, dict):
+                            return sub_value, f"{key}.{sub_key}"
+                        if isinstance(sub_value, list):
+                            for idx, row in enumerate(sub_value):
+                                if isinstance(row, dict):
+                                    return row, f"{key}.{sub_key}[{idx}]"
+                    return value, key
+                if isinstance(value, list):
+                    for idx, row in enumerate(value):
+                        if isinstance(row, dict):
+                            return row, f"{key}[{idx}]"
+        return {}, ""
 
     @staticmethod
     def _is_truthy(value: Any) -> bool:
@@ -1327,7 +1387,9 @@ class KISApi:
         
         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         KIS API Endpoint: GET /uapi/domestic-stock/v1/trading/inquire-daily-ccld
-        TR_ID: VTTC8001R (모의투자)
+        TR_ID:
+          - 최근 3개월: VTTC0081R(모의) / TTTC0081R(실전)
+          - 3개월 이전: VTSC9215R(모의) / CTSC9215R(실전)
         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         
         Args:
@@ -1340,12 +1402,11 @@ class KISApi:
             Dict: 주문 체결 내역
         """
         url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
-        
-        tr_id = self._resolve_tr_id("order_status")
-        headers = self._get_auth_headers(tr_id)
-        
+
         start_date = self._format_order_query_date(trade_date)
         query_end_date = self._format_order_query_date(end_date) if end_date is not None else start_date
+        tr_id = self._resolve_order_status_tr_id(start_date, query_end_date)
+        headers = self._get_auth_headers(tr_id)
 
         params = {
             "CANO": self.account_no,
@@ -1407,6 +1468,22 @@ class KISApi:
             ("output", "output2"),
         ]
         rows, resolved_path = self._resolve_first_list_path(data, candidate_paths)
+        summary_row, summary_path = self._resolve_first_dict_path(
+            data,
+            [
+                ("output2",),
+                ("output", "output2"),
+            ],
+        )
+        summary = {}
+        if summary_row:
+            summary = {
+                "tot_ord_qty": self._parse_numeric_int(summary_row.get("tot_ord_qty"), 0),
+                "tot_ccld_qty": self._parse_numeric_int(summary_row.get("tot_ccld_qty"), 0),
+                "tot_ccld_amt": self._parse_numeric_float(summary_row.get("tot_ccld_amt"), 0.0),
+                "pchs_avg_pric": self._parse_numeric_float(summary_row.get("pchs_avg_pric"), 0.0),
+                "resolved_path": summary_path,
+            }
 
         order_no_keys = ["odno", "ODNO", "order_no", "ord_no", "odno1", "ordn_no", "orgn_odno"]
         stock_code_keys = ["pdno", "PDNO", "stock_code", "symbol", "iscd", "mksc_shrn_iscd"]
@@ -1495,6 +1572,7 @@ class KISApi:
             "orders": orders,
             "total_count": len(orders),
             "resolved_path": resolved_path,
+            "summary": summary,
         }
     
     def wait_for_execution(
@@ -1504,6 +1582,10 @@ class KISApi:
         timeout_seconds: int = 30,
         check_interval: float = 2.0,
         ord_gno_brno: Optional[str] = None,
+        stock_code: Optional[str] = None,
+        side: Optional[str] = None,
+        holding_before_qty: Optional[int] = None,
+        holding_before_avg_price: Optional[float] = None,
     ) -> Dict:
         """
         주문 체결을 동기적으로 대기합니다.
@@ -1519,6 +1601,10 @@ class KISApi:
             timeout_seconds: 최대 대기 시간 (초)
             check_interval: 체결 확인 간격 (초)
             ord_gno_brno: 주문지점번호
+            stock_code: 체결 보정 대상 종목코드(선택)
+            side: 주문 방향("BUY"/"SELL", 선택)
+            holding_before_qty: 주문 전 보유수량(선택)
+            holding_before_avg_price: 주문 전 평균단가(선택)
         
         Returns:
             Dict: 체결 결과
@@ -1536,6 +1622,16 @@ class KISApi:
         unmatched_result_polls = 0
         last_total_count = 0
         last_observed_order_nos: List[str] = []
+        probe_symbol = str(stock_code or "").strip()
+        probe_side = str(side or "").strip().upper()
+        probe_before_qty = (
+            self._parse_numeric_int(holding_before_qty, 0)
+            if holding_before_qty is not None
+            else None
+        )
+        probe_before_avg_price = self._parse_numeric_float(holding_before_avg_price, 0.0)
+        baseline_tot_ccld_qty: Optional[int] = None
+        baseline_tot_ccld_amt: Optional[float] = None
 
         def _target_orders(order_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             matches = [
@@ -1563,6 +1659,135 @@ class KISApi:
                     }
                 )
             return fills
+
+        def _extract_summary_totals(status_payload: Dict[str, Any]) -> Optional[Tuple[int, float]]:
+            if not isinstance(status_payload, dict):
+                return None
+            summary = status_payload.get("summary")
+            if not isinstance(summary, dict):
+                return None
+            return (
+                self._parse_numeric_int(summary.get("tot_ccld_qty"), 0),
+                self._parse_numeric_float(summary.get("tot_ccld_amt"), 0.0),
+            )
+
+        def _lookup_holding_snapshot(target_symbol: str) -> Optional[Dict[str, float]]:
+            if not target_symbol:
+                return None
+            try:
+                holdings_rows = self.get_holdings()
+            except Exception as e:
+                logger.debug(
+                    "[KIS][ORDER_STATUS] holdings probe 실패: symbol=%s, err=%s",
+                    target_symbol,
+                    e,
+                )
+                return None
+
+            for row in holdings_rows or []:
+                if not isinstance(row, dict):
+                    continue
+                symbol = str(
+                    row.get("stock_code")
+                    or row.get("pdno")
+                    or row.get("symbol")
+                    or ""
+                ).strip()
+                if symbol != target_symbol:
+                    continue
+                qty = self._parse_numeric_int(
+                    row.get("qty")
+                    or row.get("hldg_qty")
+                    or row.get("quantity"),
+                    0,
+                )
+                avg_price = self._parse_numeric_float(
+                    row.get("avg_price")
+                    or row.get("pchs_avg_pric"),
+                    0.0,
+                )
+                return {"qty": max(qty, 0), "avg_price": max(avg_price, 0.0)}
+            return {"qty": 0, "avg_price": 0.0}
+
+        def _infer_execution_from_holdings(status_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            if not self.is_paper_trading:
+                return None
+            if not probe_symbol or probe_side not in ("BUY", "SELL"):
+                return None
+            if probe_before_qty is None:
+                return None
+
+            after_snapshot = _lookup_holding_snapshot(probe_symbol)
+            if after_snapshot is None:
+                return None
+
+            before_qty = max(int(probe_before_qty), 0)
+            after_qty = self._parse_numeric_int(after_snapshot.get("qty"), 0)
+            if probe_side == "BUY":
+                delta_qty = max(after_qty - before_qty, 0)
+            else:
+                delta_qty = max(before_qty - after_qty, 0)
+            if delta_qty <= 0:
+                return None
+
+            expected = max(int(expected_qty), 0)
+            exec_qty = min(delta_qty, expected) if expected > 0 else delta_qty
+            if exec_qty <= 0:
+                return None
+
+            exec_price = 0.0
+            if probe_side == "BUY":
+                exec_price = self._parse_numeric_float(after_snapshot.get("avg_price"), 0.0)
+                if exec_price <= 0:
+                    exec_price = probe_before_avg_price
+            else:
+                totals = _extract_summary_totals(status_payload)
+                if (
+                    totals
+                    and baseline_tot_ccld_qty is not None
+                    and baseline_tot_ccld_amt is not None
+                ):
+                    now_qty, now_amt = totals
+                    delta_total_qty = max(now_qty - baseline_tot_ccld_qty, 0)
+                    delta_total_amt = max(now_amt - baseline_tot_ccld_amt, 0.0)
+                    if delta_total_qty > 0 and delta_total_amt > 0:
+                        exec_price = delta_total_amt / float(delta_total_qty)
+
+            if exec_price <= 0:
+                return None
+
+            is_filled = exec_qty >= expected if expected > 0 else True
+            status = "FILLED" if is_filled else "PARTIAL"
+            logger.warning(
+                "[KIS][ORDER_STATUS] holdings 기반 %s 보정: order_no=%s, symbol=%s, before=%s, after=%s, exec_qty=%s, exec_price=%.4f",
+                probe_side,
+                order_no,
+                probe_symbol,
+                before_qty,
+                after_qty,
+                exec_qty,
+                exec_price,
+            )
+            return {
+                "success": is_filled,
+                "exec_qty": exec_qty,
+                "exec_price": exec_price,
+                "status": status,
+                "message": (
+                    f"체결조회 미응답 - 보유수량 변동으로 {status} 보정: "
+                    f"{before_qty}→{after_qty} (Δ{delta_qty})"
+                ),
+                "fills": [
+                    {
+                        "order_no": order_no,
+                        "exec_id": None,
+                        "executed_at": datetime.now(KST).isoformat(),
+                        "price": exec_price,
+                        "qty": exec_qty,
+                        "side": probe_side,
+                    }
+                ],
+            }
         
         logger.info(
             "체결 대기 시작: 주문번호=%s, 주문지점=%s, 예상수량=%s, 타임아웃=%s초",
@@ -1579,6 +1804,9 @@ class KISApi:
                     ord_gno_brno=query_branch_no or None,
                 )
                 poll_count += 1
+                summary_totals = _extract_summary_totals(status_result)
+                if summary_totals and baseline_tot_ccld_qty is None:
+                    baseline_tot_ccld_qty, baseline_tot_ccld_amt = summary_totals
                 all_rows = status_result.get("orders") or []
                 last_total_count = int(
                     status_result.get("total_count", len(all_rows)) or len(all_rows)
@@ -1586,6 +1814,9 @@ class KISApi:
                 
                 if not status_result.get("success") or not all_rows:
                     empty_result_polls += 1
+                    inferred = _infer_execution_from_holdings(status_result)
+                    if inferred is not None:
+                        return inferred
                     time.sleep(check_interval)
                     continue
 
@@ -1596,6 +1827,9 @@ class KISApi:
                         str(row.get("order_no") or "").strip()
                         for row in all_rows[:5]
                     ]
+                    inferred = _infer_execution_from_holdings(status_result)
+                    if inferred is not None:
+                        return inferred
                     time.sleep(check_interval)
                     continue
 
@@ -1660,12 +1894,17 @@ class KISApi:
                 order_no,
                 ord_gno_brno=query_branch_no or None,
             )
+            final_totals = _extract_summary_totals(final_status)
+            if final_totals and baseline_tot_ccld_qty is None:
+                baseline_tot_ccld_qty, baseline_tot_ccld_amt = final_totals
+            inference_status = final_status
             final_orders = _target_orders(final_status.get("orders", []))
             if not final_orders:
                 fallback_status = self.get_order_status(
                     None,
                     ord_gno_brno=query_branch_no or None,
                 )
+                inference_status = fallback_status
                 final_orders = _target_orders(fallback_status.get("orders", []))
             if not final_orders:
                 today = datetime.now(KST).date()
@@ -1676,11 +1915,18 @@ class KISApi:
                     end_date=today,
                     ord_gno_brno=query_branch_no or None,
                 )
+                inference_status = window_status
                 final_orders = _target_orders(window_status.get("orders", []))
             if not final_orders and query_branch_no:
                 # 주문지점번호가 맞지 않는 경우를 대비해 마지막으로 지점번호 없이 재조회
                 unscoped_status = self.get_order_status(order_no)
+                inference_status = unscoped_status
                 final_orders = _target_orders(unscoped_status.get("orders", []))
+
+            if not final_orders:
+                inferred = _infer_execution_from_holdings(inference_status)
+                if inferred is not None:
+                    return inferred
 
             if final_orders:
                 final_order = max(
