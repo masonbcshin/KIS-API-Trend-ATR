@@ -1710,8 +1710,7 @@ class KISApi:
             return {"qty": 0, "avg_price": 0.0}
 
         def _infer_execution_from_holdings(status_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-            if not self.is_paper_trading:
-                return None
+            # PAPER/REAL 공통: 체결조회 지연 시 보유수량 변동으로 보정합니다.
             if not probe_symbol or probe_side not in ("BUY", "SELL"):
                 return None
             if probe_before_qty is None:

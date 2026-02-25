@@ -881,10 +881,104 @@ class TestExecutionStatusResponses:
         assert result["exec_qty"] == 1
         assert result["exec_price"] == 22050.0
 
+    def test_wait_for_execution_buy_holding_fallback_when_order_rows_empty_real_mode(self):
+        with patch.object(KISApi, "_wait_for_rate_limit", return_value=None):
+            api = KISApi(is_paper_trading=True)
+            api.access_token = "test_token"
+        api.is_paper_trading = False
+
+        def _fake_get_order_status(_query_order_no=None, **_kwargs):
+            return {
+                "success": True,
+                "orders": [],
+                "summary": {
+                    "tot_ccld_qty": 6,
+                    "tot_ccld_amt": 756500,
+                },
+            }
+
+        api.get_order_status = _fake_get_order_status
+        api.get_holdings = lambda: [
+            {"stock_code": "024060", "qty": 1, "avg_price": 22050}
+        ]
+        api.cancel_order = lambda _order_no: {"success": True}
+
+        result = api.wait_for_execution(
+            order_no="0000009792",
+            expected_qty=1,
+            timeout_seconds=1,
+            check_interval=0,
+            stock_code="024060",
+            side="BUY",
+            holding_before_qty=0,
+            holding_before_avg_price=0.0,
+        )
+
+        assert result["success"] is True
+        assert result["status"] == "FILLED"
+        assert result["exec_qty"] == 1
+        assert result["exec_price"] == 22050.0
+
     def test_wait_for_execution_sell_holding_fallback_uses_summary_delta_price(self):
         with patch.object(KISApi, "_wait_for_rate_limit", return_value=None):
             api = KISApi(is_paper_trading=True)
             api.access_token = "test_token"
+
+        status_calls = {"count": 0}
+
+        def _fake_get_order_status(_query_order_no=None, **_kwargs):
+            status_calls["count"] += 1
+            if status_calls["count"] == 1:
+                return {
+                    "success": True,
+                    "orders": [],
+                    "summary": {
+                        "tot_ccld_qty": 6,
+                        "tot_ccld_amt": 756500,
+                    },
+                }
+            return {
+                "success": True,
+                "orders": [],
+                "summary": {
+                    "tot_ccld_qty": 7,
+                    "tot_ccld_amt": 778500,
+                },
+            }
+
+        holdings_calls = {"count": 0}
+
+        def _fake_get_holdings():
+            holdings_calls["count"] += 1
+            if holdings_calls["count"] == 1:
+                return [{"stock_code": "024060", "qty": 1, "avg_price": 22050}]
+            return []
+
+        api.get_order_status = _fake_get_order_status
+        api.get_holdings = _fake_get_holdings
+        api.cancel_order = lambda _order_no: {"success": True}
+
+        result = api.wait_for_execution(
+            order_no="0000009823",
+            expected_qty=1,
+            timeout_seconds=1,
+            check_interval=0,
+            stock_code="024060",
+            side="SELL",
+            holding_before_qty=1,
+            holding_before_avg_price=22050.0,
+        )
+
+        assert result["success"] is True
+        assert result["status"] == "FILLED"
+        assert result["exec_qty"] == 1
+        assert result["exec_price"] == 22000.0
+
+    def test_wait_for_execution_sell_holding_fallback_uses_summary_delta_price_real_mode(self):
+        with patch.object(KISApi, "_wait_for_rate_limit", return_value=None):
+            api = KISApi(is_paper_trading=True)
+            api.access_token = "test_token"
+        api.is_paper_trading = False
 
         status_calls = {"count": 0}
 

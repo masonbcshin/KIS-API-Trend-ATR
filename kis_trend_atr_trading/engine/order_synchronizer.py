@@ -570,10 +570,8 @@ class OrderSynchronizer:
         order_no: str,
     ) -> Optional[SynchronizedOrderResult]:
         """
-        PAPER 모드에서 체결조회가 비어도 보유수량 증가로 매수 체결을 보정합니다.
+        체결조회가 비어도 보유수량 증가로 매수 체결을 보정합니다. (PAPER/REAL 공통)
         """
-        if str(self.mode).upper() != "PAPER":
-            return None
         if before_snapshot is None:
             return None
 
