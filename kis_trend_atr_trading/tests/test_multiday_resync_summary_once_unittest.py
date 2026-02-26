@@ -77,6 +77,33 @@ class _DummyPosResync:
         }
 
 
+class _DummyPosResyncAllowFalse:
+    def __init__(self, action="API_FAILED"):
+        self.action = action
+
+    def synchronize_on_startup(self):
+        return {
+            "success": False,
+            "position": None,
+            "action": self.action,
+            "warnings": [],
+            "recoveries": [],
+            "allow_new_entries": False,
+        }
+
+
+class _DummyPosResyncAllowTrue:
+    def synchronize_on_startup(self):
+        return {
+            "success": True,
+            "position": None,
+            "action": "NO_POSITION",
+            "warnings": [],
+            "recoveries": [],
+            "allow_new_entries": True,
+        }
+
+
 class _DummyTelegram:
     def __init__(self):
         self.info_messages = []
@@ -101,6 +128,7 @@ class TestMultidayResyncSummaryOnce(unittest.TestCase):
         ex.stock_code = "005930"
         ex._entry_allowed = True
         ex._entry_block_reason = ""
+        ex._entry_block_sticky = False
         ex._pending_exit_state = None
         ex.order_synchronizer = types.SimpleNamespace(recover_pending_orders=lambda: [])
         ex._drop_pending_exit_state = lambda _reason: None
@@ -118,6 +146,43 @@ class TestMultidayResyncSummaryOnce(unittest.TestCase):
         assert "복원 완료:" in msg
         assert "avg=897,000.00원" in msg
         assert "avg=178,116.30원" in msg
+
+    def test_sticky_block_prevents_allow_override(self):
+        ex = MultidayExecutor.__new__(MultidayExecutor)
+        ex._entry_allowed = True
+        ex._entry_block_reason = ""
+        ex._entry_block_sticky = False
+
+        ex.set_reconcile_entry_block("[ENTRY] blocked by reconcile: API_FAILED")
+        ex.set_entry_control(True, "")
+
+        assert ex._entry_allowed is False
+        assert ex._entry_block_sticky is True
+        assert "blocked by reconcile" in ex._entry_block_reason
+
+    def test_retry_entry_unblock_via_resync_releases_sticky_block_on_success(self):
+        ex = MultidayExecutor.__new__(MultidayExecutor)
+        ex._entry_allowed = False
+        ex._entry_block_reason = "[ENTRY] blocked by reconcile: API_FAILED"
+        ex._entry_block_sticky = True
+        ex.position_resync = _DummyPosResyncAllowTrue()
+
+        assert ex.retry_entry_unblock_via_resync() is True
+        assert ex._entry_allowed is True
+        assert ex._entry_block_sticky is False
+        assert ex._entry_block_reason == ""
+
+    def test_retry_entry_unblock_via_resync_keeps_sticky_block_on_failure(self):
+        ex = MultidayExecutor.__new__(MultidayExecutor)
+        ex._entry_allowed = False
+        ex._entry_block_reason = "[ENTRY] blocked by reconcile: API_FAILED"
+        ex._entry_block_sticky = True
+        ex.position_resync = _DummyPosResyncAllowFalse(action="API_FAILED")
+
+        assert ex.retry_entry_unblock_via_resync() is False
+        assert ex._entry_allowed is False
+        assert ex._entry_block_sticky is True
+        assert "API_FAILED" in ex._entry_block_reason
 
 
 if __name__ == "__main__":

@@ -772,7 +772,30 @@ def run_trade(
 
             for executor in executors:
                 symbol = executor.stock_code
-                if not decision.policy.allow_new_entries:
+                sticky_blocked = False
+                sticky_reason = ""
+                is_sticky = getattr(executor, "is_entry_block_sticky", None)
+                if callable(is_sticky) and is_sticky():
+                    sticky_blocked = True
+                    if decision.policy.allow_new_entries:
+                        retry_unblock = getattr(executor, "retry_entry_unblock_via_resync", None)
+                        if callable(retry_unblock):
+                            sticky_blocked = not bool(retry_unblock())
+                        if sticky_blocked:
+                            get_block_reason = getattr(executor, "get_entry_block_reason", None)
+                            if callable(get_block_reason):
+                                sticky_reason = str(get_block_reason() or "")
+                            if not sticky_reason:
+                                sticky_reason = "[ENTRY] blocked by reconcile: retry_failed"
+                            logger.warning(
+                                "[ENTRY] sticky reconcile block active symbol=%s reason=%s",
+                                symbol,
+                                sticky_reason,
+                            )
+
+                if sticky_blocked:
+                    executor.set_entry_control(False, sticky_reason)
+                elif not decision.policy.allow_new_entries:
                     executor.set_entry_control(
                         False,
                         (

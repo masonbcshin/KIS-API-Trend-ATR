@@ -317,6 +317,7 @@ class MultidayExecutor:
         )
         self._entry_allowed: bool = True
         self._entry_block_reason: str = ""
+        self._entry_block_sticky: bool = False
         self._pending_exit_state: Optional[Dict[str, Any]] = self._sanitize_loaded_pending_exit(
             self.position_store.load_pending_exit()
         )
@@ -346,10 +347,56 @@ class MultidayExecutor:
         # 리스크 매니저 상태 출력
         self.risk_manager.print_status()
 
-    def set_entry_control(self, allow_entry: bool, reason: str = "") -> None:
+    def set_entry_control(self, allow_entry: bool, reason: str = "", force: bool = False) -> None:
         """외부 정책(유니버스/보유 상한)에 따른 신규 진입 허용 여부 설정."""
+        if getattr(self, "_entry_block_sticky", False) and not force:
+            if allow_entry:
+                return
+            self._entry_allowed = False
+            if reason and "blocked by reconcile" in reason:
+                self._entry_block_reason = reason
+            return
+
         self._entry_allowed = bool(allow_entry)
         self._entry_block_reason = reason or ""
+        if force and allow_entry:
+            self._entry_block_sticky = False
+
+    def set_reconcile_entry_block(self, reason: str) -> None:
+        """재동기화 실패 시 신규 진입 차단을 고정(sticky) 설정."""
+        self._entry_block_sticky = True
+        self._entry_allowed = False
+        self._entry_block_reason = reason or "[ENTRY] blocked by reconcile: reconcile_failed"
+
+    def is_entry_block_sticky(self) -> bool:
+        return bool(self._entry_block_sticky)
+
+    def get_entry_block_reason(self) -> str:
+        return self._entry_block_reason or ""
+
+    def retry_entry_unblock_via_resync(self) -> bool:
+        """재동기화 재시도로 sticky 차단 해제를 시도."""
+        if not getattr(self, "_entry_block_sticky", False):
+            return self._entry_allowed
+
+        sync_result = self.position_resync.synchronize_on_startup()
+        for warning in sync_result.get("warnings", []) or []:
+            logger.warning(f"[RESYNC][RETRY] {warning}")
+        for recovery in sync_result.get("recoveries", []) or []:
+            logger.info(f"[RESYNC][RETRY][AUTO] {recovery}")
+
+        if not sync_result.get("allow_new_entries", True):
+            reason = (
+                sync_result.get("action")
+                or "; ".join(sync_result.get("warnings", []) or [])
+                or "reconcile_failed"
+            )
+            self.set_reconcile_entry_block(f"[ENTRY] blocked by reconcile: {reason}")
+            return False
+
+        self.set_entry_control(True, "", force=True)
+        logger.info("[ENTRY] reconcile retry succeeded - sticky block released")
+        return True
     
     def _signal_handler(self, signum, frame):
         """종료 시그널 핸들러"""
@@ -1005,7 +1052,9 @@ class MultidayExecutor:
                 or "; ".join(sync_result.get("warnings", []) or [])
                 or "reconcile_failed"
             )
-            self.set_entry_control(False, f"[ENTRY] blocked by reconcile: {reason}")
+            self.set_reconcile_entry_block(f"[ENTRY] blocked by reconcile: {reason}")
+        elif getattr(self, "_entry_block_sticky", False):
+            self.set_entry_control(True, "", force=True)
 
         # 경고 메시지 출력
         for warning in sync_result.get("warnings", []):
