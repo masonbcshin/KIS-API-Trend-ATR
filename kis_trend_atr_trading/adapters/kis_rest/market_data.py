@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 from api.kis_api import KISApi
 from core.market_data import BarCallback, MarketDataProvider
@@ -93,6 +93,13 @@ class KISRestMarketDataProvider(MarketDataProvider):
     def get_latest_price(self, stock_code: str) -> float:
         data = self._api.get_current_price(stock_code=stock_code)
         return float(data.get("current_price", 0.0) or 0.0)
+
+    def get_latest_price_with_open(self, stock_code: str) -> Tuple[float, float]:
+        """Return `(current_price, open_price)` from a single quote API call."""
+        data = self._api.get_current_price(stock_code=stock_code)
+        current_price = float(data.get("current_price", 0.0) or 0.0)
+        open_price = float(data.get("open_price", 0.0) or 0.0)
+        return current_price, open_price
 
     def subscribe_bars(
         self,

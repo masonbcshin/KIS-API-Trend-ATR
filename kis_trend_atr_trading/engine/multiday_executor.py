@@ -26,48 +26,99 @@ from decimal import Decimal
 from typing import Dict, Optional, Any
 import pandas as pd
 
-from config import settings
-from api.kis_api import KISApi, KISApiError
-from strategy.multiday_trend_atr import (
-    MultidayTrendATRStrategy,
-    TradingSignal,
-    SignalType,
-    ExitReason,
-)
-from utils.gap_protection import GAP_REASON_FALLBACK, GAP_REASON_OTHER
-from engine.trading_state import TradingState, MultidayPosition
-from engine.risk_manager import (
-    RiskManager,
-    create_risk_manager_from_settings,
-    safe_exit_with_message
-)
-from engine.order_synchronizer import (
-    SingleInstanceLock,
-    MarketHoursChecker,
-    OrderSynchronizer,
-    PositionResynchronizer,
-    OrderExecutionResult,
-    ensure_single_instance,
-    get_instance_lock,
-    get_market_checker
-)
-from utils.position_store import (
-    PositionStore,
-    StoredPosition,
-    get_position_store
-)
-from db.repository import get_position_repository
-from db.repository import get_trade_repository
-from db.mysql import get_db_manager, QueryError
-from core.market_data import MarketDataProvider
-from utils.avg_price import calc_weighted_avg, quantize_price, reduce_quantity_after_sell
-from utils.telegram_notifier import TelegramNotifier, get_telegram_notifier
-from utils.logger import get_logger, TradeLogger
-from utils.market_hours import KST
-from env import get_db_namespace_mode
+try:
+    from kis_trend_atr_trading.config import settings
+    from kis_trend_atr_trading.api.kis_api import KISApi, KISApiError
+    from kis_trend_atr_trading.strategy.multiday_trend_atr import (
+        MultidayTrendATRStrategy,
+        TradingSignal,
+        SignalType,
+        ExitReason,
+    )
+    from kis_trend_atr_trading.utils.gap_protection import GAP_REASON_FALLBACK, GAP_REASON_OTHER
+    from kis_trend_atr_trading.engine.trading_state import TradingState, MultidayPosition
+    from kis_trend_atr_trading.engine.risk_manager import (
+        RiskManager,
+        create_risk_manager_from_settings,
+        safe_exit_with_message
+    )
+    from kis_trend_atr_trading.engine.order_synchronizer import (
+        SingleInstanceLock,
+        MarketHoursChecker,
+        OrderSynchronizer,
+        PositionResynchronizer,
+        OrderExecutionResult,
+        ensure_single_instance,
+        get_instance_lock,
+        get_market_checker
+    )
+    from kis_trend_atr_trading.utils.position_store import (
+        PositionStore,
+        StoredPosition,
+        get_position_store
+    )
+    from kis_trend_atr_trading.db.repository import get_position_repository
+    from kis_trend_atr_trading.db.repository import get_trade_repository
+    from kis_trend_atr_trading.db.mysql import get_db_manager, QueryError
+    from kis_trend_atr_trading.core.market_data import MarketDataProvider
+    from kis_trend_atr_trading.utils.avg_price import calc_weighted_avg, quantize_price, reduce_quantity_after_sell
+    from kis_trend_atr_trading.utils.telegram_notifier import TelegramNotifier, get_telegram_notifier
+    from kis_trend_atr_trading.utils.logger import get_logger, TradeLogger
+    from kis_trend_atr_trading.utils.market_hours import KST
+    from kis_trend_atr_trading.env import get_db_namespace_mode
+except ImportError:
+    from config import settings
+    from api.kis_api import KISApi, KISApiError
+    from strategy.multiday_trend_atr import (
+        MultidayTrendATRStrategy,
+        TradingSignal,
+        SignalType,
+        ExitReason,
+    )
+    from utils.gap_protection import GAP_REASON_FALLBACK, GAP_REASON_OTHER
+    from engine.trading_state import TradingState, MultidayPosition
+    from engine.risk_manager import (
+        RiskManager,
+        create_risk_manager_from_settings,
+        safe_exit_with_message
+    )
+    from engine.order_synchronizer import (
+        SingleInstanceLock,
+        MarketHoursChecker,
+        OrderSynchronizer,
+        PositionResynchronizer,
+        OrderExecutionResult,
+        ensure_single_instance,
+        get_instance_lock,
+        get_market_checker
+    )
+    from utils.position_store import (
+        PositionStore,
+        StoredPosition,
+        get_position_store
+    )
+    from db.repository import get_position_repository
+    from db.repository import get_trade_repository
+    from db.mysql import get_db_manager, QueryError
+    from core.market_data import MarketDataProvider
+    from utils.avg_price import calc_weighted_avg, quantize_price, reduce_quantity_after_sell
+    from utils.telegram_notifier import TelegramNotifier, get_telegram_notifier
+    from utils.logger import get_logger, TradeLogger
+    from utils.market_hours import KST
+    from env import get_db_namespace_mode
 
 logger = get_logger("multiday_executor")
 trade_logger = TradeLogger("multiday_executor")
+
+try:
+    from kis_trend_atr_trading.api.kis_api import KISApiError as _PKG_KIS_API_ERROR
+except Exception:
+    _PKG_KIS_API_ERROR = None
+_KIS_API_ERROR_TYPES = tuple(
+    err
+    for err in (KISApiError, _PKG_KIS_API_ERROR)
+    if isinstance(err, type) and issubclass(err, Exception)
+)
 
 
 class MultidayExecutor:
@@ -1144,7 +1195,7 @@ class MultidayExecutor:
             
             return df
             
-        except KISApiError as e:
+        except _KIS_API_ERROR_TYPES as e:
             logger.error(f"시장 데이터 조회 실패: {e}")
             return pd.DataFrame()
     
@@ -1157,9 +1208,13 @@ class MultidayExecutor:
         """
         try:
             if self.market_data_provider is not None:
-                current = float(
-                    self.market_data_provider.get_latest_price(self.stock_code) or 0.0
-                )
+                # REST provider가 최신가+시가 동시 조회를 지원하면 단일 API 호출만 사용합니다.
+                quote_fn = getattr(self.market_data_provider, "get_latest_price_with_open", None)
+                if callable(quote_fn):
+                    current, open_price = quote_fn(self.stock_code)
+                    return float(current or 0.0), float(open_price or 0.0)
+
+                current = float(self.market_data_provider.get_latest_price(self.stock_code) or 0.0)
                 # 멀티데이 전략은 갭 보호를 위해 시가가 필요하므로 provider-only 모드에서는
                 # REST 현재가 응답에서 시가를 보강합니다(전략/주문 파라미터 불변).
                 price_data = self.api.get_current_price(self.stock_code)
@@ -1172,7 +1227,7 @@ class MultidayExecutor:
             
             return current, open_price
             
-        except KISApiError as e:
+        except _KIS_API_ERROR_TYPES as e:
             logger.error(f"현재가 조회 실패: {e}")
             return 0.0, 0.0
     

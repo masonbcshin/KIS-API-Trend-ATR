@@ -7,7 +7,7 @@ import math
 import threading
 from collections import defaultdict, deque
 from datetime import datetime
-from typing import Callable, Deque, Dict, List, Optional
+from typing import Callable, Deque, Dict, List, Optional, Tuple
 
 from adapters.kis_rest.market_data import KISRestMarketDataProvider
 from adapters.kis_ws.bar_aggregator import MarketTick, MinuteBarAggregator
@@ -84,6 +84,22 @@ class KISWSMarketDataProvider(MarketDataProvider):
         if latest is not None:
             return float(latest)
         return self._rest_fallback.get_latest_price(code)
+
+    def get_latest_price_with_open(self, stock_code: str) -> Tuple[float, float]:
+        """
+        Return `(current_price, open_price)` while minimizing duplicate REST quote calls.
+
+        - `open_price` is always sourced from REST quote.
+        - `current_price` uses WS cache when present, otherwise REST quote current price.
+        """
+        code = str(stock_code).zfill(6)
+        with self._lock:
+            latest = self._latest_price.get(code)
+
+        rest_current, open_price = self._rest_fallback.get_latest_price_with_open(code)
+        if latest is None:
+            latest = rest_current
+        return float(latest or 0.0), float(open_price or 0.0)
 
     def _handle_tick(self, tick: MarketTick) -> None:
         code = str(tick.stock_code).zfill(6)

@@ -920,11 +920,27 @@ class KISApi:
             "FID_INPUT_ISCD": stock_code
         }
         
-        response = self._request_with_retry("GET", url, headers, params=params)
-        data = response.json()
-        
-        if data.get("rt_cd") != "0":
-            raise KISApiError(f"현재가 조회 실패: {data.get('msg1', 'Unknown error')}")
+        # SESSION FULL은 단기적으로 해소되는 경우가 있어 소폭 재시도합니다.
+        session_full_retries = 2
+        for attempt in range(session_full_retries + 1):
+            response = self._request_with_retry("GET", url, headers, params=params)
+            data = response.json()
+            if data.get("rt_cd") == "0":
+                break
+
+            msg = str(data.get("msg1", "Unknown error"))
+            if "SESSION FULL" in msg.upper() and attempt < session_full_retries:
+                wait_sec = 0.4 * (attempt + 1)
+                logger.warning(
+                    "[KIS][PRICE] SESSION FULL - %.1fs 후 재시도 (%s/%s) stock=%s",
+                    wait_sec,
+                    attempt + 1,
+                    session_full_retries,
+                    stock_code,
+                )
+                time.sleep(wait_sec)
+                continue
+            raise KISApiError(f"현재가 조회 실패: {msg}")
         
         output = data.get("output", {})
         stock_name = (

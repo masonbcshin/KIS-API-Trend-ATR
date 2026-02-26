@@ -12,7 +12,10 @@ from typing import Deque, Dict, List, Optional, Sequence, Tuple
 
 import pytz
 
-from utils.market_hours import MarketSessionState
+try:
+    from kis_trend_atr_trading.utils.market_hours import MarketSessionState
+except ImportError:
+    from utils.market_hours import MarketSessionState
 
 logger = logging.getLogger(__name__)
 
