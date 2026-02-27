@@ -13,7 +13,7 @@
 - 텔레그램 CBT 시그널 Markdown 이스케이프 안정화
 - 종목명 해석 보강: `holdings -> quote -> universe_cache` 순서로 조회
 - `websockets>=12.0` 의존성 명시, WS 미사용/미설치 시 REST 경로로 안전 동작
-- 멀티종목 호환 실행(`main_multiday`)에서 포지션 파일은 `positions_{symbol}.json` 단위로 저장
+- 멀티종목 호환 실행(`main_multiday`)에서 포지션 파일은 `positions_{mode}_{symbol}.json` 단위로 저장 (`mode`: `DRY_RUN|PAPER|REAL`)
 
 ---
 
@@ -126,8 +126,8 @@ TRADING_MODE=PAPER python3 -m kis_trend_atr_trading.main_multiday --mode trade -
 
 ### 4-6. 포지션 파일 확인 기준
 - 표준 단일 엔트리포인트(`apps.kr_trade`) 기본 경로: `kis_trend_atr_trading/data/positions.json`
-- 멀티종목 호환 경로(`main_multiday`) 기본 경로: `kis_trend_atr_trading/data/positions_{symbol}.json`
-- 따라서 멀티종목 실행 중에는 `positions.json`이 비어 있어도 `positions_*.json`이 갱신되면 정상입니다.
+- 멀티종목 호환 경로(`main_multiday`) 기본 경로: `kis_trend_atr_trading/data/positions_{mode}_{symbol}.json`
+- 따라서 멀티종목 실행 중에는 `positions.json`이 비어 있어도 `positions_{mode}_*.json`이 갱신되면 정상입니다.
 
 도움말:
 ```bash

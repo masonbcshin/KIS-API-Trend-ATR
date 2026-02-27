@@ -13,6 +13,10 @@ except Exception:  # pragma: no cover
 
 from utils.logger import get_logger
 from utils.market_hours import KST
+try:
+    from kis_trend_atr_trading.env import get_db_namespace_mode
+except Exception:  # pragma: no cover
+    from env import get_db_namespace_mode
 from .universe_selector import UniverseSelector
 
 logger = get_logger("universe_service")
@@ -73,9 +77,51 @@ class UniverseService:
             params=params,
         )
 
+    @staticmethod
+    def _current_db_mode() -> str:
+        try:
+            mode = str(get_db_namespace_mode() or "PAPER").upper().strip()
+        except Exception:
+            mode = "PAPER"
+        return mode if mode in ("DRY_RUN", "PAPER", "REAL") else "PAPER"
+
+    def _load_holdings_symbols_from_api(self, mode: str) -> Set[str]:
+        """
+        PAPER/REAL 모드에서는 브로커 계좌 보유를 우선 사용합니다.
+        """
+        if mode not in ("PAPER", "REAL"):
+            return set()
+
+        fetch_balance = getattr(self.kis_client, "get_account_balance", None)
+        if not callable(fetch_balance):
+            return set()
+
+        try:
+            balance = fetch_balance()
+        except Exception as e:
+            logger.warning(f"[UNIVERSE] API holdings 조회 실패: {e}")
+            return set()
+
+        holdings = balance.get("holdings", []) if isinstance(balance, dict) else []
+        symbols: Set[str] = set()
+        for item in holdings if isinstance(holdings, list) else []:
+            if not isinstance(item, dict):
+                continue
+            code = str(item.get("stock_code") or "").strip()
+            qty = int(item.get("qty") or item.get("quantity") or 0)
+            if len(code) == 6 and code.isdigit() and qty > 0:
+                symbols.add(code)
+        return symbols
+
     def load_holdings_symbols(self) -> List[str]:
         symbols: Set[str] = set()
-        for path in self.data_dir.glob("positions*.json"):
+        mode = self._current_db_mode()
+
+        # 계좌 동기화 모드(PAPER/REAL)는 API 보유를 우선 반영
+        symbols.update(self._load_holdings_symbols_from_api(mode))
+
+        # 모드 네임스페이스 파일만 로드 (예: positions_REAL_005930.json)
+        for path in self.data_dir.glob(f"positions_{mode}_*.json"):
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
                 pos = payload.get("position") if isinstance(payload, dict) else None
@@ -87,6 +133,8 @@ class UniverseService:
                     symbols.add(code)
             except Exception:
                 continue
+
+        logger.info(f"[UNIVERSE] holdings symbols loaded: mode={mode}, count={len(symbols)}")
         return sorted(symbols)
 
     def _read_cache_for_date(self, trade_date: str) -> Optional[Dict[str, Any]]:

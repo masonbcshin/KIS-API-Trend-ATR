@@ -202,7 +202,7 @@ selection_method:
 - 강제청산 없음
 - 포지션 파일 저장:
   - 표준 단일 실행 경로: `data/positions.json`
-  - 멀티종목 호환(`main_multiday`) 경로: `data/positions_{symbol}.json`
+  - 멀티종목 호환(`main_multiday`) 경로: `data/positions_{mode}_{symbol}.json` (`mode`: `DRY_RUN|PAPER|REAL`)
 - 프로세스 종료 시 일일 요약 로그/알림
 
 ### 재시작 시 동작
@@ -421,7 +421,7 @@ selection_method:
 
 - 저장소:
   - 표준 단일 실행 경로: `data/positions.json`
-  - 멀티종목 호환(`main_multiday`) 경로: `data/positions_{symbol}.json`
+  - 멀티종목 호환(`main_multiday`) 경로: `data/positions_{mode}_{symbol}.json` (`mode`: `DRY_RUN|PAPER|REAL`)
 - REAL 모드: 실계좌 보유와 저장 포지션 비교
   - 불일치 시 경고/정리/중단 액션 분기
   - DB `positions`를 실계좌 기준으로 upsert/close 동기화

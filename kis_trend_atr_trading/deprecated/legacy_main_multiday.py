@@ -64,7 +64,12 @@ from kis_trend_atr_trading.universe.universe_service import UniverseService
 from kis_trend_atr_trading.utils.logger import setup_logger, get_logger
 from kis_trend_atr_trading.utils.market_hours import KST, MarketSessionState, get_market_session_state
 from kis_trend_atr_trading.utils.position_store import PositionStore
-from kis_trend_atr_trading.env import get_trading_mode, validate_environment, assert_not_real_mode
+from kis_trend_atr_trading.env import (
+    get_trading_mode,
+    get_db_namespace_mode,
+    validate_environment,
+    assert_not_real_mode,
+)
 
 
 def print_banner():
@@ -394,9 +399,16 @@ def run_trade(
                 f"({real_first_order_percent}% of max_position_size)"
             )
 
+        try:
+            db_mode = str(get_db_namespace_mode() or "").upper().strip()
+        except Exception:
+            db_mode = "REAL" if trading_mode == "REAL" else ("DRY_RUN" if trading_mode == "CBT" else "PAPER")
+        if db_mode not in ("DRY_RUN", "PAPER", "REAL"):
+            db_mode = "PAPER"
+
         def _symbol_position_store(symbol: str) -> PositionStore:
             data_dir = Path(__file__).resolve().parent / "data"
-            return PositionStore(file_path=data_dir / f"positions_{symbol}.json")
+            return PositionStore(file_path=data_dir / f"positions_{db_mode}_{symbol}.json")
 
         def _merge_symbols(holdings_symbols, entry_candidates_symbols):
             merged = []

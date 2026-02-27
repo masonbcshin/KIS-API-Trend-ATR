@@ -49,6 +49,14 @@ class _DummyKIS:
     pass
 
 
+class _DummyKISWithBalance:
+    def __init__(self, holdings=None):
+        self._holdings = holdings or []
+
+    def get_account_balance(self):
+        return {"success": True, "holdings": list(self._holdings)}
+
+
 class _DummySelector:
     def __init__(self, symbols):
         self._symbols = list(symbols)
@@ -124,6 +132,46 @@ stocks:
             self.assertEqual(symbols, ["005930", "000660", "035720"])
             payload = json.loads(cache_file.read_text(encoding="utf-8"))
             self.assertEqual(payload.get("selection_method"), "fixed_fallback")
+
+    def test_load_holdings_symbols_uses_mode_scoped_files_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            data_dir = root / "data"
+            data_dir.mkdir(parents=True, exist_ok=True)
+            yaml_path = self._write_yaml(root)
+
+            (data_dir / "positions_REAL_005930.json").write_text(
+                json.dumps({"position": {"stock_code": "005930", "quantity": 2}}),
+                encoding="utf-8",
+            )
+            (data_dir / "positions_DRY_RUN_000660.json").write_text(
+                json.dumps({"position": {"stock_code": "000660", "quantity": 3}}),
+                encoding="utf-8",
+            )
+
+            service = UniverseService(str(yaml_path), _DummyKIS(), data_dir=data_dir)
+            with patch.dict("os.environ", {"EXECUTION_MODE": "REAL", "TRADING_MODE": "REAL"}, clear=False):
+                symbols = service.load_holdings_symbols()
+
+            self.assertEqual(symbols, ["005930"])
+
+    def test_load_holdings_symbols_includes_api_holdings_for_real(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            yaml_path = self._write_yaml(root)
+            kis = _DummyKISWithBalance(
+                holdings=[
+                    {"stock_code": "069500", "qty": 1},
+                    {"stock_code": "233740", "quantity": 2},
+                    {"stock_code": "005930", "qty": 0},
+                ]
+            )
+            service = UniverseService(str(yaml_path), kis, data_dir=root / "data")
+
+            with patch.dict("os.environ", {"EXECUTION_MODE": "REAL", "TRADING_MODE": "REAL"}, clear=False):
+                symbols = service.load_holdings_symbols()
+
+            self.assertEqual(symbols, ["069500", "233740"])
 
 
 if __name__ == "__main__":

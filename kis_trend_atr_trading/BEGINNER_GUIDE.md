@@ -12,7 +12,7 @@
 - 종목명 조회가 강화되어 `UNKNOWN(코드)` 빈도가 줄었습니다.
 - 텔레그램 CBT 시그널 이스케이프가 정리되었습니다.
 - WS 의존성(`websockets>=12.0`)이 `requirements.txt`에 명시되었습니다.
-- 멀티종목 실행 시 포지션 저장 파일이 `positions_{symbol}.json` 단위로 관리됩니다.
+- 멀티종목 실행 시 포지션 저장 파일이 `positions_{mode}_{symbol}.json` 단위로 관리됩니다. (`mode`: `DRY_RUN|PAPER|REAL`)
 
 ---
 
@@ -174,8 +174,8 @@ python3 -m kis_trend_atr_trading.main_multiday --mode trade --interval 60
 
 포지션 파일 확인 팁:
 - 단일 경로(`apps.kr_trade`) 기본: `kis_trend_atr_trading/data/positions.json`
-- 멀티종목 경로(`main_multiday`) 기본: `kis_trend_atr_trading/data/positions_{symbol}.json`
-- 멀티종목 실행 중 `positions.json`이 비어 있어도 `positions_*.json`이 갱신되면 정상입니다.
+- 멀티종목 경로(`main_multiday`) 기본: `kis_trend_atr_trading/data/positions_{mode}_{symbol}.json`
+- 멀티종목 실행 중 `positions.json`이 비어 있어도 `positions_{mode}_*.json`이 갱신되면 정상입니다.
 
 ---
 
