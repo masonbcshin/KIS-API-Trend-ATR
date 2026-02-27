@@ -10,9 +10,8 @@ KIS Trend-ATR Trading System - 실계좌 전용 설정
 ★ 실계좌 활성화 조건 (모두 충족 필요):
   1. EXECUTION_MODE=REAL 환경변수 설정
   2. ENABLE_REAL_TRADING=true 환경변수 설정
-  3. 아래 REAL_TRADING_CONFIRMED = True 설정
-  
-★ 세 가지 중 하나라도 미충족 시 DRY_RUN으로 자동 전환
+
+★ 두 가지 중 하나라도 미충족 시 DRY_RUN으로 자동 전환
 
 ★ 강제 규칙:
   - 손절 기준 완화 금지
@@ -25,25 +24,16 @@ KIS Trend-ATR Trading System - 실계좌 전용 설정
 """
 
 from .settings_base import *
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ⚠️⚠️⚠️ 실계좌 활성화 확인 플래그 ⚠️⚠️⚠️
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# ★ 이 값을 True로 변경해야만 실계좌 주문이 가능합니다.
-# ★ 변경 전 반드시 모든 설정을 검토하세요!
-# ★ DRY_RUN → PAPER → REAL 순서로 충분히 테스트 후 변경하세요!
-
-REAL_TRADING_CONFIRMED = False  # ⚠️ True로 변경 시 실계좌 주문 활성화
+import os
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 실계좌 전용 설정 (매우 보수적)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# ★ 실계좌 API URL (REAL_TRADING_CONFIRMED=True일 때만 사용됨)
+# ★ 실계좌 API URL (ENABLE_REAL_TRADING=true일 때만 사용됨)
 # ★ 그 외에는 모의투자 URL 사용
-if REAL_TRADING_CONFIRMED and ENABLE_REAL_TRADING:
+if os.getenv("EXECUTION_MODE", "").upper() == "REAL" and ENABLE_REAL_TRADING:
     KIS_BASE_URL = REAL_API_URL
     EXECUTION_MODE = "REAL"
 else:
@@ -200,19 +190,14 @@ def can_activate_real_trading() -> tuple[bool, str]:
     Returns:
         tuple: (활성화 가능 여부, 사유)
     """
-    # 1. 설정 파일 확인
-    if not REAL_TRADING_CONFIRMED:
-        return (False, "REAL_TRADING_CONFIRMED가 False입니다. settings_real.py에서 True로 변경하세요.")
-    
-    # 2. 환경변수 확인
-    import os
+    # 1. 환경변수 확인
     if os.getenv("ENABLE_REAL_TRADING", "false").lower() not in ("true", "1", "yes"):
         return (False, "ENABLE_REAL_TRADING 환경변수가 'true'로 설정되지 않았습니다.")
     
     if os.getenv("EXECUTION_MODE", "") != "REAL":
         return (False, "EXECUTION_MODE 환경변수가 'REAL'로 설정되지 않았습니다.")
     
-    # 3. 설정 검증
+    # 2. 설정 검증
     valid, errors = validate_real_settings()
     if not valid:
         return (False, f"설정 검증 실패: {errors[0]}")
@@ -229,7 +214,6 @@ def print_real_settings_summary() -> str:
 🔴 KIS Trend-ATR Trading System - 실계좌 설정
 ═══════════════════════════════════════════════════════════════
 [활성화 상태]
-  REAL_TRADING_CONFIRMED: {'✅ True' if REAL_TRADING_CONFIRMED else '❌ False'}
   ENABLE_REAL_TRADING: {'✅ True' if ENABLE_REAL_TRADING else '❌ False'}
   실계좌 주문 가능: {'✅ 가능' if can_trade else '❌ 불가'}
   사유: {reason}

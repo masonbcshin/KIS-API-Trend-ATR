@@ -29,9 +29,8 @@ KIS Trend-ATR Trading System - 실행 모드 관리 모듈
 ★ REAL 모드 활성화 조건:
   1. EXECUTION_MODE=REAL 환경변수 설정
   2. ENABLE_REAL_TRADING=true 환경변수 설정
-  3. 설정 파일에서 REAL_TRADING_CONFIRMED=True
 
-세 가지 모두 충족해야만 실계좌 주문 가능
+두 가지 모두 충족해야만 실계좌 주문 가능
 
 ★ 이중 차단:
   - API 레벨에서 모드 검증
@@ -139,7 +138,6 @@ class ExecutionModeConfig:
     
     # REAL 모드 활성화 조건
     env_real_enabled: bool = False       # ENABLE_REAL_TRADING 환경변수
-    config_real_confirmed: bool = False  # 설정 파일 REAL_TRADING_CONFIRMED
     
     # 추가 안전장치
     kill_switch_active: bool = False     # Kill Switch 상태
@@ -160,9 +158,6 @@ class ExecutionModeConfig:
         if not self.env_real_enabled:
             return False
         
-        if not self.config_real_confirmed:
-            return False
-        
         return True
     
     def get_rejection_reason(self) -> Optional[str]:
@@ -175,9 +170,6 @@ class ExecutionModeConfig:
         
         if not self.env_real_enabled:
             return "ENABLE_REAL_TRADING 환경변수가 'true'로 설정되지 않았습니다."
-        
-        if not self.config_real_confirmed:
-            return "설정 파일에서 REAL_TRADING_CONFIRMED가 True가 아닙니다."
         
         return None
 
@@ -234,9 +226,6 @@ class ExecutionModeManager:
             "ENABLE_REAL_TRADING", "false"
         ).lower() in ("true", "1", "yes")
         
-        # 설정 파일에서 확인 플래그 로드
-        self._config_real_confirmed = self._load_config_confirmation()
-        
         # Kill Switch 상태
         self._kill_switch_active = os.getenv(
             "KILL_SWITCH", "false"
@@ -251,18 +240,6 @@ class ExecutionModeManager:
         # REAL 모드 안전 검증
         if self._mode == ExecutionMode.REAL:
             self._validate_real_mode()
-    
-    def _load_config_confirmation(self) -> bool:
-        """설정 파일에서 REAL_TRADING_CONFIRMED 로드"""
-        try:
-            # settings_real.py에서 확인 플래그 로드 시도
-            from config.settings_real import REAL_TRADING_CONFIRMED
-            return REAL_TRADING_CONFIRMED
-        except ImportError:
-            return False
-        except Exception as e:
-            logger.warning(f"[MODE] 설정 파일 로드 오류: {e}")
-            return False
     
     def _check_manual_kill_switch_file(self) -> None:
         """수동 Kill Switch 파일 체크"""
@@ -281,7 +258,6 @@ class ExecutionModeManager:
         logger.info("[MODE] 실행 모드 관리자 초기화")
         logger.info(f"[MODE] 현재 모드: {self._mode.get_display_name()}")
         logger.info(f"[MODE] ENABLE_REAL_TRADING: {self._env_real_enabled}")
-        logger.info(f"[MODE] CONFIG_CONFIRMED: {self._config_real_confirmed}")
         logger.info(f"[MODE] Kill Switch: {'활성화' if self._kill_switch_active else '비활성화'}")
         logger.info("=" * 60)
     
@@ -315,7 +291,6 @@ class ExecutionModeManager:
         return ExecutionModeConfig(
             mode=self._mode,
             env_real_enabled=self._env_real_enabled,
-            config_real_confirmed=self._config_real_confirmed,
             kill_switch_active=self._kill_switch_active
         )
     
@@ -440,7 +415,6 @@ class ExecutionModeManager:
         if self._mode == ExecutionMode.REAL:
             print("  [REAL 모드 이중 승인 상태]")
             print(f"  - ENABLE_REAL_TRADING: {'✅' if self._env_real_enabled else '❌'}")
-            print(f"  - CONFIG_CONFIRMED: {'✅' if self._config_real_confirmed else '❌'}")
             
             if not config.can_execute_real_orders():
                 reason = config.get_rejection_reason()
@@ -459,7 +433,6 @@ class ExecutionModeManager:
             "can_place_orders": self.can_place_orders(),
             "api_url": self.get_api_base_url(),
             "env_real_enabled": self._env_real_enabled,
-            "config_real_confirmed": self._config_real_confirmed,
             "real_orders_allowed": config.can_execute_real_orders() if self._mode == ExecutionMode.REAL else False
         }
 
@@ -618,7 +591,6 @@ MODE_DESCRIPTION = """
 ★ 활성화 조건 (모두 충족 필요):
   1. EXECUTION_MODE=REAL 환경변수
   2. ENABLE_REAL_TRADING=true 환경변수
-  3. settings_real.py에서 REAL_TRADING_CONFIRMED=True
 
 ⚠️ 하나라도 미충족 시 DRY_RUN으로 자동 전환
 
