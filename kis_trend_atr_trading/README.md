@@ -443,6 +443,7 @@ selection_method:
 - PAPER: INFO
 - REAL: INFO
 - 파일 로그: `~/auto-trade/logs` (기본, `AUTO_TRADE_LOG_DIR`로 변경 가능)
+- 감사 로그: `logs/audit` (기본, `AUTO_TRADE_AUDIT_LOG_DIR`로 변경 가능)
 - 로테이션: 10MB x 10개
 
 ### 에러 알림
@@ -472,7 +473,7 @@ selection_method:
 
 - `order_state`에 `order_no`, `fill_id`, `status` 저장
 - `trades`, `account_snapshots` 테이블 존재
-- 보조 감사 로그: `logs/audit/audit_YYYYMMDD.json`
+- 보조 감사 로그: `audit_YYYYMMDD.json` (`AUTO_TRADE_AUDIT_LOG_DIR` 하위)
 
 ---
 
