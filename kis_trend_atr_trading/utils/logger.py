@@ -16,8 +16,13 @@ from typing import Optional
 from .market_hours import KST
 from env import get_trading_mode
 
-# 로그 디렉토리 설정 (기본: ~/auto-trade/logs)
-LOG_DIR = Path(os.path.expanduser(os.getenv("AUTO_TRADE_LOG_DIR", "~/auto-trade/logs")))
+def _resolve_log_dir() -> Path:
+    """환경변수 기반 로그 디렉토리를 런타임에 해석합니다."""
+    return Path(os.path.expanduser(os.getenv("AUTO_TRADE_LOG_DIR", "~/auto-trade/logs")))
+
+
+# 하위 호환용 스냅샷 상수 (실제 설정 시에는 _resolve_log_dir() 재평가 사용)
+LOG_DIR = _resolve_log_dir()
 
 
 class KSTFormatter(logging.Formatter):
@@ -78,7 +83,7 @@ def setup_logger(
     # 파일 핸들러 추가 (선택적)
     if log_to_file:
         if log_dir is None:
-            log_dir = LOG_DIR
+            log_dir = _resolve_log_dir()
         
         # 로그 디렉토리 생성
         log_dir.mkdir(parents=True, exist_ok=True)

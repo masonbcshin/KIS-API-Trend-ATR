@@ -28,8 +28,12 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency
         return False
 
 # .env 파일 로드
-env_path = Path(__file__).parent.parent / '.env'
-load_dotenv(env_path)
+# 1) repo 루트(.env) 2) 패키지 루트(kis_trend_atr_trading/.env)
+# 순서대로 로드하며, 패키지 루트 값이 있으면 repo 루트 값을 덮어씁니다.
+repo_env_path = Path(__file__).resolve().parents[2] / ".env"
+package_env_path = Path(__file__).resolve().parents[1] / ".env"
+load_dotenv(repo_env_path, override=False)
+load_dotenv(package_env_path, override=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

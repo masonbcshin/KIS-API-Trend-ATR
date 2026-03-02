@@ -40,11 +40,19 @@ logger = get_logger("audit_logger")
 
 # 감사 로그 디렉토리 설정 (기본: 프로젝트 내부 logs/audit)
 _DEFAULT_AUDIT_LOG_DIR = Path(__file__).parent.parent / "logs" / "audit"
-AUDIT_LOG_DIR = Path(
-    os.path.expanduser(
-        os.getenv("AUTO_TRADE_AUDIT_LOG_DIR", str(_DEFAULT_AUDIT_LOG_DIR))
+
+
+def _resolve_audit_log_dir() -> Path:
+    """환경변수 기반 감사 로그 디렉토리를 런타임에 해석합니다."""
+    return Path(
+        os.path.expanduser(
+            os.getenv("AUTO_TRADE_AUDIT_LOG_DIR", str(_DEFAULT_AUDIT_LOG_DIR))
+        )
     )
-)
+
+
+# 하위 호환용 스냅샷 상수 (실제 설정 시에는 _resolve_audit_log_dir() 재평가 사용)
+AUDIT_LOG_DIR = _resolve_audit_log_dir()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -201,7 +209,7 @@ class AuditLogger:
             compress_old_logs: 과거 로그 압축 여부
             retention_days: 로그 보관 기간 (일)
         """
-        self.log_dir = log_dir or AUDIT_LOG_DIR
+        self.log_dir = log_dir or _resolve_audit_log_dir()
         self.log_dir.mkdir(parents=True, exist_ok=True)
         
         self.session_id = session_id or datetime.now(KST).strftime("%Y%m%d_%H%M%S")
