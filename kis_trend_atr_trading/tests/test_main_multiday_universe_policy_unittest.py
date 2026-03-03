@@ -1,4 +1,5 @@
 import datetime as dt
+import io
 import sys
 import types
 import unittest
@@ -138,6 +139,7 @@ class _DummyExecutor:
     run_once_calls = []
     entry_controls = []
     holdings_symbols = set()
+    restore_calls = []
 
     def __init__(self, *args, **kwargs):
         symbol = kwargs["stock_code"]
@@ -149,6 +151,7 @@ class _DummyExecutor:
         self.__class__.entry_controls.append((self.stock_code, allow_entry, reason))
 
     def restore_position_on_start(self):
+        self.__class__.restore_calls.append(self.stock_code)
         return self.strategy.has_position
 
     def run_once(self):
@@ -177,12 +180,21 @@ class _DummyNotifier:
         return True
 
 
+class _DummyPositionStoreNoState:
+    def __init__(self, file_path):
+        self.file_path = file_path
+
+    def _load_raw_data(self):
+        return {}
+
+
 class TestMainMultidayUniversePolicy(unittest.TestCase):
     def setUp(self):
         _DummyExecutor.created_symbols = []
         _DummyExecutor.run_once_calls = []
         _DummyExecutor.entry_controls = []
         _DummyExecutor.holdings_symbols = set()
+        _DummyExecutor.restore_calls = []
         _DummyUniverseService.candidates = []
 
     def test_holdings_are_managed_even_if_not_in_todays_universe(self):
@@ -283,6 +295,44 @@ class TestMainMultidayUniversePolicy(unittest.TestCase):
         self.assertIn("최종 선정 2개", notifier.info_messages[1])
         self.assertIn("111111", notifier.info_messages[1])
         self.assertIn("222222", notifier.info_messages[1])
+
+    def test_startup_restore_skips_non_holding_symbols_without_state(self):
+        _DummyUniverseService.holdings = ["233740"]
+        _DummyUniverseService.universe = ["233740", "005930", "069500"]
+        _DummyUniverseService.max_positions = 10
+        _DummyExecutor.holdings_symbols = {"233740"}
+
+        with patch.object(main_multiday, "KISApi", _DummyAPI), \
+             patch.object(main_multiday, "UniverseService", _DummyUniverseService), \
+             patch.object(main_multiday, "MultidayExecutor", _DummyExecutor), \
+             patch.object(main_multiday, "MultidayTrendATRStrategy", lambda: object()), \
+             patch.object(main_multiday, "PositionStore", _DummyPositionStoreNoState), \
+             patch.object(main_multiday, "get_telegram_notifier", return_value=_DummyNotifier()), \
+             patch.object(main_multiday, "get_trading_mode", return_value="PAPER"), \
+             patch.object(
+                 main_multiday,
+                 "get_market_session_state",
+                 return_value=(main_multiday.MarketSessionState.IN_SESSION, "regular_session_open"),
+             ), \
+             patch.object(main_multiday, "get_instance_lock", return_value=_DummyLock()), \
+             patch.object(main_multiday, "create_risk_manager_from_settings", return_value=_DummyRiskManager()), \
+             patch.object(main_multiday.settings, "validate_settings", return_value=True), \
+             patch.object(main_multiday.settings, "get_settings_summary", return_value=""):
+            main_multiday.run_trade(
+                stock_code=main_multiday.settings.DEFAULT_STOCK_CODE,
+                interval=0,
+                max_runs=1,
+            )
+
+        self.assertEqual(_DummyExecutor.created_symbols, ["233740", "005930", "069500"])
+        self.assertEqual(_DummyExecutor.restore_calls, ["233740"])
+
+    def test_print_banner_uses_real_emoji(self):
+        with patch.object(main_multiday.settings, "TRADING_MODE", "REAL"), \
+             patch("sys.stdout", new_callable=io.StringIO) as fake_out:
+            main_multiday.print_banner()
+            output = fake_out.getvalue()
+        self.assertIn("🔴 현재 모드:", output)
 
 
 if __name__ == "__main__":

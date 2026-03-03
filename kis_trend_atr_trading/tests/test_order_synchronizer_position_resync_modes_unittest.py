@@ -251,6 +251,29 @@ class TestPositionResynchronizerModes(unittest.TestCase):
         self.assertEqual(result["position"].quantity, 2)
         self.assertTrue(result["recoveries"])
 
+    def test_real_mode_does_not_recover_other_symbol_when_target_missing(self):
+        api = _DummyApi(
+            holdings=[
+                {"stock_code": "233740", "quantity": 1, "avg_price": 21015, "current_price": 20950}
+            ]
+        )
+        store = _DummyStore(stored=None)
+        syncer = PositionResynchronizer(
+            api=api,
+            position_store=store,
+            db_repository=None,
+            trading_mode="REAL",
+            target_symbol="005930",
+        )
+
+        result = syncer.synchronize_on_startup()
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["action"], "NO_POSITION")
+        self.assertIsNone(result["position"])
+        self.assertFalse(result["recoveries"])
+        self.assertIsNone(store.load_position())
+
     def test_real_mode_aggregates_duplicate_rows_for_same_symbol_quantity(self):
         stale = StoredPosition(
             stock_code="005930",

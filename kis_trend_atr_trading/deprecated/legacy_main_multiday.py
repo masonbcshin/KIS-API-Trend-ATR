@@ -76,6 +76,7 @@ from kis_trend_atr_trading.env import (
 def print_banner():
     """프로그램 시작 배너"""
     mode_emoji = {
+        "REAL": "🔴",
         "LIVE": "🔴",
         "CBT": "🟡",
         "PAPER": "🟢"
@@ -412,6 +413,30 @@ def run_trade(
             data_dir = Path(__file__).resolve().parent / "data"
             return PositionStore(file_path=data_dir / f"positions_{db_mode}_{symbol}.json")
 
+        def _store_has_recoverable_state(symbol_store: PositionStore) -> bool:
+            try:
+                raw_loader = getattr(symbol_store, "_load_raw_data", None)
+                payload = raw_loader() if callable(raw_loader) else {}
+                if not isinstance(payload, dict):
+                    return False
+                position = payload.get("position")
+                if isinstance(position, dict):
+                    code = str(position.get("stock_code") or "").strip()
+                    qty = int(position.get("quantity") or 0)
+                    if len(code) == 6 and code.isdigit() and qty > 0:
+                        return True
+                pending_exit = payload.get("pending_exit")
+                if isinstance(pending_exit, dict) and pending_exit:
+                    return True
+            except Exception as e:
+                logger.debug(f"[RESYNC] state probe failed: path={symbol_store.file_path}, err={e}")
+            return False
+
+        def _should_restore_on_start(symbol: str, holdings_symbols_for_day, symbol_store: PositionStore) -> bool:
+            if symbol in set(holdings_symbols_for_day or []):
+                return True
+            return _store_has_recoverable_state(symbol_store)
+
         def _merge_symbols(holdings_symbols, entry_candidates_symbols):
             merged = []
             for sym in list(holdings_symbols) + list(entry_candidates_symbols):
@@ -520,8 +545,16 @@ def run_trade(
                 position_store=symbol_store,
                 market_data_provider=rest_provider,
             )
-            restored = executor.restore_position_on_start()
-            state_msg = "복원 완료 - Exit 조건 감시" if restored else "복원 포지션 없음 - Entry 조건 감시"
+            if _should_restore_on_start(symbol, holdings_symbols, symbol_store):
+                restored = executor.restore_position_on_start()
+                state_msg = "복원 완료 - Exit 조건 감시" if restored else "복원 포지션 없음 - Entry 조건 감시"
+            else:
+                restored = False
+                state_msg = "복원 생략 - 신규 진입 감시"
+                logger.info(
+                    f"[RESYNC] startup restore 생략: symbol={symbol}, "
+                    "reason=no_holding_no_state"
+                )
             print(f"  - {symbol}: {state_msg} (저장파일: {symbol_store.file_path})")
             executors.append(executor)
             executors_by_symbol[symbol] = executor
@@ -641,17 +674,25 @@ def run_trade(
                 for symbol in refreshed_symbols:
                     if symbol in executors_by_symbol:
                         continue
+                    symbol_store = _symbol_position_store(symbol)
                     executor = MultidayExecutor(
                         api=api,
                         strategy=MultidayTrendATRStrategy(),
                         stock_code=symbol,
                         order_quantity=order_quantity,
                         risk_manager=shared_risk_manager,
-                        position_store=_symbol_position_store(symbol),
+                        position_store=symbol_store,
                         market_data_provider=rest_provider,
                     )
-                    restored = executor.restore_position_on_start()
-                    state_msg = "복원 완료 - Exit 조건 감시" if restored else "복원 포지션 없음 - Entry 조건 감시"
+                    if _should_restore_on_start(symbol, holdings_symbols, symbol_store):
+                        restored = executor.restore_position_on_start()
+                        state_msg = "복원 완료 - Exit 조건 감시" if restored else "복원 포지션 없음 - Entry 조건 감시"
+                    else:
+                        state_msg = "복원 생략 - 신규 진입 감시"
+                        logger.info(
+                            f"[RESYNC] startup restore 생략: symbol={symbol}, "
+                            "reason=no_holding_no_state"
+                        )
                     print(f"  - {symbol}: {state_msg}")
                     executors_by_symbol[symbol] = executor
                     executors.append(executor)

@@ -1346,8 +1346,12 @@ class PositionResynchronizer:
         stored_position: Optional[Any],
     ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
         """동기화 대상 보유를 선택합니다 (target_symbol 우선)."""
-        if self.target_symbol and self.target_symbol in api_holdings:
-            return self.target_symbol, api_holdings[self.target_symbol]
+        if self.target_symbol:
+            # 멀티 심볼 실행에서는 executor별 target_symbol 경계를 엄격히 유지해야 합니다.
+            # target_symbol이 실제 보유에 없으면 다른 단일 보유 종목으로 대체하지 않습니다.
+            if self.target_symbol in api_holdings:
+                return self.target_symbol, api_holdings[self.target_symbol]
+            return None, None
 
         if stored_position is not None:
             stored_symbol = str(getattr(stored_position, "stock_code", "")).strip()
