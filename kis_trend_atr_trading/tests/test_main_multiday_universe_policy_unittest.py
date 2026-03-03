@@ -188,6 +188,19 @@ class _DummyPositionStoreNoState:
         return {}
 
 
+class _DummyPositionStoreMismatchedState:
+    def __init__(self, file_path):
+        self.file_path = file_path
+
+    def _load_raw_data(self):
+        return {
+            "position": {
+                "stock_code": "233740",
+                "quantity": 1,
+            }
+        }
+
+
 class TestMainMultidayUniversePolicy(unittest.TestCase):
     def setUp(self):
         _DummyExecutor.created_symbols = []
@@ -326,6 +339,37 @@ class TestMainMultidayUniversePolicy(unittest.TestCase):
 
         self.assertEqual(_DummyExecutor.created_symbols, ["233740", "005930", "069500"])
         self.assertEqual(_DummyExecutor.restore_calls, ["233740"])
+
+    def test_startup_restore_skips_mismatched_symbol_state(self):
+        _DummyUniverseService.holdings = []
+        _DummyUniverseService.universe = ["005930"]
+        _DummyUniverseService.max_positions = 10
+        _DummyExecutor.holdings_symbols = set()
+
+        with patch.object(main_multiday, "KISApi", _DummyAPI), \
+             patch.object(main_multiday, "UniverseService", _DummyUniverseService), \
+             patch.object(main_multiday, "MultidayExecutor", _DummyExecutor), \
+             patch.object(main_multiday, "MultidayTrendATRStrategy", lambda: object()), \
+             patch.object(main_multiday, "PositionStore", _DummyPositionStoreMismatchedState), \
+             patch.object(main_multiday, "get_telegram_notifier", return_value=_DummyNotifier()), \
+             patch.object(main_multiday, "get_trading_mode", return_value="PAPER"), \
+             patch.object(
+                 main_multiday,
+                 "get_market_session_state",
+                 return_value=(main_multiday.MarketSessionState.IN_SESSION, "regular_session_open"),
+             ), \
+             patch.object(main_multiday, "get_instance_lock", return_value=_DummyLock()), \
+             patch.object(main_multiday, "create_risk_manager_from_settings", return_value=_DummyRiskManager()), \
+             patch.object(main_multiday.settings, "validate_settings", return_value=True), \
+             patch.object(main_multiday.settings, "get_settings_summary", return_value=""):
+            main_multiday.run_trade(
+                stock_code=main_multiday.settings.DEFAULT_STOCK_CODE,
+                interval=0,
+                max_runs=1,
+            )
+
+        self.assertEqual(_DummyExecutor.created_symbols, ["005930"])
+        self.assertEqual(_DummyExecutor.restore_calls, [])
 
     def test_print_banner_uses_real_emoji(self):
         with patch.object(main_multiday.settings, "TRADING_MODE", "REAL"), \

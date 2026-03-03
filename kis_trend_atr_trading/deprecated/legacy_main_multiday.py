@@ -413,7 +413,7 @@ def run_trade(
             data_dir = Path(__file__).resolve().parent / "data"
             return PositionStore(file_path=data_dir / f"positions_{db_mode}_{symbol}.json")
 
-        def _store_has_recoverable_state(symbol_store: PositionStore) -> bool:
+        def _store_has_recoverable_state(symbol: str, symbol_store: PositionStore) -> bool:
             try:
                 raw_loader = getattr(symbol_store, "_load_raw_data", None)
                 payload = raw_loader() if callable(raw_loader) else {}
@@ -423,10 +423,13 @@ def run_trade(
                 if isinstance(position, dict):
                     code = str(position.get("stock_code") or "").strip()
                     qty = int(position.get("quantity") or 0)
-                    if len(code) == 6 and code.isdigit() and qty > 0:
+                    if len(code) == 6 and code.isdigit() and qty > 0 and code == symbol:
                         return True
                 pending_exit = payload.get("pending_exit")
                 if isinstance(pending_exit, dict) and pending_exit:
+                    pending_symbol = str(pending_exit.get("stock_code") or "").strip()
+                    if pending_symbol and pending_symbol != symbol:
+                        return False
                     return True
             except Exception as e:
                 logger.debug(f"[RESYNC] state probe failed: path={symbol_store.file_path}, err={e}")
@@ -435,7 +438,7 @@ def run_trade(
         def _should_restore_on_start(symbol: str, holdings_symbols_for_day, symbol_store: PositionStore) -> bool:
             if symbol in set(holdings_symbols_for_day or []):
                 return True
-            return _store_has_recoverable_state(symbol_store)
+            return _store_has_recoverable_state(symbol, symbol_store)
 
         def _merge_symbols(holdings_symbols, entry_candidates_symbols):
             merged = []
