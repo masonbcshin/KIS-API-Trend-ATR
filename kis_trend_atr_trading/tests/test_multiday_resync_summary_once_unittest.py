@@ -119,6 +119,14 @@ class _DummyTelegram:
         return True
 
 
+class _DummyRiskManager:
+    def __init__(self):
+        self.print_status_calls = 0
+
+    def print_status(self):
+        self.print_status_calls += 1
+
+
 class TestMultidayResyncSummaryOnce(unittest.TestCase):
     def test_summary_notified_once_and_avg_has_comma(self):
         MultidayExecutor._startup_resync_summary_notified = False
@@ -183,6 +191,18 @@ class TestMultidayResyncSummaryOnce(unittest.TestCase):
         assert ex._entry_allowed is False
         assert ex._entry_block_sticky is True
         assert "API_FAILED" in ex._entry_block_reason
+
+    def test_maybe_print_risk_status_only_once_for_shared_manager(self):
+        shared_rm = _DummyRiskManager()
+        ex1 = MultidayExecutor.__new__(MultidayExecutor)
+        ex2 = MultidayExecutor.__new__(MultidayExecutor)
+        ex1.risk_manager = shared_rm
+        ex2.risk_manager = shared_rm
+
+        ex1._maybe_print_risk_status()
+        ex2._maybe_print_risk_status()
+
+        assert shared_rm.print_status_calls == 1
 
 
 if __name__ == "__main__":

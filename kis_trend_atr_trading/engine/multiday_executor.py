@@ -344,8 +344,20 @@ class MultidayExecutor:
         # 리스크 상태 출력 전 계좌 평가 스냅샷 동기화
         self._sync_risk_account_snapshot()
 
-        # 리스크 매니저 상태 출력
+        # 리스크 매니저 상태 출력 (공유 매니저 기준 1회만 출력)
+        self._maybe_print_risk_status()
+
+    def _maybe_print_risk_status(self) -> None:
+        """공유 RiskManager 인스턴스 기준으로 상태를 1회만 출력합니다."""
+        if self.risk_manager is None:
+            return
+        if getattr(self.risk_manager, "_startup_status_printed", False):
+            return
         self.risk_manager.print_status()
+        try:
+            setattr(self.risk_manager, "_startup_status_printed", True)
+        except Exception:
+            pass
 
     def set_entry_control(self, allow_entry: bool, reason: str = "", force: bool = False) -> None:
         """외부 정책(유니버스/보유 상한)에 따른 신규 진입 허용 여부 설정."""

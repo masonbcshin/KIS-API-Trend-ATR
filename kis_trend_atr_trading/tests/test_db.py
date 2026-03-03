@@ -195,6 +195,40 @@ class TestPositionRecord:
 class TestPositionRepositoryCompatibility:
     """positions symbol/stock_code 호환 테스트"""
 
+    def _build_schema_probe_mock_db(self):
+        mock_db = Mock()
+        mock_db.config = Mock(database="kis_trading")
+        mock_db.execute_query.side_effect = [
+            [{"column_name": "stock_code"}],  # 컬럼 탐지
+            {  # position_id 메타(필수, 문자열)
+                "data_type": "varchar",
+                "is_nullable": "NO",
+                "column_default": None,
+                "extra": "",
+            },
+            {"cnt": 0},  # state 컬럼 미존재
+            {"cnt": 0},  # entry_date 컬럼 미존재
+            {"cnt": 0},  # stop_loss 컬럼 미존재
+            {"cnt": 0},  # take_profit 컬럼 미존재
+            {"cnt": 0},  # atr_value 컬럼 미존재
+            {"cnt": 0},  # atr 컬럼 미존재
+            {"cnt": 0},  # created_at 컬럼 미존재
+            {"cnt": 0},  # updated_at 컬럼 미존재
+        ]
+        return mock_db
+
+    @patch("db.repository.logger.warning")
+    def test_schema_compat_warning_is_summarized_once(self, mock_warning):
+        PositionRepository._schema_compat_logged_keys.clear()
+
+        repo1 = PositionRepository(db=self._build_schema_probe_mock_db())
+        repo2 = PositionRepository(db=self._build_schema_probe_mock_db())
+
+        assert repo1._positions_symbol_column == "stock_code"
+        assert repo2._positions_symbol_column == "stock_code"
+        assert mock_warning.call_count == 1
+        assert "positions 스키마 호환 모드 활성화" in mock_warning.call_args_list[0][0][0]
+
     def test_upsert_uses_stock_code_when_symbol_missing(self):
         mock_db = Mock()
         mock_db.config = Mock(database="kis_trading")

@@ -260,6 +260,9 @@ class PositionRepository:
         repo.close_position("005930")
     """
     
+    _schema_compat_log_lock = threading.Lock()
+    _schema_compat_logged_keys = set()
+
     def __init__(self, db: MySQLManager = None):
         """
         Args:
@@ -277,6 +280,48 @@ class PositionRepository:
         self._positions_has_atr_column = self._detect_positions_atr_column()
         self._positions_has_created_at_column = self._detect_positions_created_at_column()
         self._positions_has_updated_at_column = self._detect_positions_updated_at_column()
+        self._log_schema_compat_summary_once()
+
+    def _schema_compat_tokens(self) -> List[str]:
+        """현재 positions 호환 활성화 항목을 토큰 리스트로 반환합니다."""
+        tokens: List[str] = []
+        if self._positions_symbol_column == "stock_code":
+            tokens.append("stock_code_symbol")
+        if self._position_id_required:
+            tokens.append("position_id_required")
+        if self._positions_has_state_column:
+            tokens.append("state")
+        if self._positions_has_entry_date_column:
+            tokens.append("entry_date")
+        if self._positions_has_stop_loss_column:
+            tokens.append("stop_loss")
+        if self._positions_has_take_profit_column:
+            tokens.append("take_profit")
+        if self._positions_has_atr_value_column:
+            tokens.append("atr_value")
+        if self._positions_has_atr_column:
+            tokens.append("atr")
+        if self._positions_has_created_at_column:
+            tokens.append("created_at")
+        if self._positions_has_updated_at_column:
+            tokens.append("updated_at")
+        return tokens
+
+    def _log_schema_compat_summary_once(self) -> None:
+        """호환 모드 경고를 실행당 1회 요약 출력합니다."""
+        tokens = self._schema_compat_tokens()
+        if not tokens:
+            return
+        database_name = str(getattr(getattr(self.db, "config", None), "database", "unknown") or "unknown")
+        key = f"{database_name}:{self.mode}:{'|'.join(tokens)}"
+        with self.__class__._schema_compat_log_lock:
+            if key in self.__class__._schema_compat_logged_keys:
+                return
+            self.__class__._schema_compat_logged_keys.add(key)
+        logger.warning(
+            "[REPO] positions 스키마 호환 모드 활성화: %s",
+            ", ".join(tokens),
+        )
 
     def _detect_positions_symbol_column(self) -> str:
         """
@@ -309,7 +354,6 @@ class PositionRepository:
             if "symbol" in names:
                 return "symbol"
             if "stock_code" in names:
-                logger.warning("[REPO] positions 컬럼 호환 모드 활성화: stock_code 사용")
                 return "stock_code"
         except Exception as e:
             logger.warning(f"[REPO] positions 컬럼 탐지 실패(기본 symbol 사용): {e}")
@@ -353,8 +397,6 @@ class PositionRepository:
                 "tinyint", "smallint", "mediumint", "int", "integer", "bigint"
             }
             is_required = is_nullable == "NO" and column_default is None and "auto_increment" not in extra
-            if is_required:
-                logger.warning("[REPO] positions.position_id 필수 입력 컬럼 감지: 호환 모드 활성화")
             return is_required, is_numeric
         except Exception as e:
             logger.warning(f"[REPO] position_id 컬럼 탐지 실패: {e}")
@@ -416,7 +458,7 @@ class PositionRepository:
             "[REPO] positions.updated_at 컬럼 감지: updated_at 동기화 활성화",
         )
 
-    def _detect_positions_legacy_column(self, column_name: str, found_log: str) -> bool:
+    def _detect_positions_legacy_column(self, column_name: str, _found_log: str) -> bool:
         """positions 테이블의 특정 레거시 컬럼 존재 여부를 탐지합니다."""
         try:
             database_name = getattr(getattr(self.db, "config", None), "database", None)
@@ -437,8 +479,6 @@ class PositionRepository:
             if row:
                 cnt = row.get("cnt", row.get("CNT", 0)) or 0
             has_column = int(cnt) > 0
-            if has_column:
-                logger.warning(found_log)
             return has_column
         except Exception as e:
             logger.warning(f"[REPO] positions.{column_name} 컬럼 탐지 실패: {e}")
