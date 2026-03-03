@@ -100,6 +100,7 @@ class _DummyLock:
 class _DummyUniverseService:
     holdings = []
     universe = []
+    candidates = []
     max_positions = 10
 
     def __init__(self, yaml_path, kis_client):
@@ -120,6 +121,16 @@ class _DummyUniverseService:
     def compute_entry_candidates(self, holdings, todays_universe):
         h = set(holdings)
         return [s for s in todays_universe if s not in h]
+
+    def get_todays_universe_snapshot(self, trade_date):
+        candidates = list(self.__class__.candidates or self.__class__.universe)
+        finals = list(self.__class__.universe)
+        return {
+            "trade_date": trade_date,
+            "selection_method": self.policy.selection_method,
+            "candidate_symbols": candidates,
+            "universe_symbols": finals,
+        }
 
 
 class _DummyExecutor:
@@ -156,12 +167,23 @@ class _DummyRiskManager:
         return types.SimpleNamespace(passed=True, should_exit=False, reason="")
 
 
+class _DummyNotifier:
+    def __init__(self):
+        self.enabled = True
+        self.info_messages = []
+
+    def notify_info(self, message):
+        self.info_messages.append(str(message))
+        return True
+
+
 class TestMainMultidayUniversePolicy(unittest.TestCase):
     def setUp(self):
         _DummyExecutor.created_symbols = []
         _DummyExecutor.run_once_calls = []
         _DummyExecutor.entry_controls = []
         _DummyExecutor.holdings_symbols = set()
+        _DummyUniverseService.candidates = []
 
     def test_holdings_are_managed_even_if_not_in_todays_universe(self):
         _DummyUniverseService.holdings = ["999999"]
@@ -173,6 +195,7 @@ class TestMainMultidayUniversePolicy(unittest.TestCase):
              patch.object(main_multiday, "UniverseService", _DummyUniverseService), \
              patch.object(main_multiday, "MultidayExecutor", _DummyExecutor), \
              patch.object(main_multiday, "MultidayTrendATRStrategy", lambda: object()), \
+             patch.object(main_multiday, "get_telegram_notifier", return_value=_DummyNotifier()), \
              patch.object(main_multiday, "get_trading_mode", return_value="PAPER"), \
              patch.object(
                  main_multiday,
@@ -202,6 +225,7 @@ class TestMainMultidayUniversePolicy(unittest.TestCase):
              patch.object(main_multiday, "UniverseService", _DummyUniverseService), \
              patch.object(main_multiday, "MultidayExecutor", _DummyExecutor), \
              patch.object(main_multiday, "MultidayTrendATRStrategy", lambda: object()), \
+             patch.object(main_multiday, "get_telegram_notifier", return_value=_DummyNotifier()), \
              patch.object(main_multiday, "get_trading_mode", return_value="PAPER"), \
              patch.object(
                  main_multiday,
@@ -222,6 +246,43 @@ class TestMainMultidayUniversePolicy(unittest.TestCase):
         self.assertTrue(blocked)
         self.assertFalse(blocked[-1][1])
         self.assertIn("max_positions reached", blocked[-1][2])
+
+    def test_daily_universe_selection_is_notified_to_telegram(self):
+        _DummyUniverseService.holdings = []
+        _DummyUniverseService.universe = ["111111", "222222"]
+        _DummyUniverseService.candidates = ["333333", "444444", "555555"]
+        _DummyUniverseService.max_positions = 10
+        notifier = _DummyNotifier()
+
+        with patch.object(main_multiday, "KISApi", _DummyAPI), \
+             patch.object(main_multiday, "UniverseService", _DummyUniverseService), \
+             patch.object(main_multiday, "MultidayExecutor", _DummyExecutor), \
+             patch.object(main_multiday, "MultidayTrendATRStrategy", lambda: object()), \
+             patch.object(main_multiday, "get_telegram_notifier", return_value=notifier), \
+             patch.object(main_multiday, "get_trading_mode", return_value="PAPER"), \
+             patch.object(
+                 main_multiday,
+                 "get_market_session_state",
+                 return_value=(main_multiday.MarketSessionState.IN_SESSION, "regular_session_open"),
+             ), \
+             patch.object(main_multiday, "get_instance_lock", return_value=_DummyLock()), \
+             patch.object(main_multiday, "create_risk_manager_from_settings", return_value=_DummyRiskManager()), \
+             patch.object(main_multiday.settings, "validate_settings", return_value=True), \
+             patch.object(main_multiday.settings, "get_settings_summary", return_value=""):
+            main_multiday.run_trade(
+                stock_code=main_multiday.settings.DEFAULT_STOCK_CODE,
+                interval=0,
+                max_runs=1,
+            )
+
+        self.assertEqual(len(notifier.info_messages), 2)
+        self.assertIn("후보 3개", notifier.info_messages[0])
+        self.assertIn("333333", notifier.info_messages[0])
+        self.assertIn("444444", notifier.info_messages[0])
+        self.assertIn("555555", notifier.info_messages[0])
+        self.assertIn("최종 선정 2개", notifier.info_messages[1])
+        self.assertIn("111111", notifier.info_messages[1])
+        self.assertIn("222222", notifier.info_messages[1])
 
 
 if __name__ == "__main__":

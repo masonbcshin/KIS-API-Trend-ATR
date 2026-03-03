@@ -64,6 +64,7 @@ class UniverseSelector:
         self.trading_mode = get_trading_mode()
         self._last_market_codes_source = "not_used"
         self._last_volume_data_source = "not_used"
+        self._last_selection_meta: Dict[str, Any] = {}
         root = Path(__file__).resolve().parent.parent
         self.cache_file = root / self.config.universe_cache_file
         self.cache_file.parent.mkdir(parents=True, exist_ok=True)
@@ -165,10 +166,43 @@ class UniverseSelector:
         )
         return self._select_and_cache(now)
 
+    def _normalize_symbol_list(self, symbols: Iterable[Any]) -> List[str]:
+        out: List[str] = []
+        for value in symbols:
+            code = str(value or "").strip()
+            if not self._is_valid_code(code):
+                continue
+            out.append(code)
+        return self._dedupe(out)
+
+    def _set_last_selection_meta(
+        self,
+        candidate_symbols: Iterable[Any],
+        pre_limit_symbols: Iterable[Any],
+        selected_symbols: Iterable[Any],
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self._last_selection_meta = {
+            "candidate_symbols": self._normalize_symbol_list(candidate_symbols),
+            "pre_limit_symbols": self._normalize_symbol_list(pre_limit_symbols),
+            "selected_symbols": self._normalize_symbol_list(selected_symbols),
+            "meta": dict(meta or {}),
+        }
+
+    def get_last_selection_meta(self) -> Dict[str, Any]:
+        payload = self._last_selection_meta or {}
+        return {
+            "candidate_symbols": [str(x) for x in payload.get("candidate_symbols") or []],
+            "pre_limit_symbols": [str(x) for x in payload.get("pre_limit_symbols") or []],
+            "selected_symbols": [str(x) for x in payload.get("selected_symbols") or []],
+            "meta": dict(payload.get("meta") or {}),
+        }
+
     def _select_and_cache(self, now: datetime, method_suffix: str = "") -> List[str]:
         try:
             method = self.config.selection_method
             logger.info(f"[UNIVERSE] 재선정 시작: method={method}")
+            self._last_selection_meta = {}
             if method == "fixed":
                 selected = self._select_fixed()
             elif method == "volume_top":
@@ -182,7 +216,19 @@ class UniverseSelector:
 
             validated = self._finalize(selected)
             cache_method = method if not method_suffix else f"{method}_{method_suffix}"
-            self._save_cache(now, validated, cache_method)
+            snapshot = self.get_last_selection_meta()
+            self._set_last_selection_meta(
+                candidate_symbols=snapshot.get("candidate_symbols") or selected,
+                pre_limit_symbols=snapshot.get("pre_limit_symbols") or selected,
+                selected_symbols=validated,
+                meta={**dict(snapshot.get("meta") or {}), "selection_method": method},
+            )
+            self._save_cache(
+                now,
+                validated,
+                cache_method,
+                selection_meta=self.get_last_selection_meta(),
+            )
             logger.info(
                 f"[UNIVERSE] 최종 종목: {validated} "
                 f"(method={method}, cache_method={cache_method}, cache_file={self.cache_file})"
@@ -197,7 +243,14 @@ class UniverseSelector:
     # ----------------------------
     def _select_fixed(self) -> List[str]:
         # backward compatibility: preserve fixed.stocks behavior
-        return self.config.stocks[: self.config.max_stocks]
+        selected = self.config.stocks[: self.config.max_stocks]
+        self._set_last_selection_meta(
+            candidate_symbols=selected,
+            pre_limit_symbols=selected,
+            selected_symbols=selected,
+            meta={"strategy": "fixed"},
+        )
+        return selected
 
     def _select_volume_top(self, limit: int) -> List[str]:
         mode = self.config.candidate_pool_mode
@@ -266,6 +319,17 @@ class UniverseSelector:
         rows.sort(key=lambda x: x[1], reverse=True)
         selected = [c for c, _ in rows[:effective_limit]]
         self._last_volume_data_source = data_source
+        self._set_last_selection_meta(
+            candidate_symbols=selected,
+            pre_limit_symbols=selected,
+            selected_symbols=selected,
+            meta={
+                "strategy": "volume_top",
+                "pool_size": int(pool_size),
+                "effective_limit": int(effective_limit),
+                "data_source": str(data_source),
+            },
+        )
         logger.info(f"[UNIVERSE] volume_top data_source={data_source}")
         logger.info(f"[UNIVERSE] volume_top 통과={len(selected)}")
         return selected
@@ -284,7 +348,14 @@ class UniverseSelector:
             except Exception:
                 continue
         logger.info(f"[UNIVERSE] atr_filter 통과={len(selected)}")
-        return selected[: self.config.max_stocks]
+        limited = selected[: self.config.max_stocks]
+        self._set_last_selection_meta(
+            candidate_symbols=pool,
+            pre_limit_symbols=selected,
+            selected_symbols=limited,
+            meta={"strategy": "atr_filter"},
+        )
+        return limited
 
     def _select_combined(self) -> List[str]:
         first_stage = self._select_volume_top(self.config.max_stocks * 3)
@@ -305,7 +376,18 @@ class UniverseSelector:
             logger.info(
                 "[UNIVERSE] restricted pool 모드(yaml): 최종 선정이 candidate_stocks와 동일합니다."
             )
-        return second_stage[: self.config.max_stocks]
+        limited = second_stage[: self.config.max_stocks]
+        self._set_last_selection_meta(
+            candidate_symbols=first_stage,
+            pre_limit_symbols=second_stage,
+            selected_symbols=limited,
+            meta={
+                "strategy": "combined",
+                "stage1_count": len(first_stage),
+                "stage2_count": len(second_stage),
+            },
+        )
+        return limited
 
     # ----------------------------
     # Helpers
@@ -323,7 +405,19 @@ class UniverseSelector:
         fallback = self._finalize(self._select_fixed())
         if self.trading_mode == "REAL" and self.config.halt_on_fallback_in_real:
             raise RuntimeError("REAL 모드 fallback 발생으로 거래 중단(halt_on_fallback_in_real=true)")
-        self._save_cache(datetime.now(KST), fallback, "fixed_fallback")
+        snapshot = self.get_last_selection_meta()
+        self._set_last_selection_meta(
+            candidate_symbols=snapshot.get("candidate_symbols") or fallback,
+            pre_limit_symbols=snapshot.get("pre_limit_symbols") or fallback,
+            selected_symbols=fallback,
+            meta={**dict(snapshot.get("meta") or {}), "strategy": "fixed_fallback", "reason": str(reason)},
+        )
+        self._save_cache(
+            datetime.now(KST),
+            fallback,
+            "fixed_fallback",
+            selection_meta=self.get_last_selection_meta(),
+        )
         logger.warning(f"[UNIVERSE] fallback 적용 종목={fallback}")
         return fallback
 
@@ -507,16 +601,32 @@ class UniverseSelector:
 
         return ""
 
-    def _save_cache(self, now: datetime, stocks: List[str], method: str) -> None:
+    def _save_cache(
+        self,
+        now: datetime,
+        stocks: List[str],
+        method: str,
+        selection_meta: Optional[Dict[str, Any]] = None,
+    ) -> None:
         market_open_refreshed = ("refresh_" in method) or ("intra_bootstrap" in method)
+        snapshot = selection_meta or {}
+        candidate_symbols = self._normalize_symbol_list(snapshot.get("candidate_symbols") or stocks)
+        pre_limit_symbols = self._normalize_symbol_list(snapshot.get("pre_limit_symbols") or candidate_symbols)
+        selected_symbols = self._normalize_symbol_list(snapshot.get("selected_symbols") or stocks)
+        extra_meta = dict(snapshot.get("meta") or {})
         payload = {
             "date": now.strftime("%Y-%m-%d"),
             "stocks": stocks,
+            "candidate_symbols": candidate_symbols,
+            "pre_limit_symbols": pre_limit_symbols,
+            "selected_symbols": selected_symbols,
             "selection_method": method,
             "saved_at": now.isoformat(),
             "cache_key": now.strftime("%Y-%m-%d"),
             "market_open_refreshed": market_open_refreshed,
         }
+        if extra_meta:
+            payload["selection_meta"] = extra_meta
         self.cache_file.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",

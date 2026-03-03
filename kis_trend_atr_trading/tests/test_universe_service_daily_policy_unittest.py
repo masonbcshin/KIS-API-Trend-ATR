@@ -173,6 +173,34 @@ stocks:
 
             self.assertEqual(symbols, ["069500", "233740"])
 
+    def test_get_todays_universe_snapshot_prefers_cached_candidates(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            yaml_path = self._write_yaml(root)
+            service = UniverseService(str(yaml_path), _DummyKIS(), data_dir=root / "data")
+            cache_file = root / "data" / "universe_cache.json"
+            service.policy.cache_file = cache_file
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(
+                json.dumps(
+                    {
+                        "date": "2026-02-12",
+                        "selection_method": "combined",
+                        "candidate_symbols": ["005930", "000660", "035720"],
+                        "universe_symbols": ["005930", "035720"],
+                        "stocks": ["005930", "035720"],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            snapshot = service.get_todays_universe_snapshot("2026-02-12")
+
+            self.assertEqual(snapshot["candidate_symbols"], ["005930", "000660", "035720"])
+            self.assertEqual(snapshot["universe_symbols"], ["005930", "035720"])
+
 
 if __name__ == "__main__":
     unittest.main()

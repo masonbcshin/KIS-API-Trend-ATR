@@ -64,6 +64,7 @@ from kis_trend_atr_trading.universe.universe_service import UniverseService
 from kis_trend_atr_trading.utils.logger import setup_logger, get_logger
 from kis_trend_atr_trading.utils.market_hours import KST, MarketSessionState, get_market_session_state
 from kis_trend_atr_trading.utils.position_store import PositionStore
+from kis_trend_atr_trading.utils.telegram_notifier import get_telegram_notifier
 from kis_trend_atr_trading.env import (
     get_trading_mode,
     get_db_namespace_mode,
@@ -405,6 +406,7 @@ def run_trade(
             db_mode = "REAL" if trading_mode == "REAL" else ("DRY_RUN" if trading_mode == "CBT" else "PAPER")
         if db_mode not in ("DRY_RUN", "PAPER", "REAL"):
             db_mode = "PAPER"
+        last_universe_notified_date = ""
 
         def _symbol_position_store(symbol: str) -> PositionStore:
             data_dir = Path(__file__).resolve().parent / "data"
@@ -417,6 +419,47 @@ def run_trade(
                     merged.append(sym)
             return merged
 
+        def _normalize_symbol_list(values):
+            out = []
+            for value in list(values or []):
+                code = str(value or "").strip()
+                if len(code) == 6 and code.isdigit() and code not in out:
+                    out.append(code)
+            return out
+
+        def _notify_daily_universe_selection(
+            trade_date: str,
+            candidate_symbols,
+            final_symbols,
+        ) -> None:
+            nonlocal last_universe_notified_date
+            final_list = _normalize_symbol_list(final_symbols)
+            if not final_list:
+                return
+            if trade_date == last_universe_notified_date:
+                return
+            candidate_list = _normalize_symbol_list(candidate_symbols) or list(final_list)
+            try:
+                notifier = get_telegram_notifier()
+                if notifier is None or not getattr(notifier, "enabled", False):
+                    last_universe_notified_date = trade_date
+                    return
+                candidate_lines = [f"{idx}. {code}" for idx, code in enumerate(candidate_list, 1)]
+                candidate_message = (
+                    f"[UNIVERSE] {trade_date} 후보 {len(candidate_list)}개\n"
+                    + "\n".join(candidate_lines)
+                )
+                final_lines = [f"{idx}. {code}" for idx, code in enumerate(final_list, 1)]
+                final_message = (
+                    f"[UNIVERSE] {trade_date} 최종 선정 {len(final_list)}개\n"
+                    + "\n".join(final_lines)
+                )
+                notifier.notify_info(candidate_message)
+                notifier.notify_info(final_message)
+                last_universe_notified_date = trade_date
+            except Exception as e:
+                logger.warning(f"[TELEGRAM] 유니버스 알림 전송 실패(계속 진행): {e}")
+
         def _refresh_daily_universe():
             trade_date = datetime.now(KST).strftime("%Y-%m-%d")
             holdings_symbols = universe_service.load_holdings_symbols()
@@ -424,6 +467,17 @@ def run_trade(
             entry_candidates = universe_service.compute_entry_candidates(
                 holdings_symbols, todays_universe
             )
+            candidate_symbols = list(todays_universe)
+            get_snapshot = getattr(universe_service, "get_todays_universe_snapshot", None)
+            if callable(get_snapshot):
+                try:
+                    snapshot = dict(get_snapshot(trade_date) or {})
+                    cached_candidates = snapshot.get("candidate_symbols") or []
+                    if isinstance(cached_candidates, list) and cached_candidates:
+                        candidate_symbols = cached_candidates
+                except Exception as e:
+                    logger.warning(f"[UNIVERSE] snapshot read failed, fallback to final list: {e}")
+            _notify_daily_universe_selection(trade_date, candidate_symbols, todays_universe)
             for sym in holdings_symbols:
                 if sym in todays_universe:
                     logger.info(f"[ENTRY] skipped: already holding symbol={sym}")

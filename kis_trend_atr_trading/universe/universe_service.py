@@ -148,24 +148,72 @@ class UniverseService:
         except Exception:
             return None
 
+    @staticmethod
+    def _normalize_symbol_list(values: Any) -> List[str]:
+        out: List[str] = []
+        if not isinstance(values, list):
+            return out
+        for value in values:
+            code = str(value or "").strip()
+            if len(code) == 6 and code.isdigit() and code not in out:
+                out.append(code)
+        return out
+
+    def get_todays_universe_snapshot(self, trade_date: str) -> Dict[str, Any]:
+        payload = self._read_cache_for_date(trade_date) or {}
+        final_symbols = self._normalize_symbol_list(
+            payload.get("universe_symbols") or payload.get("stocks") or []
+        )
+        candidate_symbols = self._normalize_symbol_list(
+            payload.get("candidate_symbols")
+            or payload.get("pre_limit_symbols")
+            or payload.get("selected_symbols")
+            or []
+        )
+        if not candidate_symbols:
+            candidate_symbols = list(final_symbols)
+        return {
+            "trade_date": trade_date,
+            "selection_method": str(payload.get("selection_method") or self.policy.selection_method),
+            "candidate_symbols": candidate_symbols,
+            "universe_symbols": final_symbols,
+        }
+
     def _save_cache(
         self,
         trade_date: str,
         symbols: List[str],
         selection_method: str,
+        selection_snapshot: Optional[Dict[str, Any]] = None,
     ) -> None:
+        snapshot = selection_snapshot or {}
+        final_symbols = self._normalize_symbol_list(symbols)
+        candidate_symbols = self._normalize_symbol_list(
+            snapshot.get("candidate_symbols") or final_symbols
+        )
+        pre_limit_symbols = self._normalize_symbol_list(
+            snapshot.get("pre_limit_symbols") or candidate_symbols
+        )
+        selected_symbols = self._normalize_symbol_list(
+            snapshot.get("selected_symbols") or final_symbols
+        )
         payload = {
             "date": trade_date,
             "selection_method": selection_method,
             "universe_size": self.policy.universe_size,
             "max_positions": self.policy.max_positions,
             "params": self.policy.params,
-            "universe_symbols": symbols,
-            "stocks": symbols,  # backward compatibility
+            "candidate_symbols": candidate_symbols,
+            "pre_limit_symbols": pre_limit_symbols,
+            "selected_symbols": selected_symbols,
+            "universe_symbols": final_symbols,
+            "stocks": final_symbols,  # backward compatibility
             "created_at": datetime.now(KST).isoformat(),
             "cache_key": trade_date,
             "saved_at": datetime.now(KST).isoformat(),
         }
+        if isinstance(snapshot.get("meta"), dict) and snapshot.get("meta"):
+            payload["selection_meta"] = dict(snapshot.get("meta"))
         self.policy.cache_file.parent.mkdir(parents=True, exist_ok=True)
         self.policy.cache_file.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
@@ -192,7 +240,19 @@ class UniverseService:
 
         try:
             symbols = selector.select()
-            self._save_cache(trade_date, symbols, self.policy.selection_method)
+            snapshot: Dict[str, Any] = {}
+            get_meta = getattr(selector, "get_last_selection_meta", None)
+            if callable(get_meta):
+                try:
+                    snapshot = dict(get_meta() or {})
+                except Exception:
+                    snapshot = {}
+            self._save_cache(
+                trade_date,
+                symbols,
+                self.policy.selection_method,
+                selection_snapshot=snapshot,
+            )
             logger.info(
                 f"[UNIVERSE] today={trade_date} method={self.policy.selection_method} "
                 f"universe_size={self.policy.universe_size} -> symbols={symbols}"
@@ -210,7 +270,17 @@ class UniverseService:
 
             if self.policy.fixed_stocks:
                 symbols = self.policy.fixed_stocks[: self.policy.universe_size]
-                self._save_cache(trade_date, symbols, "fixed_fallback")
+                self._save_cache(
+                    trade_date,
+                    symbols,
+                    "fixed_fallback",
+                    selection_snapshot={
+                        "candidate_symbols": symbols,
+                        "pre_limit_symbols": symbols,
+                        "selected_symbols": symbols,
+                        "meta": {"strategy": "fixed_fallback", "reason": reason},
+                    },
+                )
                 logger.warning(
                     f"[UNIVERSE] refresh failed -> fallback reason={reason} using=fixed_stocks"
                 )
@@ -219,7 +289,17 @@ class UniverseService:
             logger.warning(
                 f"[UNIVERSE] refresh failed -> fallback reason={reason} using=empty_universe"
             )
-            self._save_cache(trade_date, [], "empty_fallback")
+            self._save_cache(
+                trade_date,
+                [],
+                "empty_fallback",
+                selection_snapshot={
+                    "candidate_symbols": [],
+                    "pre_limit_symbols": [],
+                    "selected_symbols": [],
+                    "meta": {"strategy": "empty_fallback", "reason": reason},
+                },
+            )
             return []
 
     @staticmethod
