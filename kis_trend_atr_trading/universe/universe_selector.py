@@ -475,7 +475,8 @@ class UniverseSelector:
         if mode == "kospi200":
             return self._load_kospi200_codes()
         if mode in ("volume_top", "market"):
-            return self._select_volume_top(self.config.max_stocks * 3)
+            stage1_limit = max(int(self.config.volume_top_n), self.config.max_stocks)
+            return self._select_volume_top(stage1_limit)
         return self._dedupe(self.config.candidate_stocks or self.config.stocks)
 
     def _load_market_codes(self) -> List[str]:

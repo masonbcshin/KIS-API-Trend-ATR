@@ -352,6 +352,27 @@ class UniverseSelectorFixedTests(unittest.TestCase):
             self.assertEqual(observed["limit"], 8)
             self.assertEqual(len(selected), 5)
 
+    def test_atr_filter_market_pool_uses_volume_top_n(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = UniverseSelectionConfig(
+                selection_method="atr_filter",
+                candidate_pool_mode="market",
+                max_stocks=5,
+                volume_top_n=9,
+                universe_cache_file=str(Path(td) / "universe_cache.json"),
+            )
+            selector = UniverseSelector(config=cfg, kis_client=_DummyKIS(), db=None)
+            observed = {}
+
+            def _fake_stage1(limit):
+                observed["limit"] = limit
+                return ["005930", "000660", "035420", "051910", "068270", "207940", "006400", "105560", "012330"]
+
+            selector._select_volume_top = _fake_stage1  # type: ignore
+            pool = selector._resolve_atr_candidate_pool()
+            self.assertEqual(observed["limit"], 9)
+            self.assertEqual(len(pool), 9)
+
     def test_combined_reranks_by_trend_score_not_stage1_order(self):
         with tempfile.TemporaryDirectory() as td:
             cfg = UniverseSelectionConfig(
