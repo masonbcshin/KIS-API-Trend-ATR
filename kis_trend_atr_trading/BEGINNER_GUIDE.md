@@ -172,6 +172,11 @@ python3 -m kis_trend_atr_trading.main_multiday --mode trade --interval 60
 - 종목은 1~2개부터
 - `max_positions`를 작게 유지
 
+캐시 동작(초보자용 핵심):
+- `universe_cache.json`은 `schema_version`을 포함해 저장됩니다.
+- `date + db_mode + policy_signature + cache_key`가 같을 때만 재사용됩니다.
+- 구버전 캐시는 가능한 경우 자동 변환되고, 호환되지 않으면 자동으로 재선정됩니다.
+
 포지션 파일 확인 팁:
 - 단일 경로(`apps.kr_trade`) 기본: `kis_trend_atr_trading/data/positions.json`
 - 멀티종목 경로(`main_multiday`) 기본: `kis_trend_atr_trading/data/positions_{mode}_{symbol}.json`

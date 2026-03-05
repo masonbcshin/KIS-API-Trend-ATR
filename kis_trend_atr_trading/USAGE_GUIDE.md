@@ -151,6 +151,13 @@ python3 -m kis_trend_atr_trading.apps.kr_cbt --help
 - `max_positions: 1`
 - 종목 1~2개로 충분히 검증
 
+### 5-1. Universe 캐시 스키마(운영)
+- 캐시 파일: `kis_trend_atr_trading/data/universe_cache.json`
+- 주요 필드: `schema_version`, `date`, `db_mode`, `policy_signature`, `cache_key`
+- 재사용 조건: 위 식별자가 현재 실행 정책과 일치할 때만 `HIT`
+- 구버전(`schema_version=1` 또는 미기재) 캐시는 정책 호환 시 자동 마이그레이션 후 `v2`로 재저장
+- 미지원 버전/손상 캐시는 자동 무효화되고 당일 유니버스를 재선정
+
 ---
 
 ## 6. 로그와 알림 해석

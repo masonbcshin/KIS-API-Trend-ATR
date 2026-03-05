@@ -273,15 +273,26 @@ selection_method:
 
 저장 필드:
 
+- `schema_version` (현재: `2`)
 - `date`
-- `stocks`
+- `db_mode`
+- `policy_signature`
+- `cache_key`
 - `selection_method`
+- `universe_size`, `max_positions`, `params`
+- `candidate_symbols`, `pre_limit_symbols`, `selected_symbols`
+- `universe_symbols` (`stocks`는 하위호환 유지)
+- `created_at`, `saved_at`
+- `selection_meta`(선택)
 
 정책:
 
 - 장전: 재계산 후 캐시 갱신
 - 장중 재시작: 캐시 재사용
-- 장중이라도 `selection_method`가 캐시 메서드와 다르면 캐시 즉시 무효화 후 재선정
+- 재사용 조건: `date + db_mode + policy_signature + cache_key` 일치
+- `schema_version` 미일치 시:
+  - `v1 -> v2`는 정책 호환 시 자동 마이그레이션 후 재저장
+  - 그 외(미지원/손상)는 캐시 무효화 후 재선정
 - 로그에 `CACHE HIT/MISS`, 사유(reason), `cache_key`, `cache_file` 출력
 
 ### fallback 정책

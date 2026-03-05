@@ -117,6 +117,55 @@ stocks:
             self.assertEqual(second, first)
             self.assertEqual(mocked.call_count, 1)
             self.assertTrue(cache_file.exists())
+            payload = json.loads(cache_file.read_text(encoding="utf-8"))
+            self.assertEqual(payload.get("schema_version"), service.CACHE_SCHEMA_VERSION)
+
+    def test_legacy_cache_payload_is_migrated_and_reused(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            yaml_path = self._write_yaml(root)
+            service = UniverseService(str(yaml_path), _DummyKIS(), data_dir=root / "data")
+            cache_file = root / "data" / "universe_cache.json"
+            service.policy.cache_file = cache_file
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(
+                json.dumps(
+                    {
+                        "date": "2026-02-12",
+                        "selection_method": "combined",
+                        "universe_size": 3,
+                        "max_positions": 2,
+                        "params": {
+                            "min_volume": None,
+                            "min_market_cap": None,
+                            "min_atr_pct": None,
+                            "max_atr_pct": None,
+                            "candidate_pool_mode": None,
+                            "market_scan_size": None,
+                        },
+                        "candidate_symbols": ["005930", "000660", "035720"],
+                        "stocks": ["005930", "000660", "035720"],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            with patch(
+                "universe.universe_service.UniverseSelector.from_yaml",
+                return_value=_DummySelector(["069500", "229200", "114800"]),
+            ) as mocked:
+                symbols = service.get_or_create_todays_universe("2026-02-12")
+
+            self.assertEqual(symbols, ["005930", "000660", "035720"])
+            self.assertEqual(mocked.call_count, 0)
+            migrated = json.loads(cache_file.read_text(encoding="utf-8"))
+            expected_identity = service._build_cache_identity("2026-02-12")
+            self.assertEqual(migrated.get("schema_version"), service.CACHE_SCHEMA_VERSION)
+            self.assertEqual(migrated.get("db_mode"), expected_identity["db_mode"])
+            self.assertEqual(migrated.get("policy_signature"), expected_identity["policy_signature"])
+            self.assertEqual(migrated.get("cache_key"), expected_identity["cache_key"])
 
     def test_policy_change_invalidates_same_day_cache(self):
         with tempfile.TemporaryDirectory() as td:
@@ -140,6 +189,38 @@ stocks:
             self.assertEqual(first, ["005930", "000660", "035720"])
             self.assertEqual(second, ["069500", "229200", "114800"])
             self.assertEqual(mocked.call_count, 2)
+
+    def test_unsupported_schema_version_invalidates_cache(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            yaml_path = self._write_yaml(root)
+            service = UniverseService(str(yaml_path), _DummyKIS(), data_dir=root / "data")
+            cache_file = root / "data" / "universe_cache.json"
+            service.policy.cache_file = cache_file
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 999,
+                        "date": "2026-02-12",
+                        "stocks": ["005930", "000660", "035720"],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            with patch(
+                "universe.universe_service.UniverseSelector.from_yaml",
+                return_value=_DummySelector(["069500", "229200", "114800"]),
+            ) as mocked:
+                symbols = service.get_or_create_todays_universe("2026-02-12")
+
+            self.assertEqual(symbols, ["069500", "229200", "114800"])
+            self.assertEqual(mocked.call_count, 1)
+            payload = json.loads(cache_file.read_text(encoding="utf-8"))
+            self.assertEqual(payload.get("schema_version"), service.CACHE_SCHEMA_VERSION)
 
     def test_refresh_failure_fallback_to_fixed_stocks(self):
         with tempfile.TemporaryDirectory() as td:
@@ -208,6 +289,7 @@ stocks:
             cache_file.write_text(
                 json.dumps(
                     {
+                        "schema_version": service.CACHE_SCHEMA_VERSION,
                         "date": "2026-02-12",
                         "db_mode": identity["db_mode"],
                         "policy_signature": identity["policy_signature"],

@@ -41,6 +41,8 @@ class UniverseService:
     - todays_universe: 오늘 신규 진입 후보 원본
     - entry_candidates: todays_universe - holdings_symbols
     """
+    CACHE_SCHEMA_VERSION = 2
+    LEGACY_CACHE_SCHEMA_VERSION = 1
 
     def __init__(self, yaml_path: str, kis_client: Any, data_dir: Optional[Path] = None):
         self.yaml_path = Path(yaml_path)
@@ -158,13 +160,134 @@ class UniverseService:
             "cache_key": cache_key,
         }
 
+    def _legacy_policy_is_compatible(self, payload: Dict[str, Any]) -> bool:
+        cached_method = str(payload.get("selection_method") or "").strip().lower()
+        current_method = str(self.policy.selection_method or "").strip().lower()
+        if cached_method and not cached_method.endswith("_fallback"):
+            if cached_method.split("_")[0] != current_method.split("_")[0]:
+                return False
+
+        cached_universe_size = payload.get("universe_size")
+        if cached_universe_size is not None:
+            try:
+                if int(cached_universe_size) != int(self.policy.universe_size):
+                    return False
+            except Exception:
+                return False
+
+        cached_max_positions = payload.get("max_positions")
+        if cached_max_positions is not None:
+            try:
+                if int(cached_max_positions) != int(self.policy.max_positions):
+                    return False
+            except Exception:
+                return False
+
+        cached_params = payload.get("params")
+        if cached_params is not None and isinstance(cached_params, dict):
+            current_params = dict(self.policy.params or {})
+            for key, value in current_params.items():
+                if cached_params.get(key) != value:
+                    return False
+        return True
+
+    def _migrate_legacy_cache_payload(
+        self,
+        payload: Dict[str, Any],
+        trade_date: str,
+        from_version: int,
+    ) -> Optional[Dict[str, Any]]:
+        if from_version != self.LEGACY_CACHE_SCHEMA_VERSION:
+            return None
+        if not self._legacy_policy_is_compatible(payload):
+            logger.info("[UNIVERSE][CACHE] MISS reason=legacy_policy_mismatch")
+            return None
+
+        has_final_key = ("universe_symbols" in payload) or ("stocks" in payload)
+        if not has_final_key:
+            logger.info("[UNIVERSE][CACHE] MISS reason=legacy_missing_final_symbols")
+            return None
+
+        identity = self._build_cache_identity(trade_date)
+        now_iso = datetime.now(KST).isoformat()
+        final_symbols = self._normalize_symbol_list(
+            payload.get("universe_symbols") or payload.get("stocks") or []
+        )
+        candidate_symbols = self._normalize_symbol_list(
+            payload.get("candidate_symbols")
+            or payload.get("pre_limit_symbols")
+            or payload.get("selected_symbols")
+            or final_symbols
+        )
+        pre_limit_symbols = self._normalize_symbol_list(
+            payload.get("pre_limit_symbols") or candidate_symbols
+        )
+        selected_symbols = self._normalize_symbol_list(
+            payload.get("selected_symbols") or final_symbols
+        )
+        migrated = {
+            "schema_version": self.CACHE_SCHEMA_VERSION,
+            "date": trade_date,
+            "db_mode": identity["db_mode"],
+            "policy_signature": identity["policy_signature"],
+            "cache_key": identity["cache_key"],
+            "selection_method": str(payload.get("selection_method") or self.policy.selection_method),
+            "universe_size": int(payload.get("universe_size") or self.policy.universe_size),
+            "max_positions": int(payload.get("max_positions") or self.policy.max_positions),
+            "params": dict(payload.get("params") or self.policy.params or {}),
+            "candidate_symbols": candidate_symbols,
+            "pre_limit_symbols": pre_limit_symbols,
+            "selected_symbols": selected_symbols,
+            "universe_symbols": final_symbols,
+            "stocks": final_symbols,
+            "created_at": str(payload.get("created_at") or now_iso),
+            "saved_at": str(payload.get("saved_at") or now_iso),
+        }
+        selection_meta = payload.get("selection_meta")
+        if isinstance(selection_meta, dict) and selection_meta:
+            migrated["selection_meta"] = dict(selection_meta)
+        logger.info(
+            "[UNIVERSE][CACHE] migrated legacy schema v%s -> v%s",
+            from_version,
+            self.CACHE_SCHEMA_VERSION,
+        )
+        return migrated
+
+    def _write_cache_payload(self, payload: Dict[str, Any]) -> None:
+        self.policy.cache_file.parent.mkdir(parents=True, exist_ok=True)
+        self.policy.cache_file.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
     def _read_cache_for_date(self, trade_date: str) -> Optional[Dict[str, Any]]:
         if not self.policy.cache_file.exists():
             return None
         try:
             payload = json.loads(self.policy.cache_file.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                return None
             if payload.get("date") != trade_date:
                 return None
+            raw_version = payload.get("schema_version", self.LEGACY_CACHE_SCHEMA_VERSION)
+            try:
+                schema_version = int(raw_version)
+            except Exception:
+                logger.info("[UNIVERSE][CACHE] MISS reason=schema_version_invalid")
+                return None
+            if schema_version > self.CACHE_SCHEMA_VERSION:
+                logger.info(
+                    "[UNIVERSE][CACHE] MISS reason=schema_version_unsupported cached=%s supported=%s",
+                    schema_version,
+                    self.CACHE_SCHEMA_VERSION,
+                )
+                return None
+            if schema_version < self.CACHE_SCHEMA_VERSION:
+                migrated = self._migrate_legacy_cache_payload(payload, trade_date, schema_version)
+                if not migrated:
+                    return None
+                payload = migrated
+                self._write_cache_payload(payload)
             identity = self._build_cache_identity(trade_date)
             cached_db_mode = str(payload.get("db_mode") or "").strip().upper()
             cached_signature = str(payload.get("policy_signature") or "").strip()
@@ -242,6 +365,7 @@ class UniverseService:
             snapshot.get("selected_symbols") or final_symbols
         )
         payload = {
+            "schema_version": self.CACHE_SCHEMA_VERSION,
             "date": trade_date,
             "db_mode": identity["db_mode"],
             "policy_signature": identity["policy_signature"],
@@ -260,11 +384,7 @@ class UniverseService:
         }
         if isinstance(snapshot.get("meta"), dict) and snapshot.get("meta"):
             payload["selection_meta"] = dict(snapshot.get("meta"))
-        self.policy.cache_file.parent.mkdir(parents=True, exist_ok=True)
-        self.policy.cache_file.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        self._write_cache_payload(payload)
 
     def get_or_create_todays_universe(self, trade_date: str) -> List[str]:
         cached = self._read_cache_for_date(trade_date)
