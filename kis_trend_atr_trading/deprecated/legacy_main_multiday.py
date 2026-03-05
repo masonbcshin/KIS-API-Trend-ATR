@@ -663,7 +663,6 @@ def run_trade(
         last_prewarm_prepare_date = None
         while True:
             iteration += 1
-            logger.info(f"[MULTI] 반복 #{iteration} / symbols={len(executors)}")
             if hasattr(api, "prewarm_access_token_if_due"):
                 api.prewarm_access_token_if_due()
 
@@ -674,6 +673,7 @@ def run_trade(
                 refreshed_symbols = _merge_symbols(holdings_symbols, entry_candidates)
                 if stock_code != settings.DEFAULT_STOCK_CODE:
                     refreshed_symbols = [stock_code]
+                run_symbols = list(refreshed_symbols)
                 for symbol in refreshed_symbols:
                     if symbol in executors_by_symbol:
                         continue
@@ -699,6 +699,14 @@ def run_trade(
                     print(f"  - {symbol}: {state_msg}")
                     executors_by_symbol[symbol] = executor
                     executors.append(executor)
+                logger.info(
+                    f"[UNIVERSE] runtime executor_symbols={run_symbols}, "
+                    f"selection_method={universe_service.policy.selection_method}, "
+                    f"cache_file={universe_service.policy.cache_file}"
+                )
+
+            active_executors = [executors_by_symbol[s] for s in run_symbols if s in executors_by_symbol]
+            logger.info(f"[MULTI] 반복 #{iteration} / symbols={len(active_executors)}")
 
             now_kst = datetime.now(KST)
             market_state, market_reason = get_market_session_state(
@@ -814,7 +822,7 @@ def run_trade(
                     f"policy_ws_should_run={decision.policy.ws_should_run}, "
                     f"ws_connected={decision.feed_status.ws_connected}, "
                     f"last_ws_message_age={decision.feed_status.ws_last_message_age_sec:.1f}, "
-                    f"symbols_count={len(executors)}"
+                    f"symbols_count={len(active_executors)}"
                 )
                 logger.info(summary)
                 if (
@@ -861,7 +869,7 @@ def run_trade(
 
             target_feed = _resolve_effective_feed_mode(decision)
             active_provider = ws_provider if target_feed == "ws" else rest_provider
-            for executor in executors:
+            for executor in active_executors:
                 executor.market_data_provider = active_provider
             if active_feed_name != target_feed:
                 logger.info(
@@ -872,7 +880,7 @@ def run_trade(
                 active_feed_name = target_feed
 
             # 런타임 holdings/entry_candidates 재계산 (보유는 항상 관리, 진입은 후보만)
-            runtime_holdings = [e.stock_code for e in executors if e.strategy.has_position]
+            runtime_holdings = [e.stock_code for e in active_executors if e.strategy.has_position]
             if stock_code == settings.DEFAULT_STOCK_CODE:
                 entry_candidates = universe_service.compute_entry_candidates(runtime_holdings, todays_universe)
             else:
@@ -880,7 +888,7 @@ def run_trade(
             holdings_count = len(runtime_holdings)
             max_positions = max(int(universe_service.policy.max_positions), 0)
 
-            for executor in executors:
+            for executor in active_executors:
                 symbol = executor.stock_code
                 sticky_blocked = False
                 sticky_reason = ""
@@ -971,7 +979,7 @@ def run_trade(
                 normalized_symbol_bar_ts = _normalize_bar_ts(symbol_bar_ts)
                 if normalized_symbol_bar_ts is not None:
                     bar_gate.mark_processed(symbol, normalized_symbol_bar_ts)
-                runtime_holdings = [e.stock_code for e in executors if e.strategy.has_position]
+                runtime_holdings = [e.stock_code for e in active_executors if e.strategy.has_position]
                 holdings_count = len(runtime_holdings)
                 if stock_code == settings.DEFAULT_STOCK_CODE:
                     entry_candidates = universe_service.compute_entry_candidates(runtime_holdings, todays_universe)
@@ -982,7 +990,7 @@ def run_trade(
                 report_date = now_kst.strftime("%Y-%m-%d")
                 if report_date != last_postclose_report_date:
                     logger.info("[RUNTIME] POSTCLOSE actions started date=%s", report_date)
-                    for executor in executors:
+                    for executor in active_executors:
                         if hasattr(executor, "_persist_account_snapshot"):
                             try:
                                 executor._persist_account_snapshot(force=True)
