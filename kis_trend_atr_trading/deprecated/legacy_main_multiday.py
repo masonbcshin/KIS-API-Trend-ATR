@@ -409,6 +409,23 @@ def run_trade(
             db_mode = "PAPER"
         last_universe_notified_date = ""
         last_universe_alert_key = ""
+        last_out_of_universe_alert_key = ""
+        last_entry_capacity_key = ""
+        out_of_universe_ages = {}
+        last_aging_trade_date = ""
+        out_of_universe_warn_days = max(
+            int(getattr(universe_service.policy, "out_of_universe_warn_days", 20) or 0),
+            0,
+        )
+        out_of_universe_reduce_days = max(
+            int(getattr(universe_service.policy, "out_of_universe_reduce_days", 30) or 0),
+            0,
+        )
+        if (
+            out_of_universe_reduce_days > 0
+            and out_of_universe_reduce_days < out_of_universe_warn_days
+        ):
+            out_of_universe_reduce_days = out_of_universe_warn_days
 
         def _symbol_position_store(symbol: str) -> PositionStore:
             data_dir = Path(__file__).resolve().parent / "data"
@@ -550,6 +567,127 @@ def run_trade(
             except Exception as e:
                 logger.warning(f"[TELEGRAM] 유니버스 경보 알림 전송 실패(계속 진행): {e}")
 
+        def _update_out_of_universe_aging(
+            trade_date: str,
+            holdings_symbols,
+            todays_universe,
+        ):
+            nonlocal out_of_universe_ages, last_aging_trade_date
+            advance_day = trade_date != last_aging_trade_date
+            compute_aging = getattr(universe_service, "compute_out_of_universe_ages", None)
+            if callable(compute_aging):
+                out_of_universe_ages = dict(
+                    compute_aging(
+                        out_of_universe_ages,
+                        list(holdings_symbols or []),
+                        list(todays_universe or []),
+                        advance_day=advance_day,
+                    )
+                    or {}
+                )
+            else:
+                universe_set = set(_normalize_symbol_list(todays_universe))
+                next_ages = {}
+                for symbol in _normalize_symbol_list(holdings_symbols):
+                    if symbol in universe_set:
+                        next_ages[symbol] = 0
+                    else:
+                        prev_days = max(int(out_of_universe_ages.get(symbol, 0)), 0)
+                        next_ages[symbol] = prev_days + 1 if advance_day else prev_days
+                out_of_universe_ages = next_ages
+
+            if advance_day:
+                last_aging_trade_date = trade_date
+
+            summarize_aging = getattr(universe_service, "summarize_out_of_universe_aging", None)
+            if callable(summarize_aging):
+                summary = dict(
+                    summarize_aging(
+                        out_of_universe_ages,
+                        out_of_universe_warn_days,
+                        out_of_universe_reduce_days,
+                    )
+                    or {}
+                )
+            else:
+                out_map = {
+                    code: days
+                    for code, days in dict(out_of_universe_ages or {}).items()
+                    if int(days) > 0
+                }
+                warn_symbols = [
+                    code for code, days in sorted(out_map.items(), key=lambda item: (-item[1], item[0]))
+                    if out_of_universe_warn_days > 0 and int(days) >= out_of_universe_warn_days
+                ]
+                reduce_symbols = [
+                    code for code, days in sorted(out_map.items(), key=lambda item: (-item[1], item[0]))
+                    if out_of_universe_reduce_days > 0 and int(days) >= out_of_universe_reduce_days
+                ]
+                summary = {
+                    "tracked_count": len(out_of_universe_ages),
+                    "out_of_universe_count": len(out_map),
+                    "warn_count": len(warn_symbols),
+                    "reduce_count": len(reduce_symbols),
+                    "warn_symbols": warn_symbols,
+                    "reduce_symbols": reduce_symbols,
+                    "out_of_universe_days": out_map,
+                }
+            return summary
+
+        def _notify_out_of_universe_aging(trade_date: str, aging_summary: dict) -> None:
+            nonlocal last_out_of_universe_alert_key
+            days_map = dict(aging_summary.get("out_of_universe_days") or {})
+            warn_symbols = list(aging_summary.get("warn_symbols") or [])
+            reduce_symbols = list(aging_summary.get("reduce_symbols") or [])
+            tracked_count = int(aging_summary.get("tracked_count") or 0)
+            out_count = int(aging_summary.get("out_of_universe_count") or 0)
+
+            logger.info(
+                "[UNIVERSE][AGING] date=%s tracked=%s out_of_universe=%s warn=%s reduce=%s detail=%s",
+                trade_date,
+                tracked_count,
+                out_count,
+                len(warn_symbols),
+                len(reduce_symbols),
+                days_map,
+            )
+
+            if not warn_symbols and not reduce_symbols:
+                return
+
+            alert_key = (
+                f"{trade_date}|warn={','.join(warn_symbols)}|reduce={','.join(reduce_symbols)}"
+            )
+            if alert_key == last_out_of_universe_alert_key:
+                return
+
+            try:
+                notifier = get_telegram_notifier()
+                if notifier is None or not getattr(notifier, "enabled", False):
+                    last_out_of_universe_alert_key = alert_key
+                    return
+
+                details = [f"{code}:{int(days_map.get(code, 0))}d" for code in sorted(days_map.keys())]
+                message = (
+                    "[UNIVERSE][AGING] 유니버스 밖 보유 노화 감지\n"
+                    f"- date: {trade_date}\n"
+                    f"- warn_days: {out_of_universe_warn_days}, reduce_days: {out_of_universe_reduce_days}\n"
+                    f"- warn_symbols({len(warn_symbols)}): {warn_symbols}\n"
+                    f"- reduce_symbols({len(reduce_symbols)}): {reduce_symbols}\n"
+                    f"- out_of_universe_days: {details}"
+                )
+                if reduce_symbols:
+                    send_warning = getattr(notifier, "notify_warning", None)
+                    if callable(send_warning):
+                        send_warning(message)
+                    else:
+                        notifier.notify_info(message)
+                else:
+                    notifier.notify_info(message)
+                last_out_of_universe_alert_key = alert_key
+            except Exception as e:
+                logger.warning(f"[TELEGRAM] 유니버스 노화 알림 전송 실패(계속 진행): {e}")
+
         def _refresh_daily_universe():
             trade_date = datetime.now(KST).strftime("%Y-%m-%d")
             holdings_symbols = universe_service.load_holdings_symbols()
@@ -570,6 +708,8 @@ def run_trade(
                     logger.warning(f"[UNIVERSE] snapshot read failed, fallback to final list: {e}")
             _notify_daily_universe_selection(trade_date, candidate_symbols, todays_universe)
             _notify_universe_anomaly(trade_date, snapshot, todays_universe)
+            aging_summary = _update_out_of_universe_aging(trade_date, holdings_symbols, todays_universe)
+            _notify_out_of_universe_aging(trade_date, aging_summary)
             for sym in holdings_symbols:
                 if sym in todays_universe:
                     logger.info(f"[ENTRY] skipped: already holding symbol={sym}")
@@ -945,12 +1085,54 @@ def run_trade(
 
             # 런타임 holdings/entry_candidates 재계산 (보유는 항상 관리, 진입은 후보만)
             runtime_holdings = [e.stock_code for e in active_executors if e.strategy.has_position]
-            if stock_code == settings.DEFAULT_STOCK_CODE:
-                entry_candidates = universe_service.compute_entry_candidates(runtime_holdings, todays_universe)
-            else:
-                entry_candidates = [stock_code] if stock_code not in runtime_holdings else []
             holdings_count = len(runtime_holdings)
             max_positions = max(int(universe_service.policy.max_positions), 0)
+            compute_capacity = getattr(universe_service, "compute_entry_capacity", None)
+            if callable(compute_capacity):
+                free_slots = int(compute_capacity(runtime_holdings, max_positions))
+            else:
+                free_slots = max(max_positions - len(set(runtime_holdings)), 0)
+            free_slots = max(free_slots, 0)
+
+            if stock_code == settings.DEFAULT_STOCK_CODE:
+                ranked_entry_candidates = universe_service.compute_entry_candidates(
+                    runtime_holdings, todays_universe
+                )
+            else:
+                ranked_entry_candidates = [stock_code] if stock_code not in runtime_holdings else []
+
+            limit_candidates = getattr(universe_service, "limit_entry_candidates", None)
+            if callable(limit_candidates):
+                entry_candidates = list(limit_candidates(ranked_entry_candidates, free_slots))
+            else:
+                entry_candidates = list(ranked_entry_candidates[:free_slots])
+            capacity_cutoff_symbols = set(ranked_entry_candidates[len(entry_candidates) :])
+            cutoff_key = (
+                f"{holdings_count}|{max_positions}|{len(ranked_entry_candidates)}|"
+                f"{','.join(sorted(capacity_cutoff_symbols))}"
+            )
+            if cutoff_key != last_entry_capacity_key:
+                if capacity_cutoff_symbols:
+                    logger.info(
+                        "[ENTRY] capacity cutoff applied: holdings=%s max=%s free_slots=%s "
+                        "ranked=%s allowed=%s dropped=%s dropped_symbols=%s",
+                        holdings_count,
+                        max_positions,
+                        free_slots,
+                        len(ranked_entry_candidates),
+                        len(entry_candidates),
+                        len(capacity_cutoff_symbols),
+                        sorted(capacity_cutoff_symbols),
+                    )
+                else:
+                    logger.info(
+                        "[ENTRY] capacity status: holdings=%s max=%s free_slots=%s ranked=%s",
+                        holdings_count,
+                        max_positions,
+                        free_slots,
+                        len(ranked_entry_candidates),
+                    )
+                last_entry_capacity_key = cutoff_key
 
             for executor in active_executors:
                 symbol = executor.stock_code
@@ -987,8 +1169,6 @@ def run_trade(
                     )
                 elif symbol in runtime_holdings:
                     executor.set_entry_control(False, f"[ENTRY] skipped: already holding symbol={symbol}")
-                elif symbol not in entry_candidates:
-                    executor.set_entry_control(False, f"[ENTRY] skipped: symbol={symbol} not in entry_candidates")
                 elif holdings_count >= max_positions:
                     msg = (
                         f"[ENTRY] blocked: max_positions reached "
@@ -996,6 +1176,14 @@ def run_trade(
                     )
                     logger.info(msg)
                     executor.set_entry_control(False, msg)
+                elif symbol in capacity_cutoff_symbols:
+                    msg = (
+                        f"[ENTRY] blocked: capacity cutoff "
+                        f"(symbol={symbol}, free_slots={free_slots}, ranked={len(ranked_entry_candidates)})"
+                    )
+                    executor.set_entry_control(False, msg)
+                elif symbol not in entry_candidates:
+                    executor.set_entry_control(False, f"[ENTRY] skipped: symbol={symbol} not in entry_candidates")
                 else:
                     executor.set_entry_control(True, "")
 
@@ -1045,10 +1233,24 @@ def run_trade(
                     bar_gate.mark_processed(symbol, normalized_symbol_bar_ts)
                 runtime_holdings = [e.stock_code for e in active_executors if e.strategy.has_position]
                 holdings_count = len(runtime_holdings)
-                if stock_code == settings.DEFAULT_STOCK_CODE:
-                    entry_candidates = universe_service.compute_entry_candidates(runtime_holdings, todays_universe)
+                compute_capacity = getattr(universe_service, "compute_entry_capacity", None)
+                if callable(compute_capacity):
+                    free_slots = int(compute_capacity(runtime_holdings, max_positions))
                 else:
-                    entry_candidates = [stock_code] if stock_code not in runtime_holdings else []
+                    free_slots = max(max_positions - len(set(runtime_holdings)), 0)
+                free_slots = max(free_slots, 0)
+                if stock_code == settings.DEFAULT_STOCK_CODE:
+                    ranked_entry_candidates = universe_service.compute_entry_candidates(
+                        runtime_holdings,
+                        todays_universe,
+                    )
+                else:
+                    ranked_entry_candidates = [stock_code] if stock_code not in runtime_holdings else []
+                limit_candidates = getattr(universe_service, "limit_entry_candidates", None)
+                if callable(limit_candidates):
+                    entry_candidates = list(limit_candidates(ranked_entry_candidates, free_slots))
+                else:
+                    entry_candidates = list(ranked_entry_candidates[:free_slots])
 
             if _state_equals(decision.market_state, MarketSessionState.POSTCLOSE):
                 report_date = now_kst.strftime("%Y-%m-%d")

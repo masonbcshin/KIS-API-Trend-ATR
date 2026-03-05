@@ -517,7 +517,9 @@ class UniverseSelector:
                 "selected_etf_count": 0,
             }
 
-        final_target = target_total if max_stocks <= 0 else min(target_total, max_stocks)
+        # Quotas define priority allocation by asset type. Final count should still
+        # target max_stocks (universe_size) when positive, with ranked backfill.
+        final_target = target_total if max_stocks <= 0 else max_stocks
         stage2_etf_rows = [row for row in ranked if self._row_is_etf_candidate(row)]
         stage2_stock_rows = [row for row in ranked if not self._row_is_etf_candidate(row)]
         selected_rows = stage2_stock_rows[:stock_quota] + stage2_etf_rows[:etf_quota]

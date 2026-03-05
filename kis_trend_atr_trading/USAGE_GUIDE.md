@@ -143,8 +143,14 @@ python3 -m kis_trend_atr_trading.apps.kr_cbt --help
 핵심 키:
 - `universe.selection_method`: `fixed | volume_top | atr_filter | combined`
 - `universe.max_stocks`, `universe.universe_size`, `universe.max_positions`
+- `universe.out_of_universe_warn_days`, `universe.out_of_universe_reduce_days`
 - `universe.candidate_pool_mode`: `yaml | market | kospi200 | volume_top`
 - `stocks`: 고정 종목 리스트
+
+운영 의미:
+- `universe_size`: 당일 유니버스 선정 개수
+- `max_positions`: 동시 보유 하드캡
+- `max_stocks`: 하위호환 fallback(미설정 시 `universe_size`/`max_positions` 기본값)
 
 권장 시작값:
 - `selection_method: fixed`
@@ -180,6 +186,12 @@ python3 -m kis_trend_atr_trading.apps.kr_cbt --help
 - `UNKNOWN(종목코드)`는 종목명 해석 실패 시의 최종 폴백 표기입니다.
   - 일시적 API 실패, 비보유/비캐시 상태에서 발생할 수 있습니다.
   - 다음 사이클에서 캐시가 채워지면 정상 종목명으로 복구될 수 있습니다.
+
+### 6-4. 슬롯 컷/보유 노화 로그
+- `[ENTRY] capacity cutoff applied ...`
+  - 의미: 보유 상한(`max_positions`) 대비 슬롯 부족으로 상위 후보만 진입 허용
+- `[UNIVERSE][AGING] ...`
+  - 의미: 유니버스 밖 보유 종목의 누적 일수 요약(경보/축소 우선순위 계산)
 
 상세 배경: `kis_trend_atr_trading/LEGACY_DB_COMPATIBILITY.md`
 

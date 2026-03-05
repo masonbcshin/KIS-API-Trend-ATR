@@ -22,10 +22,12 @@ universe:
   # ────────────────────────────────────────────────────────────────
   selection_method: "combined"
   
-  # 최대 동시 거래 종목 수 (개별주 5 + ETF 3)
+  # 하위호환용 선정 상한값
+  # - universe_size 미설정 시 fallback으로 사용
   max_stocks: 8
   # 자산군 쿼터 (0이면 비활성)
-  # - combined 최종 선정 시 개별주/ETF를 분리해서 선발
+  # - combined 최종 선정 시 개별주/ETF를 우선 배정
+  # - quota 합이 max_stocks보다 작아도 남는 슬롯은 통합 랭킹으로 백필
   stock_quota: 5
   etf_quota: 3
   # ETF 심볼 수동 지정(종목명 식별 실패 대비)
@@ -39,6 +41,11 @@ universe:
   # 동시 보유 포지션 상한
   # 하위호환: 미설정 시 max_stocks 값을 사용
   max_positions: 8
+  # 유니버스 밖 보유 노화 임계치(거래일 기준)
+  # - warn 이상: 경보
+  # - reduce 이상: 축소 우선순위
+  out_of_universe_warn_days: 20
+  out_of_universe_reduce_days: 30
   
   # ────────────────────────────────────────────────────────────────
   # 필터 조건 (volume_top, atr_filter, combined 방식 적용)
@@ -119,7 +126,8 @@ universe:
   # ────────────────────────────────────────────────────────────────
   # 
   # 종목코드만 입력합니다.
-  # 최대 max_stocks 개수만큼 사용됩니다.
+  # 최대 universe_size 개수만큼 사용됩니다.
+  # (universe_size 미설정 시 max_stocks 기준)
   #
 stocks:
     - "005930"   # 삼성전자

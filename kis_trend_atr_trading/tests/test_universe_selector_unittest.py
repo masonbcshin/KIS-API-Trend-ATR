@@ -515,6 +515,76 @@ class UniverseSelectorFixedTests(unittest.TestCase):
                 ["005930", "000660", "035420", "051910", "006400", "114800", "069500", "229200"],
             )
 
+    def test_combined_quota_shortage_backfills_to_universe_size(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = UniverseSelectionConfig(
+                selection_method="combined",
+                max_stocks=10,
+                volume_top_n=12,
+                stock_quota=5,
+                etf_quota=3,
+                universe_cache_file=str(Path(td) / "universe_cache.json"),
+            )
+            selector = UniverseSelector(config=cfg, kis_client=_DummyKIS(), db=None)
+            selector._select_volume_top = lambda limit: [  # type: ignore
+                "069500",
+                "229200",
+                "005930",
+                "396500",
+                "000660",
+                "035420",
+                "114800",
+                "051910",
+                "006400",
+                "371460",
+                "207940",
+                "068270",
+            ]
+            metrics_map = {
+                "069500": {"trend_score": 300.0, "is_etf": True},
+                "229200": {"trend_score": 295.0, "is_etf": True},
+                "005930": {"trend_score": 290.0, "is_etf": False},
+                "396500": {"trend_score": 285.0, "is_etf": True},
+                "000660": {"trend_score": 280.0, "is_etf": False},
+                "035420": {"trend_score": 275.0, "is_etf": False},
+                "114800": {"trend_score": 270.0, "is_etf": True},
+                "051910": {"trend_score": 265.0, "is_etf": False},
+                "006400": {"trend_score": 260.0, "is_etf": False},
+                "371460": {"trend_score": 255.0, "is_etf": True},
+                "207940": {"trend_score": 250.0, "is_etf": False},
+                "068270": {"trend_score": 245.0, "is_etf": False},
+            }
+            selector._evaluate_combined_candidate = lambda code: {  # type: ignore
+                "code": code,
+                "stock_name": code,
+                "trend_score": metrics_map[code]["trend_score"],
+                "is_etf": metrics_map[code]["is_etf"],
+                "adx": 25.0,
+                "trend_up": True,
+                "breakout": True,
+            }
+
+            selected = selector._select_combined()
+            meta = selector.get_last_selection_meta().get("meta", {})
+            self.assertEqual(
+                selected,
+                [
+                    "069500",
+                    "229200",
+                    "005930",
+                    "396500",
+                    "000660",
+                    "035420",
+                    "114800",
+                    "051910",
+                    "006400",
+                    "371460",
+                ],
+            )
+            self.assertEqual(len(selected), 10)
+            self.assertEqual(int(meta.get("selected_stock_count", 0)), 5)
+            self.assertEqual(int(meta.get("selected_etf_count", 0)), 5)
+
     def test_unknown_market_cap_is_blocked_when_strict(self):
         with tempfile.TemporaryDirectory() as td:
             cfg = UniverseSelectionConfig(

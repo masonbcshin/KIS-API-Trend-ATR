@@ -101,6 +101,52 @@ stocks:
         )
         self.assertEqual(got, ["035720", "051910"])
 
+    def test_compute_entry_capacity_and_limit_candidates(self):
+        capacity = UniverseService.compute_entry_capacity(
+            holdings=["005930", "005930", "000660"],
+            max_positions=3,
+        )
+        self.assertEqual(capacity, 1)
+        limited = UniverseService.limit_entry_candidates(
+            entry_candidates=["035720", "051910", "207940"],
+            capacity=capacity,
+        )
+        self.assertEqual(limited, ["035720"])
+
+    def test_compute_out_of_universe_ages_and_summary(self):
+        day1 = UniverseService.compute_out_of_universe_ages(
+            previous_ages={},
+            holdings=["005930", "000660"],
+            todays_universe=["005930", "035720"],
+            advance_day=True,
+        )
+        self.assertEqual(day1, {"005930": 0, "000660": 1})
+
+        day2 = UniverseService.compute_out_of_universe_ages(
+            previous_ages=day1,
+            holdings=["005930", "000660"],
+            todays_universe=["005930", "035720"],
+            advance_day=True,
+        )
+        self.assertEqual(day2, {"005930": 0, "000660": 2})
+
+        summary = UniverseService.summarize_out_of_universe_aging(
+            ages=day2,
+            warn_days=2,
+            reduce_days=3,
+        )
+        self.assertEqual(summary["out_of_universe_count"], 1)
+        self.assertEqual(summary["warn_symbols"], ["000660"])
+        self.assertEqual(summary["reduce_symbols"], [])
+
+    def test_policy_loads_aging_thresholds_with_defaults(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            yaml_path = self._write_yaml(root)
+            service = UniverseService(str(yaml_path), _DummyKIS(), data_dir=root / "data")
+            self.assertEqual(service.policy.out_of_universe_warn_days, 20)
+            self.assertEqual(service.policy.out_of_universe_reduce_days, 30)
+
     def test_reuse_today_universe_cache_on_restart(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

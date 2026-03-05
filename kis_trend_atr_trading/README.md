@@ -262,10 +262,12 @@ selection_method:
 - 단계:
   1. `volume_top(max_stocks * 3)`
   2. ATR 필터 적용
-  3. `max_stocks`로 최종 제한
+  3. 자산군 쿼터(`stock_quota`/`etf_quota`) 우선 배정
+  4. 쿼터 미달분은 통합 랭킹으로 백필해 `max_stocks`까지 채움
 - 주의:
   - `candidate_pool_mode=yaml`이면 `combined`도 restricted 모드(후보군 내부 선별)로 동작
   - 시장 자동선정이 목적이면 `candidate_pool_mode=market`을 사용
+  - `UniverseService` 경유 실행에서는 `selector.max_stocks = universe_size`로 동작
 
 ### 캐싱 구조
 
@@ -307,6 +309,17 @@ selection_method:
 - 종목코드 6자리 숫자 검증
 - `max_stocks` 초과 금지
 - 최종 0종목이면 예외로 거래 중단
+
+### 런타임 진입 제약/노화
+
+- 신규 진입 후보: `entry_candidates = todays_universe - holdings`
+- 진입 가능 슬롯: `free_slots = max_positions - holdings_count`
+- 슬롯 부족 시: `entry_candidates` 상위 순위(유니버스 랭킹 순)만 `free_slots`만큼 허용
+- 보유 노화: `out_of_universe_warn_days`, `out_of_universe_reduce_days` 기준으로
+  유니버스 밖 보유 일수를 누적/경보
+- 관련 로그:
+  - `[ENTRY] capacity cutoff applied ...`
+  - `[UNIVERSE][AGING] ...`
 
 ---
 

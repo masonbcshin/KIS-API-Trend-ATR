@@ -164,8 +164,14 @@ python3 -m kis_trend_atr_trading.main_multiday --mode trade --interval 60
 주요 키:
 - `universe.selection_method`: `fixed | volume_top | atr_filter | combined`
 - `universe.max_stocks`, `universe.universe_size`, `universe.max_positions`
+- `universe.out_of_universe_warn_days`, `universe.out_of_universe_reduce_days`
 - `universe.candidate_pool_mode`: `yaml | market | kospi200 | volume_top`
 - `stocks`: 고정 목록
+
+쉽게 이해하기:
+- `universe_size`: 오늘 뽑을 신규 후보 개수
+- `max_positions`: 동시에 들고 있을 수 있는 최대 보유 개수
+- `max_stocks`: 예전 호환용 기본값(가능하면 `universe_size`를 기준으로 운영)
 
 초보자 권장:
 - 시작은 `selection_method: fixed`
@@ -176,6 +182,10 @@ python3 -m kis_trend_atr_trading.main_multiday --mode trade --interval 60
 - `universe_cache.json`은 `schema_version`을 포함해 저장됩니다.
 - `date + db_mode + policy_signature + cache_key`가 같을 때만 재사용됩니다.
 - 구버전 캐시는 가능한 경우 자동 변환되고, 호환되지 않으면 자동으로 재선정됩니다.
+
+실행 중 진입 제어(초보자용 핵심):
+- 보유가 많아 슬롯이 부족하면 신규 후보 전부 진입하지 않고 상위 후보부터 들어갑니다.
+- 유니버스 밖 보유 종목은 일수 누적(`out_of_universe_*_days`)로 관리되어 경보가 뜹니다.
 
 포지션 파일 확인 팁:
 - 단일 경로(`apps.kr_trade`) 기본: `kis_trend_atr_trading/data/positions.json`

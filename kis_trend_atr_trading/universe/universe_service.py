@@ -28,6 +28,8 @@ class UniversePolicy:
     selection_method: str
     universe_size: int
     max_positions: int
+    out_of_universe_warn_days: int
+    out_of_universe_reduce_days: int
     fixed_stocks: List[str]
     cache_file: Path
     params: Dict[str, Any]
@@ -61,6 +63,10 @@ class UniverseService:
         max_stocks = int(uni.get("max_stocks", 5))
         universe_size = int(uni.get("universe_size", max_stocks))
         max_positions = int(uni.get("max_positions", max_stocks))
+        out_of_universe_warn_days = max(int(uni.get("out_of_universe_warn_days", 20)), 0)
+        out_of_universe_reduce_days = max(int(uni.get("out_of_universe_reduce_days", 30)), 0)
+        if out_of_universe_reduce_days > 0 and out_of_universe_reduce_days < out_of_universe_warn_days:
+            out_of_universe_reduce_days = out_of_universe_warn_days
         cache_rel = str(uni.get("universe_cache_file", "data/universe_cache.json"))
         cache_file = Path(__file__).resolve().parent.parent / cache_rel
         params = {
@@ -75,6 +81,8 @@ class UniverseService:
             selection_method=str(uni.get("selection_method", "fixed")).lower(),
             universe_size=max(universe_size, 0),
             max_positions=max(max_positions, 0),
+            out_of_universe_warn_days=out_of_universe_warn_days,
+            out_of_universe_reduce_days=out_of_universe_reduce_days,
             fixed_stocks=stocks,
             cache_file=cache_file,
             params=params,
@@ -472,3 +480,84 @@ class UniverseService:
     def compute_entry_candidates(holdings: List[str], todays_universe: List[str]) -> List[str]:
         holding_set = set(holdings)
         return [s for s in todays_universe if s not in holding_set]
+
+    @staticmethod
+    def compute_entry_capacity(holdings: List[str], max_positions: int) -> int:
+        holdings_count = len({str(s).strip() for s in list(holdings or []) if str(s).strip()})
+        return max(int(max_positions) - holdings_count, 0)
+
+    @staticmethod
+    def limit_entry_candidates(entry_candidates: List[str], capacity: int) -> List[str]:
+        cap = max(int(capacity), 0)
+        return list(entry_candidates[:cap])
+
+    @staticmethod
+    def compute_out_of_universe_ages(
+        previous_ages: Dict[str, int],
+        holdings: List[str],
+        todays_universe: List[str],
+        advance_day: bool = True,
+    ) -> Dict[str, int]:
+        holdings_list = UniverseService._normalize_symbol_list(list(holdings or []))
+        universe_set = set(UniverseService._normalize_symbol_list(list(todays_universe or [])))
+
+        normalized_prev: Dict[str, int] = {}
+        for raw_code, raw_days in dict(previous_ages or {}).items():
+            code = str(raw_code or "").strip()
+            if len(code) != 6 or not code.isdigit():
+                continue
+            try:
+                days = max(int(raw_days), 0)
+            except Exception:
+                days = 0
+            normalized_prev[code] = days
+
+        updated: Dict[str, int] = {}
+        for code in holdings_list:
+            if code in universe_set:
+                updated[code] = 0
+                continue
+            base = normalized_prev.get(code, 0)
+            updated[code] = base + 1 if advance_day else base
+        return updated
+
+    @staticmethod
+    def summarize_out_of_universe_aging(
+        ages: Dict[str, int],
+        warn_days: int,
+        reduce_days: int,
+    ) -> Dict[str, Any]:
+        warn_threshold = max(int(warn_days), 0)
+        reduce_threshold = max(int(reduce_days), 0)
+
+        normalized: Dict[str, int] = {}
+        for raw_code, raw_days in dict(ages or {}).items():
+            code = str(raw_code or "").strip()
+            if len(code) != 6 or not code.isdigit():
+                continue
+            try:
+                days = max(int(raw_days), 0)
+            except Exception:
+                days = 0
+            normalized[code] = days
+
+        out_of_universe = {code: days for code, days in normalized.items() if days > 0}
+        warn_symbols = [
+            code
+            for code, days in sorted(out_of_universe.items(), key=lambda item: (-item[1], item[0]))
+            if warn_threshold > 0 and days >= warn_threshold
+        ]
+        reduce_symbols = [
+            code
+            for code, days in sorted(out_of_universe.items(), key=lambda item: (-item[1], item[0]))
+            if reduce_threshold > 0 and days >= reduce_threshold
+        ]
+        return {
+            "tracked_count": len(normalized),
+            "out_of_universe_count": len(out_of_universe),
+            "warn_count": len(warn_symbols),
+            "reduce_count": len(reduce_symbols),
+            "warn_symbols": warn_symbols,
+            "reduce_symbols": reduce_symbols,
+            "out_of_universe_days": dict(sorted(out_of_universe.items(), key=lambda item: item[0])),
+        }

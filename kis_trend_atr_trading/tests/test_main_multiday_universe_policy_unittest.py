@@ -103,6 +103,8 @@ class _DummyUniverseService:
     universe = []
     candidates = []
     max_positions = 10
+    out_of_universe_warn_days = 20
+    out_of_universe_reduce_days = 30
     selection_method = "combined"
     selection_meta = {}
 
@@ -113,6 +115,8 @@ class _DummyUniverseService:
             selection_method=self.__class__.selection_method,
             cache_file=Path("/tmp/universe_cache.json"),
             max_positions=self.__class__.max_positions,
+            out_of_universe_warn_days=self.__class__.out_of_universe_warn_days,
+            out_of_universe_reduce_days=self.__class__.out_of_universe_reduce_days,
         )
 
     def load_holdings_symbols(self):
@@ -134,6 +138,42 @@ class _DummyUniverseService:
             "candidate_symbols": candidates,
             "universe_symbols": finals,
             "selection_meta": dict(self.__class__.selection_meta or {}),
+        }
+
+    @staticmethod
+    def compute_entry_capacity(holdings, max_positions):
+        return max(int(max_positions) - len(set(holdings or [])), 0)
+
+    @staticmethod
+    def limit_entry_candidates(entry_candidates, capacity):
+        cap = max(int(capacity), 0)
+        return list(entry_candidates[:cap])
+
+    @staticmethod
+    def compute_out_of_universe_ages(previous_ages, holdings, todays_universe, advance_day=True):
+        universe_set = set(todays_universe or [])
+        out = {}
+        for symbol in holdings or []:
+            if symbol in universe_set:
+                out[symbol] = 0
+            else:
+                prev = int((previous_ages or {}).get(symbol, 0))
+                out[symbol] = prev + 1 if advance_day else prev
+        return out
+
+    @staticmethod
+    def summarize_out_of_universe_aging(ages, warn_days, reduce_days):
+        out_map = {k: int(v) for k, v in dict(ages or {}).items() if int(v) > 0}
+        warn = [k for k, v in sorted(out_map.items(), key=lambda item: (-item[1], item[0])) if int(v) >= int(warn_days)]
+        reduce = [k for k, v in sorted(out_map.items(), key=lambda item: (-item[1], item[0])) if int(v) >= int(reduce_days)]
+        return {
+            "tracked_count": len(dict(ages or {})),
+            "out_of_universe_count": len(out_map),
+            "warn_count": len(warn),
+            "reduce_count": len(reduce),
+            "warn_symbols": warn,
+            "reduce_symbols": reduce,
+            "out_of_universe_days": out_map,
         }
 
 
@@ -217,6 +257,8 @@ class TestMainMultidayUniversePolicy(unittest.TestCase):
         _DummyExecutor.holdings_symbols = set()
         _DummyExecutor.restore_calls = []
         _DummyUniverseService.candidates = []
+        _DummyUniverseService.out_of_universe_warn_days = 20
+        _DummyUniverseService.out_of_universe_reduce_days = 30
         _DummyUniverseService.selection_method = "combined"
         _DummyUniverseService.selection_meta = {}
 
@@ -281,6 +323,40 @@ class TestMainMultidayUniversePolicy(unittest.TestCase):
         self.assertTrue(blocked)
         self.assertFalse(blocked[-1][1])
         self.assertIn("max_positions reached", blocked[-1][2])
+
+    def test_entry_capacity_cutoff_allows_only_top_ranked_candidates(self):
+        _DummyUniverseService.holdings = ["999999"]
+        _DummyUniverseService.universe = ["111111", "222222", "333333"]
+        _DummyUniverseService.max_positions = 2
+        _DummyExecutor.holdings_symbols = {"999999"}
+
+        with patch.object(main_multiday, "KISApi", _DummyAPI), \
+             patch.object(main_multiday, "UniverseService", _DummyUniverseService), \
+             patch.object(main_multiday, "MultidayExecutor", _DummyExecutor), \
+             patch.object(main_multiday, "MultidayTrendATRStrategy", lambda: object()), \
+             patch.object(main_multiday, "get_telegram_notifier", return_value=_DummyNotifier()), \
+             patch.object(main_multiday, "get_trading_mode", return_value="PAPER"), \
+             patch.object(
+                 main_multiday,
+                 "get_market_session_state",
+                 return_value=(main_multiday.MarketSessionState.IN_SESSION, "regular_session_open"),
+             ), \
+             patch.object(main_multiday, "get_instance_lock", return_value=_DummyLock()), \
+             patch.object(main_multiday, "create_risk_manager_from_settings", return_value=_DummyRiskManager()), \
+             patch.object(main_multiday.settings, "validate_settings", return_value=True), \
+             patch.object(main_multiday.settings, "get_settings_summary", return_value=""):
+            main_multiday.run_trade(
+                stock_code=main_multiday.settings.DEFAULT_STOCK_CODE,
+                interval=0,
+                max_runs=1,
+            )
+
+        controls = {symbol: (allow, reason) for symbol, allow, reason in _DummyExecutor.entry_controls}
+        self.assertTrue(controls["111111"][0])
+        self.assertFalse(controls["222222"][0])
+        self.assertFalse(controls["333333"][0])
+        self.assertIn("capacity cutoff", controls["222222"][1])
+        self.assertIn("capacity cutoff", controls["333333"][1])
 
     def test_daily_universe_selection_is_notified_to_telegram(self):
         _DummyUniverseService.holdings = []
@@ -355,6 +431,38 @@ class TestMainMultidayUniversePolicy(unittest.TestCase):
 
         self.assertEqual(len(notifier.warning_messages), 1)
         self.assertIn("stage1", notifier.warning_messages[0])
+
+    def test_out_of_universe_aging_warn_is_notified(self):
+        _DummyUniverseService.holdings = ["999999"]
+        _DummyUniverseService.universe = ["111111"]
+        _DummyUniverseService.max_positions = 10
+        _DummyUniverseService.out_of_universe_warn_days = 1
+        _DummyUniverseService.out_of_universe_reduce_days = 3
+        _DummyExecutor.holdings_symbols = {"999999"}
+        notifier = _DummyNotifier()
+
+        with patch.object(main_multiday, "KISApi", _DummyAPI), \
+             patch.object(main_multiday, "UniverseService", _DummyUniverseService), \
+             patch.object(main_multiday, "MultidayExecutor", _DummyExecutor), \
+             patch.object(main_multiday, "MultidayTrendATRStrategy", lambda: object()), \
+             patch.object(main_multiday, "get_telegram_notifier", return_value=notifier), \
+             patch.object(main_multiday, "get_trading_mode", return_value="PAPER"), \
+             patch.object(
+                 main_multiday,
+                 "get_market_session_state",
+                 return_value=(main_multiday.MarketSessionState.IN_SESSION, "regular_session_open"),
+             ), \
+             patch.object(main_multiday, "get_instance_lock", return_value=_DummyLock()), \
+             patch.object(main_multiday, "create_risk_manager_from_settings", return_value=_DummyRiskManager()), \
+             patch.object(main_multiday.settings, "validate_settings", return_value=True), \
+             patch.object(main_multiday.settings, "get_settings_summary", return_value=""):
+            main_multiday.run_trade(
+                stock_code=main_multiday.settings.DEFAULT_STOCK_CODE,
+                interval=0,
+                max_runs=1,
+            )
+
+        self.assertTrue(any("AGING" in msg for msg in notifier.info_messages))
 
     def test_startup_restore_skips_non_holding_symbols_without_state(self):
         _DummyUniverseService.holdings = ["233740"]
