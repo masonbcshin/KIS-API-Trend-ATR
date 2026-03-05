@@ -1173,6 +1173,13 @@ class KISApi:
             current_price = self._to_float(
                 self._first_present(item, ["stck_prpr", "prpr", "current_price"], 0)
             )
+            stock_name = str(
+                self._first_present(
+                    item,
+                    ["hts_kor_isnm", "prdt_name", "isnm_nm", "stck_shrn_iscd_nm", "stock_name"],
+                    "",
+                )
+            ).strip()
             volume = self._to_float(
                 self._first_present(item, ["acml_vol", "acml_voln", "volume"], 0)
             )
@@ -1227,6 +1234,7 @@ class KISApi:
             rows.append(
                 {
                     "code": code,
+                    "stock_name": stock_name or None,
                     "trade_value": trade_value,
                     "current_price": current_price,
                     "volume": volume,

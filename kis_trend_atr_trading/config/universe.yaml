@@ -24,6 +24,17 @@ universe:
   
   # 최대 동시 거래 종목 수 (개별주 5 + ETF 3)
   max_stocks: 8
+  # 자산군 쿼터 (0이면 비활성)
+  # - combined 최종 선정 시 개별주/ETF를 분리해서 선발
+  stock_quota: 5
+  etf_quota: 3
+  # ETF 심볼 수동 지정(종목명 식별 실패 대비)
+  etf_symbols:
+    - "069500"
+    - "229200"
+    - "252670"
+    - "233740"
+    - "396500"
   # 오늘 유니버스 크기 (신규 진입 후보군 크기)
   # 하위호환: 미설정 시 max_stocks 값을 사용
   universe_size: 8

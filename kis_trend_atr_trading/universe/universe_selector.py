@@ -39,6 +39,29 @@ class UniverseSelectionConfig:
     max_atr_pct: float = 8.0
     atr_period: int = 14
     volume_top_n: int = 50
+    stock_quota: int = 0
+    etf_quota: int = 0
+    etf_symbols: List[str] = field(default_factory=list)
+    etf_name_keywords: List[str] = field(
+        default_factory=lambda: [
+            "KODEX",
+            "TIGER",
+            "KOSEF",
+            "KBSTAR",
+            "KINDEX",
+            "HANARO",
+            "ARIRANG",
+            "ACE",
+            "SOL",
+            "PLUS",
+            "TIMEFOLIO",
+            "TREX",
+            "FOCUS",
+            "KIWOOM",
+            "KIS",
+            "WON",
+        ]
+    )
     exclude_management: bool = True
     allow_unknown_market_cap: bool = False
     fallback_to_fixed: bool = True
@@ -65,6 +88,7 @@ class UniverseSelector:
         self.trading_mode = get_trading_mode()
         self._last_market_codes_source = "not_used"
         self._last_volume_data_source = "not_used"
+        self._last_volume_snapshot_map: Dict[str, Dict[str, Any]] = {}
         self._last_selection_meta: Dict[str, Any] = {}
         root = Path(__file__).resolve().parent.parent
         self.cache_file = root / self.config.universe_cache_file
@@ -96,6 +120,11 @@ class UniverseSelector:
             max_atr_pct=float(section.get("max_atr_pct", 8.0)),
             atr_period=int(section.get("atr_period", 14)),
             volume_top_n=int(section.get("volume_top_n", 50)),
+            stock_quota=int(section.get("stock_quota", 0)),
+            etf_quota=int(section.get("etf_quota", 0)),
+            etf_symbols=[str(x) for x in section.get("etf_symbols", [])],
+            etf_name_keywords=[str(x) for x in section.get("etf_name_keywords", [])]
+            or UniverseSelectionConfig().etf_name_keywords,
             exclude_management=bool(section.get("exclude_management", True)),
             allow_unknown_market_cap=bool(section.get("allow_unknown_market_cap", False)),
             fallback_to_fixed=bool(section.get("fallback_to_fixed", True)),
@@ -258,6 +287,8 @@ class UniverseSelector:
         mode = self.config.candidate_pool_mode
         effective_limit = max(int(limit), 1)
         candidates = self._candidate_pool_for_volume_scan()
+        self._last_volume_snapshot_map = {}
+        snapshot_map: Dict[str, Dict[str, Any]] = {}
         pool_size = len(candidates)
         volume_source = "market_scan" if mode == "market" else "restricted_pool"
         candidate_source = self._last_market_codes_source if mode == "market" else "configured_pool"
@@ -277,8 +308,17 @@ class UniverseSelector:
                 )
                 market_rows = self.kis_client.get_market_top_by_trade_value(top_n=top_n)
                 for snap in market_rows:
-                    if self._passes_safety_filters(snap):
-                        rows.append((str(snap["code"]), float(snap["trade_value"])))
+                    code = str(snap.get("code") or "").strip()
+                    if not self._is_valid_code(code):
+                        continue
+                    normalized = dict(snap)
+                    normalized["code"] = code
+                    stock_name = str(normalized.get("stock_name") or "").strip()
+                    if stock_name:
+                        normalized["stock_name"] = stock_name
+                    if self._passes_safety_filters(normalized):
+                        rows.append((code, float(normalized["trade_value"])))
+                        snapshot_map[code] = normalized
                 min_required = min(
                     max(int(effective_limit), 1),
                     max(int(self.config.max_stocks), 1),
@@ -302,8 +342,17 @@ class UniverseSelector:
             try:
                 bulk = self.kis_client.get_market_snapshot_bulk(candidates)
                 for snap in bulk:
-                    if self._passes_safety_filters(snap):
-                        rows.append((str(snap["code"]), float(snap["trade_value"])))
+                    code = str(snap.get("code") or "").strip()
+                    if not self._is_valid_code(code):
+                        continue
+                    normalized = dict(snap)
+                    normalized["code"] = code
+                    stock_name = str(normalized.get("stock_name") or "").strip()
+                    if stock_name:
+                        normalized["stock_name"] = stock_name
+                    if self._passes_safety_filters(normalized):
+                        rows.append((code, float(normalized["trade_value"])))
+                        snapshot_map[code] = normalized
                 bulk_ok = True
                 data_source = "bulk_snapshot"
             except Exception:
@@ -324,6 +373,7 @@ class UniverseSelector:
                     if not self._passes_safety_filters(snap):
                         continue
                     rows.append((code, snap["trade_value"]))
+                    snapshot_map[code] = dict(snap)
                     # rate limit friendly
                     if mode == "market":
                         time.sleep(0.12)
@@ -334,6 +384,11 @@ class UniverseSelector:
             data_source = "single_snapshot"
         rows.sort(key=lambda x: x[1], reverse=True)
         selected = [c for c, _ in rows[:effective_limit]]
+        self._last_volume_snapshot_map = {
+            code: dict(snapshot_map.get(code) or {})
+            for code in selected
+            if code in snapshot_map
+        }
         self._last_volume_data_source = data_source
         self._set_last_selection_meta(
             candidate_symbols=selected,
@@ -402,7 +457,7 @@ class UniverseSelector:
             ),
         )
         ranked_codes = [str(row["code"]) for row in ranked]
-        limited = ranked_codes[: self.config.max_stocks]
+        limited, quota_meta = self._apply_asset_type_quota(ranked)
         self._set_last_selection_meta(
             candidate_symbols=first_stage,
             pre_limit_symbols=ranked_codes,
@@ -413,13 +468,16 @@ class UniverseSelector:
                 "stage2_count": len(second_stage),
                 "stage1_limit": stage1_limit,
                 "rank_basis": "trend_score_then_stage1_rank",
+                **quota_meta,
                 "top_ranked": [
                     {
                         "code": str(row.get("code")),
+                        "stock_name": str(row.get("stock_name") or ""),
                         "trend_score": round(float(row.get("trend_score") or 0.0), 2),
                         "adx": round(float(row.get("adx") or 0.0), 2),
                         "trend_up": bool(row.get("trend_up")),
                         "breakout": bool(row.get("breakout")),
+                        "is_etf": bool(row.get("is_etf")),
                     }
                     for row in ranked[: min(5, len(ranked))]
                 ],
@@ -430,6 +488,114 @@ class UniverseSelector:
     # ----------------------------
     # Helpers
     # ----------------------------
+    def _apply_asset_type_quota(self, ranked: List[Dict[str, Any]]) -> Tuple[List[str], Dict[str, Any]]:
+        max_stocks = max(int(self.config.max_stocks), 0)
+        ranked_codes = [str(row.get("code") or "") for row in ranked]
+        stock_quota = max(int(self.config.stock_quota), 0)
+        etf_quota = max(int(self.config.etf_quota), 0)
+
+        if stock_quota == 0 and etf_quota == 0:
+            return ranked_codes[:max_stocks], {
+                "asset_quota_enabled": False,
+                "stock_quota": 0,
+                "etf_quota": 0,
+                "stage2_stock_count": 0,
+                "stage2_etf_count": 0,
+                "selected_stock_count": 0,
+                "selected_etf_count": 0,
+            }
+
+        target_total = stock_quota + etf_quota
+        if target_total <= 0:
+            return ranked_codes[:max_stocks], {
+                "asset_quota_enabled": False,
+                "stock_quota": stock_quota,
+                "etf_quota": etf_quota,
+                "stage2_stock_count": 0,
+                "stage2_etf_count": 0,
+                "selected_stock_count": 0,
+                "selected_etf_count": 0,
+            }
+
+        final_target = target_total if max_stocks <= 0 else min(target_total, max_stocks)
+        stage2_etf_rows = [row for row in ranked if self._row_is_etf_candidate(row)]
+        stage2_stock_rows = [row for row in ranked if not self._row_is_etf_candidate(row)]
+        selected_rows = stage2_stock_rows[:stock_quota] + stage2_etf_rows[:etf_quota]
+        selected_set = {
+            str(row.get("code") or "")
+            for row in selected_rows
+            if self._is_valid_code(str(row.get("code") or ""))
+        }
+
+        if len(selected_set) < final_target:
+            for row in ranked:
+                code = str(row.get("code") or "")
+                if not self._is_valid_code(code) or code in selected_set:
+                    continue
+                selected_rows.append(row)
+                selected_set.add(code)
+                if len(selected_set) >= final_target:
+                    break
+
+        limited = [
+            str(row.get("code") or "")
+            for row in selected_rows
+            if self._is_valid_code(str(row.get("code") or ""))
+        ][:final_target]
+        selected_rows_by_code = {
+            str(row.get("code") or ""): row
+            for row in selected_rows
+            if self._is_valid_code(str(row.get("code") or ""))
+        }
+        selected_etf_count = sum(
+            1
+            for code in limited
+            if self._row_is_etf_candidate(selected_rows_by_code.get(code) or {"code": code})
+        )
+        selected_stock_count = max(len(limited) - selected_etf_count, 0)
+
+        logger.info(
+            "[UNIVERSE] asset quota applied: stock=%s/%s, etf=%s/%s, total=%s",
+            selected_stock_count,
+            stock_quota,
+            selected_etf_count,
+            etf_quota,
+            len(limited),
+        )
+
+        return limited, {
+            "asset_quota_enabled": True,
+            "stock_quota": stock_quota,
+            "etf_quota": etf_quota,
+            "stage2_stock_count": len(stage2_stock_rows),
+            "stage2_etf_count": len(stage2_etf_rows),
+            "selected_stock_count": selected_stock_count,
+            "selected_etf_count": selected_etf_count,
+        }
+
+    def _row_is_etf_candidate(self, row: Dict[str, Any]) -> bool:
+        if "is_etf" in row:
+            return bool(row.get("is_etf"))
+        code = str(row.get("code") or "").strip()
+        stock_name = str(row.get("stock_name") or "").strip() or self._stock_name_for_code(code)
+        return self._is_etf_candidate(code, stock_name)
+
+    def _stock_name_for_code(self, code: str) -> str:
+        snapshot = self._last_volume_snapshot_map.get(code) or {}
+        return str(snapshot.get("stock_name") or "").strip()
+
+    def _is_etf_candidate(self, code: str, stock_name: str) -> bool:
+        if code and code in set(self.config.etf_symbols or []):
+            return True
+        if not stock_name:
+            return False
+        upper_name = str(stock_name).upper()
+        for token in self.config.etf_name_keywords or []:
+            key = str(token or "").strip().upper()
+            if key and key in upper_name:
+                return True
+        return False
+
     def _fallback_fixed_or_raise(self, reason: str) -> List[str]:
         logger.error(f"[UNIVERSE] fallback 사유: {reason}")
         if self.trading_mode == "REAL":
@@ -526,6 +692,7 @@ class UniverseSelector:
 
     def _snapshot_for_symbol(self, code: str) -> Dict[str, Any]:
         price = self.kis_client.get_current_price(code)
+        stock_name = str(price.get("stock_name") or "").strip() or None
         current_price = float(price.get("current_price") or 0)
         open_price = float(price.get("open_price") or 0)
         volume = float(price.get("volume") or 0)
@@ -558,6 +725,7 @@ class UniverseSelector:
         )
         return {
             "code": code,
+            "stock_name": stock_name,
             "current_price": current_price,
             "open_price": open_price,
             "volume": volume,
@@ -593,10 +761,13 @@ class UniverseSelector:
         if not (self.config.min_atr_pct <= atr_ratio <= self.config.max_atr_pct):
             return None
         trend_score, trend_meta = self._trend_entry_score_from_df(df)
+        stock_name = self._stock_name_for_code(code)
         return {
             "code": code,
+            "stock_name": stock_name,
             "atr_ratio": atr_ratio,
             "trend_score": trend_score,
+            "is_etf": self._is_etf_candidate(code, stock_name),
             **trend_meta,
         }
 

@@ -103,12 +103,14 @@ class _DummyUniverseService:
     universe = []
     candidates = []
     max_positions = 10
+    selection_method = "combined"
+    selection_meta = {}
 
     def __init__(self, yaml_path, kis_client):
         self.yaml_path = yaml_path
         self.kis_client = kis_client
         self.policy = types.SimpleNamespace(
-            selection_method="combined",
+            selection_method=self.__class__.selection_method,
             cache_file=Path("/tmp/universe_cache.json"),
             max_positions=self.__class__.max_positions,
         )
@@ -131,6 +133,7 @@ class _DummyUniverseService:
             "selection_method": self.policy.selection_method,
             "candidate_symbols": candidates,
             "universe_symbols": finals,
+            "selection_meta": dict(self.__class__.selection_meta or {}),
         }
 
 
@@ -174,9 +177,14 @@ class _DummyNotifier:
     def __init__(self):
         self.enabled = True
         self.info_messages = []
+        self.warning_messages = []
 
     def notify_info(self, message):
         self.info_messages.append(str(message))
+        return True
+
+    def notify_warning(self, message):
+        self.warning_messages.append(str(message))
         return True
 
 
@@ -209,6 +217,8 @@ class TestMainMultidayUniversePolicy(unittest.TestCase):
         _DummyExecutor.holdings_symbols = set()
         _DummyExecutor.restore_calls = []
         _DummyUniverseService.candidates = []
+        _DummyUniverseService.selection_method = "combined"
+        _DummyUniverseService.selection_meta = {}
 
     def test_holdings_are_managed_even_if_not_in_todays_universe(self):
         _DummyUniverseService.holdings = ["999999"]
@@ -308,6 +318,43 @@ class TestMainMultidayUniversePolicy(unittest.TestCase):
         self.assertIn("최종 선정 2개", notifier.info_messages[1])
         self.assertIn("111111", notifier.info_messages[1])
         self.assertIn("222222", notifier.info_messages[1])
+        self.assertEqual(len(notifier.warning_messages), 0)
+
+    def test_universe_anomaly_stage_zero_sends_warning(self):
+        _DummyUniverseService.holdings = []
+        _DummyUniverseService.universe = ["111111", "222222"]
+        _DummyUniverseService.selection_method = "combined"
+        _DummyUniverseService.selection_meta = {
+            "strategy": "combined",
+            "stage1_count": 0,
+            "stage2_count": 0,
+        }
+        _DummyUniverseService.max_positions = 10
+        notifier = _DummyNotifier()
+
+        with patch.object(main_multiday, "KISApi", _DummyAPI), \
+             patch.object(main_multiday, "UniverseService", _DummyUniverseService), \
+             patch.object(main_multiday, "MultidayExecutor", _DummyExecutor), \
+             patch.object(main_multiday, "MultidayTrendATRStrategy", lambda: object()), \
+             patch.object(main_multiday, "get_telegram_notifier", return_value=notifier), \
+             patch.object(main_multiday, "get_trading_mode", return_value="PAPER"), \
+             patch.object(
+                 main_multiday,
+                 "get_market_session_state",
+                 return_value=(main_multiday.MarketSessionState.IN_SESSION, "regular_session_open"),
+             ), \
+             patch.object(main_multiday, "get_instance_lock", return_value=_DummyLock()), \
+             patch.object(main_multiday, "create_risk_manager_from_settings", return_value=_DummyRiskManager()), \
+             patch.object(main_multiday.settings, "validate_settings", return_value=True), \
+             patch.object(main_multiday.settings, "get_settings_summary", return_value=""):
+            main_multiday.run_trade(
+                stock_code=main_multiday.settings.DEFAULT_STOCK_CODE,
+                interval=0,
+                max_runs=1,
+            )
+
+        self.assertEqual(len(notifier.warning_messages), 1)
+        self.assertIn("stage1", notifier.warning_messages[0])
 
     def test_startup_restore_skips_non_holding_symbols_without_state(self):
         _DummyUniverseService.holdings = ["233740"]

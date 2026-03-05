@@ -172,11 +172,15 @@ class UniverseService:
         )
         if not candidate_symbols:
             candidate_symbols = list(final_symbols)
+        selection_meta = payload.get("selection_meta")
+        if not isinstance(selection_meta, dict):
+            selection_meta = {}
         return {
             "trade_date": trade_date,
             "selection_method": str(payload.get("selection_method") or self.policy.selection_method),
             "candidate_symbols": candidate_symbols,
             "universe_symbols": final_symbols,
+            "selection_meta": dict(selection_meta),
         }
 
     def _save_cache(

@@ -408,6 +408,7 @@ def run_trade(
         if db_mode not in ("DRY_RUN", "PAPER", "REAL"):
             db_mode = "PAPER"
         last_universe_notified_date = ""
+        last_universe_alert_key = ""
 
         def _symbol_position_store(symbol: str) -> PositionStore:
             data_dir = Path(__file__).resolve().parent / "data"
@@ -488,6 +489,67 @@ def run_trade(
             except Exception as e:
                 logger.warning(f"[TELEGRAM] 유니버스 알림 전송 실패(계속 진행): {e}")
 
+        def _notify_universe_anomaly(
+            trade_date: str,
+            snapshot_payload: dict,
+            final_symbols,
+        ) -> None:
+            nonlocal last_universe_alert_key
+            final_list = _normalize_symbol_list(final_symbols)
+            selection_method = str(snapshot_payload.get("selection_method") or "").strip().lower()
+            selection_meta = snapshot_payload.get("selection_meta")
+            if not isinstance(selection_meta, dict):
+                selection_meta = {}
+
+            stage1 = selection_meta.get("stage1_count")
+            stage2 = selection_meta.get("stage2_count")
+            strategy = str(selection_meta.get("strategy") or "").strip().lower()
+            reason = str(selection_meta.get("reason") or "").strip()
+
+            issues = []
+            if isinstance(stage1, (int, float)) and int(stage1) == 0:
+                issues.append("combined stage1=0")
+            if isinstance(stage2, (int, float)) and int(stage2) == 0:
+                issues.append("combined stage2=0")
+            if strategy in ("fixed_fallback", "empty_fallback") or selection_method.endswith("fallback"):
+                issues.append("fallback 적용")
+            if not issues:
+                return
+
+            alert_key = f"{trade_date}|{selection_method}|{strategy}|{','.join(issues)}|{','.join(final_list)}"
+            if alert_key == last_universe_alert_key:
+                return
+
+            try:
+                notifier = get_telegram_notifier()
+                if notifier is None or not getattr(notifier, "enabled", False):
+                    last_universe_alert_key = alert_key
+                    return
+
+                stage1_label = int(stage1) if isinstance(stage1, (int, float)) else "n/a"
+                stage2_label = int(stage2) if isinstance(stage2, (int, float)) else "n/a"
+                warning_message = (
+                    "[UNIVERSE][ALERT] 선정 이상 감지\n"
+                    f"- date: {trade_date}\n"
+                    f"- issues: {', '.join(issues)}\n"
+                    f"- selection_method: {selection_method or 'unknown'}\n"
+                    f"- strategy: {strategy or 'unknown'}\n"
+                    f"- stage1: {stage1_label}, stage2: {stage2_label}\n"
+                    f"- final_count: {len(final_list)}\n"
+                    f"- final_symbols: {final_list}"
+                )
+                if reason:
+                    warning_message += f"\n- reason: {reason}"
+
+                send_warning = getattr(notifier, "notify_warning", None)
+                if callable(send_warning):
+                    send_warning(warning_message)
+                else:
+                    notifier.notify_info(warning_message)
+                last_universe_alert_key = alert_key
+            except Exception as e:
+                logger.warning(f"[TELEGRAM] 유니버스 경보 알림 전송 실패(계속 진행): {e}")
+
         def _refresh_daily_universe():
             trade_date = datetime.now(KST).strftime("%Y-%m-%d")
             holdings_symbols = universe_service.load_holdings_symbols()
@@ -496,6 +558,7 @@ def run_trade(
                 holdings_symbols, todays_universe
             )
             candidate_symbols = list(todays_universe)
+            snapshot = {}
             get_snapshot = getattr(universe_service, "get_todays_universe_snapshot", None)
             if callable(get_snapshot):
                 try:
@@ -506,6 +569,7 @@ def run_trade(
                 except Exception as e:
                     logger.warning(f"[UNIVERSE] snapshot read failed, fallback to final list: {e}")
             _notify_daily_universe_selection(trade_date, candidate_symbols, todays_universe)
+            _notify_universe_anomaly(trade_date, snapshot, todays_universe)
             for sym in holdings_symbols:
                 if sym in todays_universe:
                     logger.info(f"[ENTRY] skipped: already holding symbol={sym}")
