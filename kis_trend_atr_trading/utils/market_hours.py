@@ -14,6 +14,9 @@ from datetime import datetime, time, date, timedelta
 from enum import Enum
 from typing import Optional, Sequence, Tuple
 import logging
+import json
+import os
+from pathlib import Path
 import pytz
 
 logger = logging.getLogger(__name__)
@@ -48,9 +51,8 @@ SESSION_CLOSE = time(15, 30, 0)
 LUNCH_START = time(11, 30, 0)
 LUNCH_END = time(13, 0, 0)
 
-# 2024-2025년 한국 주식시장 휴장일 (수동 관리)
-# 실제 운영 시 외부 API 또는 캘린더 서비스 연동 권장
-HOLIDAYS_2024_2025 = {
+# 내장 기본 휴장일(폴백용)
+_DEFAULT_KRX_HOLIDAYS = {
     # 2024년
     date(2024, 1, 1),   # 신정
     date(2024, 2, 9),   # 설날 연휴
@@ -115,6 +117,100 @@ HOLIDAYS_2024_2025 = {
     date(2026, 12, 25), # 크리스마스
     date(2026, 12, 31), # 연말휴장
 }
+
+_CALENDAR_ENV_KEY = "MARKET_CALENDAR_FILE"
+_DEFAULT_CALENDAR_PATH = (
+    Path(__file__).resolve().parent.parent / "data" / "market_calendar_krx.json"
+)
+_HOLIDAY_CACHE = {
+    "path": "",
+    "mtime_ns": -1,
+    "holidays": set(_DEFAULT_KRX_HOLIDAYS),
+    "metadata": {
+        "source": "builtin_fallback",
+        "coverage_from": "",
+        "coverage_to": "",
+        "version": "builtin",
+    },
+}
+
+
+def _calendar_path() -> Path:
+    token = str(os.getenv(_CALENDAR_ENV_KEY, "")).strip()
+    if token:
+        return Path(token)
+    return _DEFAULT_CALENDAR_PATH
+
+
+def load_krx_holiday_calendar(force_reload: bool = False) -> set:
+    """
+    KRX 휴장일 캘린더를 로드합니다.
+    - 우선순위: 환경변수 지정 파일 -> 기본 파일 -> 내장 폴백
+    - 파일 로드 실패 시 내장 폴백으로 안전하게 동작
+    """
+    path = _calendar_path()
+    cache = _HOLIDAY_CACHE
+
+    if not force_reload:
+        if cache["path"] == str(path):
+            if not path.exists():
+                return set(cache["holidays"])
+            try:
+                if int(path.stat().st_mtime_ns) == int(cache["mtime_ns"]):
+                    return set(cache["holidays"])
+            except Exception:
+                pass
+
+    holidays_set = set(_DEFAULT_KRX_HOLIDAYS)
+    metadata = {
+        "source": "builtin_fallback",
+        "coverage_from": "",
+        "coverage_to": "",
+        "version": "builtin",
+    }
+    mtime_ns = -1
+
+    if path.exists():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("calendar payload must be dict")
+
+            parsed = set()
+            for token in list(payload.get("holidays") or []):
+                raw = str(token or "").strip()
+                if not raw:
+                    continue
+                try:
+                    parsed.add(datetime.strptime(raw, "%Y-%m-%d").date())
+                except Exception:
+                    logger.debug("[CALENDAR] skip invalid holiday token=%s", raw)
+            if parsed:
+                holidays_set = parsed
+                metadata = {
+                    "source": str(payload.get("source") or "file"),
+                    "coverage_from": str(payload.get("coverage_from") or ""),
+                    "coverage_to": str(payload.get("coverage_to") or ""),
+                    "version": str(payload.get("version") or ""),
+                }
+            mtime_ns = int(path.stat().st_mtime_ns)
+        except Exception as e:
+            logger.warning(
+                "[CALENDAR] failed to load %s, fallback to builtin holidays (err=%s)",
+                path,
+                e,
+            )
+
+    cache["path"] = str(path)
+    cache["mtime_ns"] = int(mtime_ns)
+    cache["holidays"] = set(holidays_set)
+    cache["metadata"] = dict(metadata)
+    return set(cache["holidays"])
+
+
+def get_holiday_calendar_metadata() -> dict:
+    load_krx_holiday_calendar()
+    return dict(_HOLIDAY_CACHE.get("metadata") or {})
 
 
 class MarketSessionState(Enum):
@@ -243,8 +339,8 @@ def is_holiday(check_date: date = None) -> bool:
     """
     if check_date is None:
         check_date = get_today()
-    
-    return check_date in HOLIDAYS_2024_2025
+
+    return check_date in load_krx_holiday_calendar()
 
 def is_weekend(check_date: date = None) -> bool:
     """

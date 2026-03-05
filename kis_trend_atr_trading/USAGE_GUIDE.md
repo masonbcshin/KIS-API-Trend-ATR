@@ -194,6 +194,12 @@ python3 -m kis_trend_atr_trading.apps.kr_cbt --help
   - 의미: 유니버스 밖 보유 종목의 누적 일수 요약(경보/축소 우선순위 계산)
   - 누적 일수는 KRX 영업일 기준(주말/휴장일 제외)으로 계산
 
+### 6-5. 휴장일 캘린더 자동 갱신
+- 런타임 파일: `kis_trend_atr_trading/data/market_calendar_krx.json`
+- 환경변수로 파일 경로 오버라이드 가능: `MARKET_CALENDAR_FILE=/path/to/file.json`
+- 수동 갱신: `python tools/build_market_calendar.py`
+- 정기 갱신: GitHub Actions `Refresh KRX Market Calendar` (월 1회 + 수동 실행)
+
 상세 배경: `kis_trend_atr_trading/LEGACY_DB_COMPATIBILITY.md`
 
 ---

@@ -1,0 +1,45 @@
+name: Refresh KRX Market Calendar
+
+on:
+  schedule:
+    - cron: "0 18 1 * *" # 03:00 KST on day 2 each month
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  refresh-calendar:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install calendar builder dependency
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install holidays
+
+      - name: Build market calendar
+        run: |
+          python tools/build_market_calendar.py
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "chore(calendar): refresh KRX market calendar"
+          title: "chore(calendar): refresh KRX market calendar"
+          body: |
+            Automated calendar refresh.
+
+            - Regenerated `kis_trend_atr_trading/data/market_calendar_krx.json`
+            - Source: python-holidays (+ local overrides)
+          branch: "chore/refresh-krx-market-calendar"
+          delete-branch: true

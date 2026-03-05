@@ -187,6 +187,8 @@ python3 -m kis_trend_atr_trading.main_multiday --mode trade --interval 60
 - 보유가 많아 슬롯이 부족하면 신규 후보 전부 진입하지 않고 상위 후보부터 들어갑니다.
 - 유니버스 밖 보유 종목은 일수 누적(`out_of_universe_*_days`)로 관리되어 경보가 뜹니다.
   - 이 일수는 영업일 기준(주말/휴장일 제외)입니다.
+- 휴장일 파일(`data/market_calendar_krx.json`)은 월 1회 자동 갱신되며,
+  문제가 생기면 `python tools/build_market_calendar.py`로 수동 재생성할 수 있습니다.
 
 포지션 파일 확인 팁:
 - 단일 경로(`apps.kr_trade`) 기본: `kis_trend_atr_trading/data/positions.json`

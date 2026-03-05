@@ -322,6 +322,14 @@ selection_method:
   - `[ENTRY] capacity cutoff applied ...`
   - `[UNIVERSE][AGING] ...`
 
+### KRX 캘린더 자동화
+
+- 런타임 휴장일 파일: `kis_trend_atr_trading/data/market_calendar_krx.json`
+- 자동 갱신 워크플로우: `.github/workflows/refresh-market-calendar.yml`
+- 수동 갱신 명령:
+  - `python tools/build_market_calendar.py`
+- 파일 손상/누락 시 내장 폴백 휴장일로 자동 전환(경고 로그 출력)
+
 ---
 
 ## 5️⃣ 안전 설계
