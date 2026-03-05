@@ -1,30 +1,30 @@
-name: Auto Deploy to OCI
-
-on:
-  push:
-    branches:
-      - main
-
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1.0.0
-        with:
-          host: ${{ secrets.OCI_HOST }}
-          username: ${{ secrets.OCI_USER }}
-          key: ${{ secrets.OCI_SSH_KEY }}
-          script: |
-            cd ${{ secrets.OCI_PROJECT_PATH }}
-
-            echo ">>> Git pull"
-            git pull
-
-            echo ">>> Restart service"
-            sudo systemctl restart auto-trade
-
-            echo ">>> Check status"
-            sudo systemctl is-active --quiet auto-trade
-            sudo systemctl --no-pager --full status auto-trade || true
+# name: Auto Deploy to OCI
+#
+# on:
+#   push:
+#     branches:
+#       - main
+#
+# jobs:
+#   deploy:
+#     runs-on: ubuntu-latest
+#
+#     steps:
+#       - name: Deploy via SSH
+#         uses: appleboy/ssh-action@v1.0.0
+#         with:
+#           host: ${{ secrets.OCI_HOST }}
+#           username: ${{ secrets.OCI_USER }}
+#           key: ${{ secrets.OCI_SSH_KEY }}
+#           script: |
+#             cd ${{ secrets.OCI_PROJECT_PATH }}
+#
+#             echo ">>> Git pull"
+#             git pull
+#
+#             echo ">>> Restart service"
+#             sudo systemctl restart auto-trade
+#
+#             echo ">>> Check status"
+#             sudo systemctl is-active --quiet auto-trade
+#             sudo systemctl --no-pager --full status auto-trade || true
