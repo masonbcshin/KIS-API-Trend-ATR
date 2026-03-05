@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime
@@ -137,12 +138,50 @@ class UniverseService:
         logger.info(f"[UNIVERSE] holdings symbols loaded: mode={mode}, count={len(symbols)}")
         return sorted(symbols)
 
+    def _build_cache_identity(self, trade_date: str) -> Dict[str, str]:
+        db_mode = self._current_db_mode()
+        normalized_fixed = [str(x).strip() for x in (self.policy.fixed_stocks or []) if str(x).strip()]
+        signature_source = {
+            "db_mode": db_mode,
+            "selection_method": str(self.policy.selection_method or "").strip().lower(),
+            "universe_size": int(self.policy.universe_size),
+            "max_positions": int(self.policy.max_positions),
+            "fixed_stocks": normalized_fixed,
+            "params": dict(self.policy.params or {}),
+        }
+        raw = json.dumps(signature_source, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        policy_signature = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        cache_key = f"{trade_date}|{db_mode}|{policy_signature[:12]}"
+        return {
+            "db_mode": db_mode,
+            "policy_signature": policy_signature,
+            "cache_key": cache_key,
+        }
+
     def _read_cache_for_date(self, trade_date: str) -> Optional[Dict[str, Any]]:
         if not self.policy.cache_file.exists():
             return None
         try:
             payload = json.loads(self.policy.cache_file.read_text(encoding="utf-8"))
             if payload.get("date") != trade_date:
+                return None
+            identity = self._build_cache_identity(trade_date)
+            cached_db_mode = str(payload.get("db_mode") or "").strip().upper()
+            cached_signature = str(payload.get("policy_signature") or "").strip()
+            cached_key = str(payload.get("cache_key") or "").strip()
+            if (
+                cached_db_mode != identity["db_mode"]
+                or cached_signature != identity["policy_signature"]
+                or cached_key != identity["cache_key"]
+            ):
+                logger.info(
+                    "[UNIVERSE][CACHE] MISS reason=identity_mismatch expected_key=%s cached_key=%s "
+                    "expected_mode=%s cached_mode=%s",
+                    identity["cache_key"],
+                    cached_key or "none",
+                    identity["db_mode"],
+                    cached_db_mode or "none",
+                )
                 return None
             return payload
         except Exception:
@@ -190,6 +229,7 @@ class UniverseService:
         selection_method: str,
         selection_snapshot: Optional[Dict[str, Any]] = None,
     ) -> None:
+        identity = self._build_cache_identity(trade_date)
         snapshot = selection_snapshot or {}
         final_symbols = self._normalize_symbol_list(symbols)
         candidate_symbols = self._normalize_symbol_list(
@@ -203,6 +243,8 @@ class UniverseService:
         )
         payload = {
             "date": trade_date,
+            "db_mode": identity["db_mode"],
+            "policy_signature": identity["policy_signature"],
             "selection_method": selection_method,
             "universe_size": self.policy.universe_size,
             "max_positions": self.policy.max_positions,
@@ -213,7 +255,7 @@ class UniverseService:
             "universe_symbols": final_symbols,
             "stocks": final_symbols,  # backward compatibility
             "created_at": datetime.now(KST).isoformat(),
-            "cache_key": trade_date,
+            "cache_key": identity["cache_key"],
             "saved_at": datetime.now(KST).isoformat(),
         }
         if isinstance(snapshot.get("meta"), dict) and snapshot.get("meta"):

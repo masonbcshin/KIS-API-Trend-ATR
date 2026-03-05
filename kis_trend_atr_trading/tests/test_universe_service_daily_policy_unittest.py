@@ -118,6 +118,29 @@ stocks:
             self.assertEqual(mocked.call_count, 1)
             self.assertTrue(cache_file.exists())
 
+    def test_policy_change_invalidates_same_day_cache(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            yaml_path = self._write_yaml(root)
+            service = UniverseService(str(yaml_path), _DummyKIS(), data_dir=root / "data")
+            cache_file = root / "data" / "universe_cache.json"
+            service.policy.cache_file = cache_file
+
+            with patch(
+                "universe.universe_service.UniverseSelector.from_yaml",
+                side_effect=[
+                    _DummySelector(["005930", "000660", "035720"]),
+                    _DummySelector(["069500", "229200", "114800"]),
+                ],
+            ) as mocked:
+                first = service.get_or_create_todays_universe("2026-02-12")
+                service.policy.universe_size = 2
+                second = service.get_or_create_todays_universe("2026-02-12")
+
+            self.assertEqual(first, ["005930", "000660", "035720"])
+            self.assertEqual(second, ["069500", "229200", "114800"])
+            self.assertEqual(mocked.call_count, 2)
+
     def test_refresh_failure_fallback_to_fixed_stocks(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -180,11 +203,15 @@ stocks:
             service = UniverseService(str(yaml_path), _DummyKIS(), data_dir=root / "data")
             cache_file = root / "data" / "universe_cache.json"
             service.policy.cache_file = cache_file
+            identity = service._build_cache_identity("2026-02-12")
             cache_file.parent.mkdir(parents=True, exist_ok=True)
             cache_file.write_text(
                 json.dumps(
                     {
                         "date": "2026-02-12",
+                        "db_mode": identity["db_mode"],
+                        "policy_signature": identity["policy_signature"],
+                        "cache_key": identity["cache_key"],
                         "selection_method": "combined",
                         "candidate_symbols": ["005930", "000660", "035720"],
                         "universe_symbols": ["005930", "035720"],
