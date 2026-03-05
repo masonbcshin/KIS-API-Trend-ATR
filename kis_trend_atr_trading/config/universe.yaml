@@ -40,9 +40,9 @@ universe:
   min_volume: 2000000000
   
   # 최소 시가총액 (억원)
-  min_market_cap: 3000
+  min_market_cap: 1000
   # 시총 미확인(0/None) 종목 허용 여부
-  allow_unknown_market_cap: false
+  allow_unknown_market_cap: true
   
   # ATR 비율 범위 (%)
   # ATR / 종가 * 100
