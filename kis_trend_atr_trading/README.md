@@ -317,6 +317,7 @@ selection_method:
 - 슬롯 부족 시: `entry_candidates` 상위 순위(유니버스 랭킹 순)만 `free_slots`만큼 허용
 - 보유 노화: `out_of_universe_warn_days`, `out_of_universe_reduce_days` 기준으로
   유니버스 밖 보유 일수를 누적/경보
+  - 계산 기준: KRX 영업일(주말/휴장일 제외)
 - 관련 로그:
   - `[ENTRY] capacity cutoff applied ...`
   - `[UNIVERSE][AGING] ...`

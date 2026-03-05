@@ -113,6 +113,14 @@ stocks:
         )
         self.assertEqual(limited, ["035720"])
 
+    def test_count_business_day_advances_uses_krx_business_days(self):
+        self.assertEqual(UniverseService.count_business_day_advances("", "2026-03-07"), 0)  # Sat
+        self.assertEqual(UniverseService.count_business_day_advances("", "2026-03-09"), 1)  # Mon
+        self.assertEqual(UniverseService.count_business_day_advances("2026-03-06", "2026-03-09"), 1)
+        self.assertEqual(UniverseService.count_business_day_advances("2026-03-06", "2026-03-10"), 2)
+        # 2026-03-02는 대체휴일(휴장), 03-03만 영업일
+        self.assertEqual(UniverseService.count_business_day_advances("2026-02-28", "2026-03-03"), 1)
+
     def test_compute_out_of_universe_ages_and_summary(self):
         day1 = UniverseService.compute_out_of_universe_ages(
             previous_ages={},
@@ -138,6 +146,16 @@ stocks:
         self.assertEqual(summary["out_of_universe_count"], 1)
         self.assertEqual(summary["warn_symbols"], ["000660"])
         self.assertEqual(summary["reduce_symbols"], [])
+
+    def test_compute_out_of_universe_ages_accepts_advance_days(self):
+        day1 = UniverseService.compute_out_of_universe_ages(
+            previous_ages={"000660": 1},
+            holdings=["000660"],
+            todays_universe=["005930"],
+            advance_day=False,
+            advance_days=2,
+        )
+        self.assertEqual(day1, {"000660": 3})
 
     def test_policy_loads_aging_thresholds_with_defaults(self):
         with tempfile.TemporaryDirectory() as td:

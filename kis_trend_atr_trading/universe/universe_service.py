@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
@@ -13,7 +13,7 @@ except Exception:  # pragma: no cover
     yaml = None
 
 from utils.logger import get_logger
-from utils.market_hours import KST
+from utils.market_hours import KST, is_holiday, is_weekend
 try:
     from kis_trend_atr_trading.env import get_db_namespace_mode
 except Exception:  # pragma: no cover
@@ -482,6 +482,40 @@ class UniverseService:
         return [s for s in todays_universe if s not in holding_set]
 
     @staticmethod
+    def _parse_trade_date(trade_date: str) -> Optional[date]:
+        token = str(trade_date or "").strip()
+        if not token:
+            return None
+        try:
+            return datetime.strptime(token, "%Y-%m-%d").date()
+        except Exception:
+            return None
+
+    @staticmethod
+    def is_business_trading_day(trade_day: date) -> bool:
+        return not is_weekend(trade_day) and not is_holiday(trade_day)
+
+    @classmethod
+    def count_business_day_advances(cls, previous_trade_date: str, current_trade_date: str) -> int:
+        current = cls._parse_trade_date(current_trade_date)
+        if current is None:
+            return 0
+
+        previous = cls._parse_trade_date(previous_trade_date)
+        if previous is None:
+            return 1 if cls.is_business_trading_day(current) else 0
+        if current <= previous:
+            return 0
+
+        count = 0
+        cursor = previous + timedelta(days=1)
+        while cursor <= current:
+            if cls.is_business_trading_day(cursor):
+                count += 1
+            cursor += timedelta(days=1)
+        return count
+
+    @staticmethod
     def compute_entry_capacity(holdings: List[str], max_positions: int) -> int:
         holdings_count = len({str(s).strip() for s in list(holdings or []) if str(s).strip()})
         return max(int(max_positions) - holdings_count, 0)
@@ -497,9 +531,11 @@ class UniverseService:
         holdings: List[str],
         todays_universe: List[str],
         advance_day: bool = True,
+        advance_days: Optional[int] = None,
     ) -> Dict[str, int]:
         holdings_list = UniverseService._normalize_symbol_list(list(holdings or []))
         universe_set = set(UniverseService._normalize_symbol_list(list(todays_universe or [])))
+        day_increment = max(int(advance_days), 0) if advance_days is not None else (1 if advance_day else 0)
 
         normalized_prev: Dict[str, int] = {}
         for raw_code, raw_days in dict(previous_ages or {}).items():
@@ -518,7 +554,7 @@ class UniverseService:
                 updated[code] = 0
                 continue
             base = normalized_prev.get(code, 0)
-            updated[code] = base + 1 if advance_day else base
+            updated[code] = base + day_increment if day_increment > 0 else base
         return updated
 
     @staticmethod

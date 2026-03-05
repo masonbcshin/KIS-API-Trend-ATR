@@ -150,15 +150,19 @@ class _DummyUniverseService:
         return list(entry_candidates[:cap])
 
     @staticmethod
-    def compute_out_of_universe_ages(previous_ages, holdings, todays_universe, advance_day=True):
+    def compute_out_of_universe_ages(
+        previous_ages, holdings, todays_universe, advance_day=True, advance_days=None
+    ):
         universe_set = set(todays_universe or [])
+        increment = int(advance_days) if advance_days is not None else (1 if advance_day else 0)
+        increment = max(increment, 0)
         out = {}
         for symbol in holdings or []:
             if symbol in universe_set:
                 out[symbol] = 0
             else:
                 prev = int((previous_ages or {}).get(symbol, 0))
-                out[symbol] = prev + 1 if advance_day else prev
+                out[symbol] = prev + increment if increment > 0 else prev
         return out
 
     @staticmethod
@@ -175,6 +179,10 @@ class _DummyUniverseService:
             "reduce_symbols": reduce,
             "out_of_universe_days": out_map,
         }
+
+    @staticmethod
+    def count_business_day_advances(previous_trade_date, current_trade_date):
+        return 1 if str(previous_trade_date) != str(current_trade_date) else 0
 
 
 class _DummyExecutor:

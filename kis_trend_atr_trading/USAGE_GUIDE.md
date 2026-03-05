@@ -192,6 +192,7 @@ python3 -m kis_trend_atr_trading.apps.kr_cbt --help
   - 의미: 보유 상한(`max_positions`) 대비 슬롯 부족으로 상위 후보만 진입 허용
 - `[UNIVERSE][AGING] ...`
   - 의미: 유니버스 밖 보유 종목의 누적 일수 요약(경보/축소 우선순위 계산)
+  - 누적 일수는 KRX 영업일 기준(주말/휴장일 제외)으로 계산
 
 상세 배경: `kis_trend_atr_trading/LEGACY_DB_COMPATIBILITY.md`
 

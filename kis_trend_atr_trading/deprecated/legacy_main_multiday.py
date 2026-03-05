@@ -573,7 +573,19 @@ def run_trade(
             todays_universe,
         ):
             nonlocal out_of_universe_ages, last_aging_trade_date
-            advance_day = trade_date != last_aging_trade_date
+            count_advances = 0
+            count_business_advances = getattr(universe_service, "count_business_day_advances", None)
+            if callable(count_business_advances):
+                try:
+                    count_advances = max(
+                        int(count_business_advances(last_aging_trade_date, trade_date) or 0),
+                        0,
+                    )
+                except Exception:
+                    count_advances = 1 if trade_date != last_aging_trade_date else 0
+            else:
+                count_advances = 1 if trade_date != last_aging_trade_date else 0
+            advance_day = count_advances > 0
             compute_aging = getattr(universe_service, "compute_out_of_universe_ages", None)
             if callable(compute_aging):
                 out_of_universe_ages = dict(
@@ -582,6 +594,7 @@ def run_trade(
                         list(holdings_symbols or []),
                         list(todays_universe or []),
                         advance_day=advance_day,
+                        advance_days=count_advances,
                     )
                     or {}
                 )
@@ -593,10 +606,10 @@ def run_trade(
                         next_ages[symbol] = 0
                     else:
                         prev_days = max(int(out_of_universe_ages.get(symbol, 0)), 0)
-                        next_ages[symbol] = prev_days + 1 if advance_day else prev_days
+                        next_ages[symbol] = prev_days + count_advances if count_advances > 0 else prev_days
                 out_of_universe_ages = next_ages
 
-            if advance_day:
+            if trade_date != last_aging_trade_date:
                 last_aging_trade_date = trade_date
 
             summarize_aging = getattr(universe_service, "summarize_out_of_universe_aging", None)
