@@ -85,6 +85,15 @@ class _DummyKISNoMarketCodes(_DummyKIS):
         return []
 
 
+class _DummyKISNoBulkUnknownCap(_DummyKIS):
+    def get_market_snapshot_bulk(self, codes):
+        raise RuntimeError("bulk snapshot unavailable")
+
+    def get_current_price(self, stock_code):
+        # market_cap/is_management/is_suspended intentionally missing
+        return {"current_price": 70000, "open_price": 69000, "volume": 100000}
+
+
 class UniverseSelectorFixedTests(unittest.TestCase):
     def test_fixed_mode_preserves_order_and_max(self):
         with tempfile.TemporaryDirectory() as td:
@@ -294,6 +303,86 @@ class UniverseSelectorFixedTests(unittest.TestCase):
             selector = UniverseSelector(config=cfg, kis_client=_DummyKIS(), db=None)
             stage1 = selector._select_volume_top(limit=cfg.max_stocks * 3)
             self.assertEqual(len(stage1), 15)
+
+    def test_combined_uses_volume_top_n_for_stage1_limit(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = UniverseSelectionConfig(
+                selection_method="combined",
+                max_stocks=5,
+                volume_top_n=8,
+                universe_cache_file=str(Path(td) / "universe_cache.json"),
+            )
+            selector = UniverseSelector(config=cfg, kis_client=_DummyKIS(), db=None)
+            observed = {}
+
+            def _fake_stage1(limit):
+                observed["limit"] = limit
+                return ["005930", "000660", "035420", "051910", "068270", "207940", "006400", "105560"]
+
+            selector._select_volume_top = _fake_stage1  # type: ignore
+            selector._evaluate_combined_candidate = lambda code: {  # type: ignore
+                "code": code,
+                "trend_score": 10.0,
+                "adx": 25.0,
+                "trend_up": True,
+                "breakout": False,
+            }
+
+            selected = selector._select_combined()
+            self.assertEqual(observed["limit"], 8)
+            self.assertEqual(len(selected), 5)
+
+    def test_combined_reranks_by_trend_score_not_stage1_order(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = UniverseSelectionConfig(
+                selection_method="combined",
+                max_stocks=2,
+                volume_top_n=3,
+                universe_cache_file=str(Path(td) / "universe_cache.json"),
+            )
+            selector = UniverseSelector(config=cfg, kis_client=_DummyKIS(), db=None)
+            selector._select_volume_top = lambda limit: ["005930", "000660", "035420"]  # type: ignore
+            score_map = {"005930": 10.0, "000660": 95.0, "035420": 60.0}
+            selector._evaluate_combined_candidate = lambda code: {  # type: ignore
+                "code": code,
+                "trend_score": score_map[code],
+                "adx": 20.0,
+                "trend_up": True,
+                "breakout": code == "000660",
+            }
+
+            selected = selector._select_combined()
+            self.assertEqual(selected, ["000660", "035420"])
+
+    def test_unknown_market_cap_is_blocked_when_strict(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = UniverseSelectionConfig(
+                selection_method="volume_top",
+                candidate_pool_mode="yaml",
+                candidate_stocks=["005930", "000660", "035420"],
+                max_stocks=3,
+                min_market_cap=1000,
+                allow_unknown_market_cap=False,
+                universe_cache_file=str(Path(td) / "universe_cache.json"),
+            )
+            selector = UniverseSelector(config=cfg, kis_client=_DummyKISNoBulkUnknownCap(), db=None)
+            selected = selector._select_volume_top(limit=3)
+            self.assertEqual(selected, [])
+
+    def test_unknown_market_cap_can_pass_when_allowed(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = UniverseSelectionConfig(
+                selection_method="volume_top",
+                candidate_pool_mode="yaml",
+                candidate_stocks=["005930", "000660", "035420"],
+                max_stocks=3,
+                min_market_cap=1000,
+                allow_unknown_market_cap=True,
+                universe_cache_file=str(Path(td) / "universe_cache.json"),
+            )
+            selector = UniverseSelector(config=cfg, kis_client=_DummyKISNoBulkUnknownCap(), db=None)
+            selected = selector._select_volume_top(limit=3)
+            self.assertEqual(len(selected), 3)
 
 
 if __name__ == "__main__":

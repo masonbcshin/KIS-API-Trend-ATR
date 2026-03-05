@@ -1098,6 +1098,27 @@ class KISApi:
             return default
 
     @staticmethod
+    def _to_bool_flag(value: Any, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return value != 0
+        text = str(value).strip().upper()
+        if text in {"", "N", "NO", "FALSE", "F", "0", "00", "000", "NONE", "NULL"}:
+            return False
+        if text in {"Y", "YES", "TRUE", "T", "1"}:
+            return True
+        if text.isdigit():
+            return text not in {"0", "00", "000"}
+        if "정지" in text or "SUSPEND" in text or "HALT" in text:
+            return True
+        if "관리" in text or "MANAGE" in text:
+            return True
+        return default
+
+    @staticmethod
     def _first_present(item: Dict[str, Any], keys: List[str], default: Any = None) -> Any:
         for key in keys:
             if key in item and item.get(key) not in (None, ""):
@@ -1168,8 +1189,39 @@ class KISApi:
             pct_from_open = self._to_float(
                 self._first_present(item, ["prdy_ctrt", "change_rate"], 0)
             )
-            market_cap = self._to_float(
-                self._first_present(item, ["hts_avls", "market_cap"], 0)
+            market_cap_raw = self._first_present(item, ["hts_avls", "market_cap"], None)
+            market_cap = (
+                self._to_float(market_cap_raw, 0.0)
+                if market_cap_raw not in (None, "")
+                else None
+            )
+            is_suspended = self._to_bool_flag(
+                self._first_present(
+                    item,
+                    [
+                        "is_suspended",
+                        "suspended",
+                        "trht_yn",
+                        "halt_yn",
+                        "trading_halt_yn",
+                        "stck_stop_yn",
+                    ],
+                    False,
+                ),
+                False,
+            )
+            is_management = self._to_bool_flag(
+                self._first_present(
+                    item,
+                    [
+                        "is_management",
+                        "management_yn",
+                        "mang_issu_yn",
+                        "mang_issu_cls_code",
+                    ],
+                    False,
+                ),
+                False,
             )
 
             rows.append(
@@ -1179,8 +1231,8 @@ class KISApi:
                     "current_price": current_price,
                     "volume": volume,
                     "market_cap": market_cap,
-                    "is_suspended": False,
-                    "is_management": False,
+                    "is_suspended": is_suspended,
+                    "is_management": is_management,
                     "pct_from_open": pct_from_open,
                 }
             )

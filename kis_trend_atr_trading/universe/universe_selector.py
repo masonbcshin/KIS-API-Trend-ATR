@@ -40,6 +40,7 @@ class UniverseSelectionConfig:
     atr_period: int = 14
     volume_top_n: int = 50
     exclude_management: bool = True
+    allow_unknown_market_cap: bool = False
     fallback_to_fixed: bool = True
     halt_on_fallback_in_real: bool = False
     universe_cache_file: str = "data/universe_cache.json"
@@ -96,6 +97,7 @@ class UniverseSelector:
             atr_period=int(section.get("atr_period", 14)),
             volume_top_n=int(section.get("volume_top_n", 50)),
             exclude_management=bool(section.get("exclude_management", True)),
+            allow_unknown_market_cap=bool(section.get("allow_unknown_market_cap", False)),
             fallback_to_fixed=bool(section.get("fallback_to_fixed", True)),
             halt_on_fallback_in_real=bool(section.get("halt_on_fallback_in_real", False)),
             universe_cache_file=str(section.get("universe_cache_file", "data/universe_cache.json")),
@@ -358,33 +360,55 @@ class UniverseSelector:
         return limited
 
     def _select_combined(self) -> List[str]:
-        first_stage = self._select_volume_top(self.config.max_stocks * 3)
-        logger.info(f"[UNIVERSE] combined stage1={len(first_stage)}")
-        second_stage: List[str] = []
+        stage1_limit = max(int(self.config.volume_top_n), self.config.max_stocks)
+        first_stage = self._select_volume_top(stage1_limit)
+        logger.info(f"[UNIVERSE] combined stage1={len(first_stage)} (limit={stage1_limit})")
+        stage1_rank = {code: idx for idx, code in enumerate(first_stage)}
+        second_stage: List[Dict[str, Any]] = []
         for code in first_stage:
-            ratio = self._atr_ratio_pct(code)
-            if ratio is None:
+            metrics = self._evaluate_combined_candidate(code)
+            if metrics is None:
                 continue
-            if self.config.min_atr_pct <= ratio <= self.config.max_atr_pct:
-                second_stage.append(code)
+            second_stage.append(metrics)
         logger.info(f"[UNIVERSE] combined stage2={len(second_stage)}")
         if (
             self.config.candidate_pool_mode == "yaml"
             and len(second_stage) > 0
-            and self._dedupe(second_stage) == self._dedupe(self.config.candidate_stocks)[: len(second_stage)]
+            and self._dedupe([str(row["code"]) for row in second_stage])
+            == self._dedupe(self.config.candidate_stocks)[: len(second_stage)]
         ):
             logger.info(
                 "[UNIVERSE] restricted pool 모드(yaml): 최종 선정이 candidate_stocks와 동일합니다."
             )
-        limited = second_stage[: self.config.max_stocks]
+        ranked = sorted(
+            second_stage,
+            key=lambda row: (
+                -float(row.get("trend_score") or 0.0),
+                stage1_rank.get(str(row.get("code")), 10**9),
+            ),
+        )
+        ranked_codes = [str(row["code"]) for row in ranked]
+        limited = ranked_codes[: self.config.max_stocks]
         self._set_last_selection_meta(
             candidate_symbols=first_stage,
-            pre_limit_symbols=second_stage,
+            pre_limit_symbols=ranked_codes,
             selected_symbols=limited,
             meta={
                 "strategy": "combined",
                 "stage1_count": len(first_stage),
                 "stage2_count": len(second_stage),
+                "stage1_limit": stage1_limit,
+                "rank_basis": "trend_score_then_stage1_rank",
+                "top_ranked": [
+                    {
+                        "code": str(row.get("code")),
+                        "trend_score": round(float(row.get("trend_score") or 0.0), 2),
+                        "adx": round(float(row.get("adx") or 0.0), 2),
+                        "trend_up": bool(row.get("trend_up")),
+                        "breakout": bool(row.get("breakout")),
+                    }
+                    for row in ranked[: min(5, len(ranked))]
+                ],
             },
         )
         return limited
@@ -497,7 +521,26 @@ class UniverseSelector:
         if open_price > 0:
             pct = ((current_price - open_price) / open_price) * 100.0
         # KIS API 기본 응답에는 관리/정지/시총 필드가 없어 best-effort 처리
-        market_cap = 0.0
+        market_cap = self._to_float(
+            self._first_present(price, ["market_cap", "hts_avls", "stck_avls"], 0),
+            0.0,
+        )
+        is_suspended = self._to_bool_flag(
+            self._first_present(
+                price,
+                ["is_suspended", "suspended", "trht_yn", "halt_yn", "trading_halt_yn"],
+                False,
+            ),
+            False,
+        )
+        is_management = self._to_bool_flag(
+            self._first_present(
+                price,
+                ["is_management", "management_yn", "mang_issu_yn", "mang_issu_cls_code"],
+                False,
+            ),
+            False,
+        )
         return {
             "code": code,
             "current_price": current_price,
@@ -505,26 +548,48 @@ class UniverseSelector:
             "volume": volume,
             "trade_value": trade_value,
             "market_cap": market_cap,
-            "is_suspended": False,
-            "is_management": False,
+            "is_suspended": is_suspended,
+            "is_management": is_management,
             "pct_from_open": pct,
         }
 
     def _passes_safety_filters(self, snap: Dict[str, Any]) -> bool:
         if float(snap.get("trade_value") or 0.0) < self.config.min_volume:
             return False
-        if snap["market_cap"] > 0 and snap["market_cap"] < self.config.min_market_cap:
+        market_cap = self._to_float(snap.get("market_cap"), 0.0)
+        if self.config.min_market_cap > 0:
+            if market_cap <= 0 and not self.config.allow_unknown_market_cap:
+                return False
+            if market_cap > 0 and market_cap < self.config.min_market_cap:
+                return False
+        if self._to_bool_flag(snap.get("is_suspended"), False):
             return False
-        if snap.get("is_suspended"):
-            return False
-        if self.config.exclude_management and snap.get("is_management"):
+        if self.config.exclude_management and self._to_bool_flag(snap.get("is_management"), False):
             return False
         if abs(float(snap.get("pct_from_open") or 0.0)) >= 28.0:
             return False
         return True
 
+    def _evaluate_combined_candidate(self, code: str) -> Optional[Dict[str, Any]]:
+        df = self.kis_client.get_daily_ohlcv(code, period_type="D")
+        atr_ratio = self._atr_ratio_pct_from_df(df)
+        if atr_ratio is None:
+            return None
+        if not (self.config.min_atr_pct <= atr_ratio <= self.config.max_atr_pct):
+            return None
+        trend_score, trend_meta = self._trend_entry_score_from_df(df)
+        return {
+            "code": code,
+            "atr_ratio": atr_ratio,
+            "trend_score": trend_score,
+            **trend_meta,
+        }
+
     def _atr_ratio_pct(self, code: str) -> Optional[float]:
         df = self.kis_client.get_daily_ohlcv(code, period_type="D")
+        return self._atr_ratio_pct_from_df(df)
+
+    def _atr_ratio_pct_from_df(self, df: Any) -> Optional[float]:
         if df is None or len(df) < 20:
             return None
         closes = df["close"].astype(float).tolist()
@@ -545,6 +610,90 @@ class UniverseSelector:
             return None
         atr = sum(tr_list[-period:]) / period
         return (atr / closes[-1]) * 100.0
+
+    def _trend_entry_score_from_df(self, df: Any) -> Tuple[float, Dict[str, Any]]:
+        if df is None or len(df) < 20:
+            return 0.0, {"adx": 0.0, "trend_up": False, "breakout": False, "prev_high": 0.0}
+        closes = df["close"].astype(float).tolist()
+        highs = df["high"].astype(float).tolist()
+        lows = df["low"].astype(float).tolist()
+        if len(closes) < 3:
+            return 0.0, {"adx": 0.0, "trend_up": False, "breakout": False, "prev_high": 0.0}
+
+        ma_period = min(20, len(closes) - 1)
+        ma_value = sum(closes[-ma_period:]) / ma_period if ma_period > 0 else 0.0
+        latest_close = closes[-1]
+        prev_high = highs[-2] if len(highs) >= 2 else 0.0
+        trend_up = ma_value > 0 and latest_close > ma_value
+        breakout = prev_high > 0 and latest_close > prev_high
+        adx = self._calculate_adx(highs, lows, closes, period=max(14, self.config.atr_period))
+
+        # 진입 조건(상승 추세 + 고가 돌파 + 추세 강도)과 동일한 방향으로 점수화
+        score = 0.0
+        score += 120.0 if trend_up else -60.0
+        score += 80.0 if breakout else -20.0
+        score += min(max(adx, 0.0), 60.0)
+        if ma_value > 0:
+            score += max((latest_close / ma_value - 1.0) * 100.0, -10.0) * 1.5
+
+        return score, {
+            "adx": adx,
+            "trend_up": trend_up,
+            "breakout": breakout,
+            "prev_high": prev_high,
+            "ma": ma_value,
+        }
+
+    @staticmethod
+    def _calculate_adx(
+        highs: List[float],
+        lows: List[float],
+        closes: List[float],
+        period: int = 14,
+    ) -> float:
+        if len(closes) < 3:
+            return 0.0
+        period = max(int(period), 2)
+        alpha = 1.0 / float(period)
+        atr_ema: Optional[float] = None
+        plus_dm_ema: Optional[float] = None
+        minus_dm_ema: Optional[float] = None
+        adx_ema: Optional[float] = None
+
+        for i in range(1, len(closes)):
+            up_move = highs[i] - highs[i - 1]
+            down_move = lows[i - 1] - lows[i]
+            plus_dm = up_move if up_move > down_move and up_move > 0 else 0.0
+            minus_dm = down_move if down_move > up_move and down_move > 0 else 0.0
+            tr = max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i - 1]),
+                abs(lows[i] - closes[i - 1]),
+            )
+
+            if atr_ema is None:
+                atr_ema = tr
+                plus_dm_ema = plus_dm
+                minus_dm_ema = minus_dm
+            else:
+                atr_ema += alpha * (tr - atr_ema)
+                plus_dm_ema += alpha * (plus_dm - plus_dm_ema)
+                minus_dm_ema += alpha * (minus_dm - minus_dm_ema)
+
+            if not atr_ema or atr_ema <= 0:
+                continue
+
+            plus_di = 100.0 * (plus_dm_ema or 0.0) / atr_ema
+            minus_di = 100.0 * (minus_dm_ema or 0.0) / atr_ema
+            di_sum = plus_di + minus_di
+            dx = 0.0 if di_sum <= 0 else (100.0 * abs(plus_di - minus_di) / di_sum)
+
+            if adx_ema is None:
+                adx_ema = dx
+            else:
+                adx_ema += alpha * (dx - adx_ema)
+
+        return float(adx_ema or 0.0)
 
     def _is_market_hours(self, now: datetime) -> bool:
         t = now.time()
@@ -654,3 +803,42 @@ class UniverseSelector:
     @staticmethod
     def _is_valid_code(code: str) -> bool:
         return len(code) == 6 and code.isdigit()
+
+    @staticmethod
+    def _first_present(item: Dict[str, Any], keys: Iterable[str], default: Any = None) -> Any:
+        for key in keys:
+            if key in item and item.get(key) not in (None, ""):
+                return item.get(key)
+        return default
+
+    @staticmethod
+    def _to_float(value: Any, default: float = 0.0) -> float:
+        try:
+            if value is None:
+                return default
+            if isinstance(value, str):
+                value = value.replace(",", "").strip()
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _to_bool_flag(value: Any, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return value != 0
+        text = str(value).strip().upper()
+        if text in {"", "N", "NO", "FALSE", "F", "0", "00", "000", "NONE", "NULL"}:
+            return False
+        if text in {"Y", "YES", "TRUE", "T", "1"}:
+            return True
+        if text.isdigit():
+            return text not in {"0", "00", "000"}
+        if "정지" in text or "SUSPEND" in text or "HALT" in text:
+            return True
+        if "관리" in text or "MANAGE" in text:
+            return True
+        return default

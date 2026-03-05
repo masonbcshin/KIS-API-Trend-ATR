@@ -22,14 +22,14 @@ universe:
   # ────────────────────────────────────────────────────────────────
   selection_method: "combined"
   
-  # 최대 동시 거래 종목 수
-  max_stocks: 5
+  # 최대 동시 거래 종목 수 (개별주 5 + ETF 3)
+  max_stocks: 8
   # 오늘 유니버스 크기 (신규 진입 후보군 크기)
   # 하위호환: 미설정 시 max_stocks 값을 사용
-  universe_size: 5
+  universe_size: 8
   # 동시 보유 포지션 상한
   # 하위호환: 미설정 시 max_stocks 값을 사용
-  max_positions: 5
+  max_positions: 8
   
   # ────────────────────────────────────────────────────────────────
   # 필터 조건 (volume_top, atr_filter, combined 방식 적용)
@@ -37,21 +37,23 @@ universe:
   
   # 최소 일평균 거래대금 (원)
   # 10억 이상 권장 (유동성 확보)
-  min_volume: 1000000000
+  min_volume: 2000000000
   
   # 최소 시가총액 (억원)
-  min_market_cap: 1000
+  min_market_cap: 3000
+  # 시총 미확인(0/None) 종목 허용 여부
+  allow_unknown_market_cap: false
   
   # ATR 비율 범위 (%)
   # ATR / 종가 * 100
   min_atr_pct: 1.0    # 최소 변동성
-  max_atr_pct: 8.0    # 최대 변동성 (너무 높으면 위험)
+  max_atr_pct: 6.5    # 최대 변동성 (과열 구간 제한)
   
   # 관리종목/정리매매 제외
   exclude_management: true
   
   # 거래대금 상위 후보 (volume_top 방식)
-  volume_top_n: 50
+  volume_top_n: 80
 
   # ATR 계산 기간
   atr_period: 14
@@ -64,7 +66,7 @@ universe:
   candidate_pool_mode: "market"
 
   # candidate_pool_mode=market에서 조회할 후보군 최대 스캔 수
-  market_scan_size: 200
+  market_scan_size: 300
 
   # candidate_pool_mode=yaml일 때 사용할 후보군
   candidate_stocks:
