@@ -85,6 +85,11 @@ class _DummyKISNoMarketCodes(_DummyKIS):
         return []
 
 
+class _DummyKISVolumeRankEmpty(_DummyKIS):
+    def get_market_top_by_trade_value(self, top_n=200):
+        return []
+
+
 class _DummyKISNoBulkUnknownCap(_DummyKIS):
     def get_market_snapshot_bulk(self, codes):
         raise RuntimeError("bulk snapshot unavailable")
@@ -265,6 +270,21 @@ class UniverseSelectorFixedTests(unittest.TestCase):
             selected = selector._select_volume_top(limit=10)
             self.assertEqual(len(selected), 10)
             self.assertEqual(selector._last_market_codes_source, "market_api")
+
+    def test_market_mode_fallbacks_to_bulk_when_volume_rank_is_empty(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = UniverseSelectionConfig(
+                selection_method="volume_top",
+                candidate_pool_mode="market",
+                max_stocks=5,
+                min_volume=1_000_000_000,
+                min_market_cap=1000,
+                universe_cache_file=str(Path(td) / "universe_cache.json"),
+            )
+            selector = UniverseSelector(config=cfg, kis_client=_DummyKISVolumeRankEmpty(), db=None)
+            selected = selector._select_volume_top(limit=10)
+            self.assertEqual(len(selected), 10)
+            self.assertEqual(selector._last_volume_data_source, "bulk_snapshot")
 
     def test_market_mode_falls_back_to_seed_codes_when_market_codes_empty(self):
         with tempfile.TemporaryDirectory() as td:

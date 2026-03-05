@@ -279,8 +279,22 @@ class UniverseSelector:
                 for snap in market_rows:
                     if self._passes_safety_filters(snap):
                         rows.append((str(snap["code"]), float(snap["trade_value"])))
-                bulk_ok = True
-                data_source = "volume_rank_api"
+                min_required = min(
+                    max(int(effective_limit), 1),
+                    max(int(self.config.max_stocks), 1),
+                    max(int(pool_size), 1),
+                )
+                if len(rows) < min_required:
+                    logger.warning(
+                        "[UNIVERSE] volume_rank_api 결과 부족: passed=%s, required>=%s -> bulk_snapshot 재시도",
+                        len(rows),
+                        min_required,
+                    )
+                    rows = []
+                    bulk_ok = False
+                else:
+                    bulk_ok = True
+                    data_source = "volume_rank_api"
             except Exception:
                 bulk_ok = False
 
