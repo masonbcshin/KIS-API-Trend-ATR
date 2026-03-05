@@ -537,20 +537,22 @@ class UniverseSelector:
                 if len(selected_set) >= final_target:
                     break
 
-        limited = [
+        # 쿼터 선발은 자산군 분리 우선이지만, 최종 결과는 원래 ranked 순서를 유지합니다.
+        ranked_codes = [
             str(row.get("code") or "")
-            for row in selected_rows
+            for row in ranked
             if self._is_valid_code(str(row.get("code") or ""))
-        ][:final_target]
-        selected_rows_by_code = {
+        ]
+        limited = [code for code in ranked_codes if code in selected_set][:final_target]
+        ranked_rows_by_code = {
             str(row.get("code") or ""): row
-            for row in selected_rows
+            for row in ranked
             if self._is_valid_code(str(row.get("code") or ""))
         }
         selected_etf_count = sum(
             1
             for code in limited
-            if self._row_is_etf_candidate(selected_rows_by_code.get(code) or {"code": code})
+            if self._row_is_etf_candidate(ranked_rows_by_code.get(code) or {"code": code})
         )
         selected_stock_count = max(len(limited) - selected_etf_count, 0)
 

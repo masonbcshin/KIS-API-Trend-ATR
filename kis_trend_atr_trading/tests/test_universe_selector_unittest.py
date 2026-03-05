@@ -475,6 +475,46 @@ class UniverseSelectorFixedTests(unittest.TestCase):
             self.assertEqual(int(meta.get("selected_etf_count", 0)), 2)
             self.assertEqual(int(meta.get("selected_stock_count", 0)), 6)
 
+    def test_combined_quota_shortage_preserves_rank_order(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = UniverseSelectionConfig(
+                selection_method="combined",
+                max_stocks=8,
+                volume_top_n=8,
+                stock_quota=5,
+                etf_quota=3,
+                universe_cache_file=str(Path(td) / "universe_cache.json"),
+            )
+            selector = UniverseSelector(config=cfg, kis_client=_DummyKIS(), db=None)
+            selector._select_volume_top = lambda limit: [  # type: ignore
+                "005930", "000660", "035420", "051910", "006400", "114800", "069500", "229200"
+            ]
+            metrics_map = {
+                "005930": {"trend_score": 250.0, "is_etf": False},
+                "000660": {"trend_score": 240.0, "is_etf": False},
+                "035420": {"trend_score": 230.0, "is_etf": False},
+                "051910": {"trend_score": 220.0, "is_etf": False},
+                "006400": {"trend_score": 210.0, "is_etf": False},
+                "114800": {"trend_score": 208.0, "is_etf": False},
+                "069500": {"trend_score": 205.0, "is_etf": True},
+                "229200": {"trend_score": 200.0, "is_etf": True},
+            }
+            selector._evaluate_combined_candidate = lambda code: {  # type: ignore
+                "code": code,
+                "stock_name": code,
+                "trend_score": metrics_map[code]["trend_score"],
+                "is_etf": metrics_map[code]["is_etf"],
+                "adx": 25.0,
+                "trend_up": True,
+                "breakout": True,
+            }
+
+            selected = selector._select_combined()
+            self.assertEqual(
+                selected,
+                ["005930", "000660", "035420", "051910", "006400", "114800", "069500", "229200"],
+            )
+
     def test_unknown_market_cap_is_blocked_when_strict(self):
         with tempfile.TemporaryDirectory() as td:
             cfg = UniverseSelectionConfig(
