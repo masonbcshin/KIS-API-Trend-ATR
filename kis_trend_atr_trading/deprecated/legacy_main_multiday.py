@@ -1473,9 +1473,9 @@ def main():
         run_backtest(stock_code=args.stock, days=args.days)
         
     elif args.mode == "trade":
-        interval = max(60, args.interval)
+        interval = max(30, args.interval)
         if interval != args.interval:
-            print(f"⚠️ 실행 간격이 60초 미만입니다. 60초로 조정됩니다.")
+            print(f"⚠️ 실행 간격이 30초 미만입니다. 30초로 조정됩니다.")
         
         run_trade(
             stock_code=args.stock,

@@ -9,8 +9,6 @@ import time
 from pathlib import Path
 from typing import Optional
 
-import yaml
-
 # Legacy modules inside this repo use absolute imports like `from config import ...`.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 APP_ROOT = PROJECT_ROOT / "kis_trend_atr_trading"
@@ -28,22 +26,10 @@ from utils.logger import get_logger, setup_logger
 logger = get_logger("apps.kr_trade")
 
 
-def _load_config_file(config_path: str) -> dict:
-    path = Path(config_path)
-    if not path.is_absolute():
-        path = APP_ROOT / config_path
-    if not path.exists():
-        return {}
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
-
-
-def _resolve_feed(args_feed: Optional[str], config_path: str) -> str:
+def _resolve_feed(args_feed: Optional[str]) -> str:
     if args_feed:
         return args_feed
-    raw = _load_config_file(config_path)
-    market_data = raw.get("market_data", {}) if isinstance(raw, dict) else {}
-    feed = str(market_data.get("data_feed", "rest")).strip().lower()
+    feed = str(getattr(settings, "DATA_FEED_DEFAULT", "rest")).strip().lower()
     return feed if feed in ("rest", "ws") else "rest"
 
 
@@ -51,7 +37,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Unified KR trade app")
     parser.add_argument("--mode", choices=["trade", "paper", "cbt"], default="trade")
     parser.add_argument("--feed", choices=["rest", "ws"], default=None)
-    parser.add_argument("--config", default="config/dev.yaml")
     parser.add_argument("--stock", default=settings.DEFAULT_STOCK_CODE)
     parser.add_argument("--interval", type=int, default=60)
     parser.add_argument("--max-runs", type=int, default=None)
@@ -60,7 +45,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def run_trade_app(args: argparse.Namespace) -> int:
-    feed = _resolve_feed(args.feed, args.config)
+    feed = _resolve_feed(args.feed)
 
     if args.mode == "cbt":
         from apps.kr_cbt import run_cbt_mode

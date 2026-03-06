@@ -6,7 +6,7 @@
 - 표준 실행 엔트리포인트: `python3 -m kis_trend_atr_trading.apps.kr_trade`
 - 전략 엔진: 멀티데이 Trend + ATR
 - 권장 진행 순서: `DRY_RUN -> PAPER -> REAL`
-- Deprecated 래퍼(`main_multiday.py`, `main_v2.py` 등)는 하위호환용으로만 유지
+- Deprecated 래퍼(`main_multiday.py` 등)는 하위호환용으로만 유지
 
 ## 1-1. 최근 배포 반영 요약 (`d14d305`, `84db5c2`, `d2b82b2`)
 - CBT 재시작 동기화 시 `CBT -> PAPER` 강제 보정 제거
@@ -262,6 +262,43 @@ sudo systemctl status auto-trade --no-pager
 참고:
 - `.github/workflows/deploy.yml`, `.github/workflows/deploy-oci.yml`의 `nohup python main.py`는 legacy 경로입니다.
 - systemd로 운영 중이면 위 `systemctl restart auto-trade`가 실제 재기동 기준입니다.
+
+### 9-1. 추천 프로필 원클릭 적용(REAL + 추세 민감도 튜닝)
+서버에서 아래 명령 1회 실행:
+```bash
+cd /home/deploy/KIS-API-Trend-ATR
+tools/deploy_recommended_real_profile.sh
+```
+
+적용 내용:
+- `.env` 키 업데이트:
+  - `EXECUTION_MODE=REAL`
+  - `TRADING_MODE=REAL`
+  - `ENABLE_REAL_TRADING=true`
+  - `TREND_MA_PERIOD=35`
+  - `ADX_THRESHOLD=22`
+  - `ATR_SPIKE_THRESHOLD=3.0`
+  - `ATR_PERIOD=14`
+  - `ADX_PERIOD=14`
+  - `DATA_FEED_DEFAULT=ws`
+- systemd override 적용:
+  - `auto-trade.service` 실행 인자를 `--interval 30`으로 고정
+  - `daemon-reload` + `restart`
+
+옵션 예시:
+```bash
+# 실제 반영 없이 미리보기
+tools/deploy_recommended_real_profile.sh --dry-run
+
+# systemd 변경 없이 .env만 반영
+tools/deploy_recommended_real_profile.sh --no-systemd
+```
+
+적용 후 override 점검:
+```bash
+cd /home/deploy/KIS-API-Trend-ATR
+tools/check_auto_trade_override.sh --sudo --strict
+```
 
 ---
 

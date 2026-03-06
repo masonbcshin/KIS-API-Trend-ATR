@@ -25,8 +25,9 @@
 
 호환성 유지:
 
-- 기존 `main.py`, `main_v2.py`, `main_v3.py`, `main_multiday.py`, `main_cbt.py`는
+- 기존 `main.py`, `main_multiday.py`, `main_cbt.py`는
   deprecated thin wrapper로 유지되며 기존 커맨드는 계속 실행 가능합니다.
+- `main_v2.py`, `main_v3.py` 경로는 제거 안내 후 종료됩니다.
 - 내부 구현은 `deprecated/legacy_main*.py`로 보존됩니다.
 
 ---
@@ -46,6 +47,8 @@
 
 - 실운영 서버 재시작 기준: `sudo systemctl restart auto-trade`
 - 상태 확인: `sudo systemctl status auto-trade`
+- 원클릭 추천 프로필 반영: `tools/deploy_recommended_real_profile.sh`
+- override 점검: `tools/check_auto_trade_override.sh --sudo --strict`
 - 참고: `.github/workflows/deploy.yml`, `.github/workflows/deploy-oci.yml`의 `nohup python main.py`는 legacy 경로이며, systemd 기반 운영 재기동을 대체하지 않습니다.
 
 ---

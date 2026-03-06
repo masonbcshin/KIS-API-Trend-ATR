@@ -100,10 +100,10 @@ MAX_POSITIONS: int = int(os.getenv("MAX_POSITIONS", "1"))
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ATR(Average True Range) 계산 기간
-ATR_PERIOD: int = 14
+ATR_PERIOD: int = int(os.getenv("ATR_PERIOD", "14"))
 
 # 추세 판단용 이동평균 기간
-TREND_MA_PERIOD: int = 50
+TREND_MA_PERIOD: int = int(os.getenv("TREND_MA_PERIOD", "50"))
 
 # ★ 손절 배수 (ATR 기준) - 보수적으로 2.0
 ATR_MULTIPLIER_SL: float = 2.0
@@ -120,13 +120,13 @@ ATR_MULTIPLIER_TP: float = 3.0
 MAX_LOSS_PCT: float = 5.0
 
 # ★ ATR 급등 임계값 (평균 대비 배수) - 2.5배 초과 시 진입 거부
-ATR_SPIKE_THRESHOLD: float = 2.5
+ATR_SPIKE_THRESHOLD: float = float(os.getenv("ATR_SPIKE_THRESHOLD", "2.5"))
 
 # ★ ADX 임계값 (추세 강도) - 25 미만이면 횡보장 판단
-ADX_THRESHOLD: float = 25.0
+ADX_THRESHOLD: float = float(os.getenv("ADX_THRESHOLD", "25.0"))
 
 # ADX 계산 기간
-ADX_PERIOD: int = 14
+ADX_PERIOD: int = int(os.getenv("ADX_PERIOD", "14"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -260,7 +260,7 @@ TOKEN_PREWARM_MINUTE: int = int(os.getenv("TOKEN_PREWARM_MINUTE", "0"))
 # 실행 주기 설정
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# 기본 실행 간격 (초) - 최소 60초 강제
+# 기본 실행 간격 (초)
 DEFAULT_EXECUTION_INTERVAL: int = 60
 
 # 손절선 근접 시 실행 간격 (초)

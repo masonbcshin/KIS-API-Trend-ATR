@@ -34,7 +34,8 @@
 ## 2. 구버전 실행 파일 안내
 아래 파일들은 하위호환(Deprecated)입니다.
 - `main_multiday.py`
-- `main.py`, `main_v2.py`, `main_v3.py`, `main_cbt.py`
+- `main.py`, `main_cbt.py`
+- `main_v2.py`, `main_v3.py`는 제거 안내 후 종료됩니다.
 
 지금은 아래를 표준으로 사용하세요.
 ```bash
