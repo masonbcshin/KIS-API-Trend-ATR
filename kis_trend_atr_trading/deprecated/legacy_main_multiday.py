@@ -111,14 +111,27 @@ def print_banner():
 
 def print_strategy_rules():
     """전략 규칙 출력"""
-    rules = """
+    trend_ma_period = getattr(settings, "TREND_MA_PERIOD", 50)
+    adx_threshold = getattr(settings, "ADX_THRESHOLD", 25.0)
+
+    try:
+        trend_ma_period = int(trend_ma_period)
+    except (TypeError, ValueError):
+        trend_ma_period = 50
+
+    try:
+        adx_threshold = float(adx_threshold)
+    except (TypeError, ValueError):
+        adx_threshold = 25.0
+
+    rules = f"""
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
                          전략 규칙 요약
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [진입 조건]
-  ✓ 상승 추세 (종가 > 50일 MA)
-  ✓ ADX > 25 (추세 강도 확인)
+  ✓ 상승 추세 (종가 > {trend_ma_period}일 MA)
+  ✓ ADX > {adx_threshold:g} (추세 강도 확인)
   ✓ 직전 캔들 고가 돌파
   ✓ ATR 정상 범위 (급등 아님)
 
