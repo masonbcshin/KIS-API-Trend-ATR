@@ -21,6 +21,18 @@ DRY_RUN=0
 USE_SYSTEMD=1
 RESTART_SERVICE=1
 
+PROFILE_KEYS=(
+  EXECUTION_MODE
+  TRADING_MODE
+  ENABLE_REAL_TRADING
+  TREND_MA_PERIOD
+  ADX_THRESHOLD
+  ATR_SPIKE_THRESHOLD
+  ATR_PERIOD
+  ADX_PERIOD
+  DATA_FEED_DEFAULT
+)
+
 usage() {
   cat <<'USAGE'
 Usage:
@@ -110,6 +122,78 @@ upsert_key() {
   fi
 }
 
+key_description() {
+  local key="$1"
+  case "${key}" in
+    EXECUTION_MODE)
+      echo "실행 안전 모드. REAL이면 실거래 설정 파일(settings_real.py) 로드."
+      ;;
+    TRADING_MODE)
+      echo "주문/계좌 네임스페이스 모드. REAL이면 실계좌 경로를 사용."
+      ;;
+    ENABLE_REAL_TRADING)
+      echo "실거래 이중 승인 스위치. true여야 REAL 주문이 실제로 허용됨."
+      ;;
+    TREND_MA_PERIOD)
+      echo "추세 판단 이동평균 기간(일). 작을수록 추세 전환을 더 빠르게 반영."
+      ;;
+    ADX_THRESHOLD)
+      echo "진입 허용 최소 추세강도(ADX). 낮출수록 진입이 늘고, 높일수록 엄격해짐."
+      ;;
+    ATR_SPIKE_THRESHOLD)
+      echo "ATR 급등 차단 임계 배수. 값이 낮을수록 변동성 급등 구간 진입을 더 보수적으로 차단."
+      ;;
+    ATR_PERIOD)
+      echo "ATR 계산 기간(일). 짧을수록 최근 변동성 반영이 빠름."
+      ;;
+    ADX_PERIOD)
+      echo "ADX 계산 기간(일). 짧을수록 추세강도 변화 반응이 빠름."
+      ;;
+    DATA_FEED_DEFAULT)
+      echo "기본 시세 소스(rest|ws). ws면 장중 실시간 틱 우선 사용."
+      ;;
+    *)
+      echo "설명 없음"
+      ;;
+  esac
+}
+
+read_env_value() {
+  local file="$1"
+  local key="$2"
+  local line
+  line="$(grep -E "^${key}=" "${file}" | tail -n1 || true)"
+  if [[ -z "${line}" ]]; then
+    echo "<unset>"
+    return
+  fi
+  echo "${line#*=}"
+}
+
+print_profile_with_descriptions() {
+  local file="$1"
+  echo "[INFO] active keys with descriptions:"
+  for key in "${PROFILE_KEYS[@]}"; do
+    local value
+    value="$(read_env_value "${file}" "${key}")"
+    printf "  - %s=%s\n" "${key}" "${value}"
+    printf "    %s\n" "$(key_description "${key}")"
+  done
+}
+
+print_recommended_profile_with_descriptions() {
+  echo "[INFO] recommended REAL profile keys:"
+  printf "  - EXECUTION_MODE=REAL\n    %s\n" "$(key_description EXECUTION_MODE)"
+  printf "  - TRADING_MODE=REAL\n    %s\n" "$(key_description TRADING_MODE)"
+  printf "  - ENABLE_REAL_TRADING=true\n    %s\n" "$(key_description ENABLE_REAL_TRADING)"
+  printf "  - TREND_MA_PERIOD=35\n    %s\n" "$(key_description TREND_MA_PERIOD)"
+  printf "  - ADX_THRESHOLD=22\n    %s\n" "$(key_description ADX_THRESHOLD)"
+  printf "  - ATR_SPIKE_THRESHOLD=3.0\n    %s\n" "$(key_description ATR_SPIKE_THRESHOLD)"
+  printf "  - ATR_PERIOD=14\n    %s\n" "$(key_description ATR_PERIOD)"
+  printf "  - ADX_PERIOD=14\n    %s\n" "$(key_description ADX_PERIOD)"
+  printf "  - DATA_FEED_DEFAULT=ws\n    %s\n" "$(key_description DATA_FEED_DEFAULT)"
+}
+
 ensure_env_file() {
   if [[ -f "${ENV_FILE}" ]]; then
     return
@@ -141,8 +225,7 @@ apply_env_profile() {
   upsert_key "${ENV_FILE}" "DATA_FEED_DEFAULT" "ws"
 
   echo "[OK] applied recommended REAL profile in ${ENV_FILE}"
-  echo "[INFO] active keys:"
-  grep -E '^(EXECUTION_MODE|TRADING_MODE|ENABLE_REAL_TRADING|TREND_MA_PERIOD|ADX_THRESHOLD|ATR_SPIKE_THRESHOLD|ATR_PERIOD|ADX_PERIOD|DATA_FEED_DEFAULT)=' "${ENV_FILE}" || true
+  print_profile_with_descriptions "${ENV_FILE}"
 }
 
 write_systemd_override() {
@@ -183,6 +266,7 @@ echo "[INFO] use_systemd=${USE_SYSTEMD}, restart_service=${RESTART_SERVICE}, dry
 
 if (( DRY_RUN == 1 )); then
   echo "[DRY-RUN] would apply recommended env keys and systemd override."
+  print_recommended_profile_with_descriptions
   exit 0
 fi
 
