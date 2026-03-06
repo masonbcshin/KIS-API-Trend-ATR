@@ -1175,6 +1175,11 @@ class MultidayExecutor:
             if stored is None:
                 logger.error("동기화 성공했으나 포지션 데이터 없음")
                 return False
+
+            stored = self._apply_stop_loss_guard_to_stored_position(
+                stored,
+                context=f"restore:{action}",
+            )
             
             logger.info(
                 f"포지션 동기화 완료: {stored.stock_code} @ {stored.entry_price:,.0f}원, "
@@ -1386,6 +1391,63 @@ class MultidayExecutor:
                 return parsed
         return 0.0
 
+    def _compute_entry_exit_prices(self, entry_price: float, atr: float) -> tuple[float, float, float]:
+        """
+        체결가/복구가 기준으로 진입 ATR, 손절가, 익절가를 일관 계산합니다.
+
+        - 손절가는 전략 공용 함수(calculate_stop_loss)를 사용해 MAX_LOSS_PCT 캡을 반드시 반영합니다.
+        - ATR 누락 시 보수적 폴백(진입가의 1%)을 사용합니다.
+        """
+        entry = float(entry_price or 0.0)
+        resolved_atr = float(atr or 0.0)
+        if entry <= 0:
+            return 0.0, 0.0, 0.0
+        if resolved_atr <= 0:
+            resolved_atr = max(entry * 0.01, 1.0)
+
+        stop_loss = float(self.strategy.calculate_stop_loss(entry, resolved_atr))
+        take_profit = float(self.strategy.calculate_take_profit(entry, resolved_atr))
+        return resolved_atr, stop_loss, take_profit
+
+    def _apply_stop_loss_guard_to_stored_position(self, stored: StoredPosition, context: str) -> StoredPosition:
+        """
+        저장/복구 포지션의 손절가가 전략 기준보다 과도하게 느슨하면 즉시 보정합니다.
+        """
+        if stored is None:
+            return stored
+
+        entry_price = float(getattr(stored, "entry_price", 0.0) or 0.0)
+        if entry_price <= 0:
+            return stored
+
+        base_atr = float(getattr(stored, "atr_at_entry", 0.0) or 0.0)
+        resolved_atr, min_stop_loss, _ = self._compute_entry_exit_prices(entry_price, base_atr)
+        if min_stop_loss <= 0:
+            return stored
+
+        if base_atr <= 0:
+            stored.atr_at_entry = resolved_atr
+
+        current_stop_loss = float(getattr(stored, "stop_loss", 0.0) or 0.0)
+        if current_stop_loss <= 0 or current_stop_loss < min_stop_loss:
+            logger.warning(
+                "[RISK][SL_GUARD] context=%s symbol=%s stop_loss adjusted: old=%.2f -> new=%.2f "
+                "(entry=%.2f, atr=%.2f, max_loss_pct=%.2f)",
+                context,
+                getattr(stored, "stock_code", "UNKNOWN"),
+                current_stop_loss,
+                min_stop_loss,
+                entry_price,
+                resolved_atr,
+                float(getattr(settings, "MAX_LOSS_PCT", 0.0) or 0.0),
+            )
+            stored.stop_loss = min_stop_loss
+            trailing_stop = float(getattr(stored, "trailing_stop", 0.0) or 0.0)
+            if trailing_stop < min_stop_loss:
+                stored.trailing_stop = min_stop_loss
+
+        return stored
+
     def _get_account_holding(self, stock_code: str) -> Optional[Dict[str, Any]]:
         """API 계좌 기준 특정 종목 보유 스냅샷을 반환합니다."""
         try:
@@ -1550,10 +1612,9 @@ class MultidayExecutor:
             return False
 
         atr = float(getattr(signal, "atr", 0.0) or 0.0)
-        if atr <= 0:
-            atr = max(recovered_avg * 0.01, 1.0)
-        stop_loss = recovered_avg - (atr * settings.ATR_MULTIPLIER_SL)
-        take_profit = recovered_avg + (atr * settings.ATR_MULTIPLIER_TP)
+        atr, stop_loss, take_profit = self._compute_entry_exit_prices(recovered_avg, atr)
+        if atr <= 0 or stop_loss <= 0:
+            return False
 
         try:
             self.strategy.open_position(
@@ -1789,13 +1850,15 @@ class MultidayExecutor:
                     fill_price = float(fill["price"])
                     fill_qty = int(fill["qty"])
                     if not self.strategy.has_position:
-                        actual_stop_loss = fill_price - (signal.atr * settings.ATR_MULTIPLIER_SL)
-                        actual_take_profit = fill_price + (signal.atr * settings.ATR_MULTIPLIER_TP)
+                        entry_atr, actual_stop_loss, actual_take_profit = self._compute_entry_exit_prices(
+                            fill_price,
+                            float(getattr(signal, "atr", 0.0) or 0.0),
+                        )
                         self.strategy.open_position(
                             symbol=self.stock_code,
                             entry_price=fill_price,
                             quantity=fill_qty,
-                            atr=signal.atr,
+                            atr=entry_atr,
                             stop_loss=actual_stop_loss,
                             take_profit=actual_take_profit,
                         )
@@ -1809,6 +1872,15 @@ class MultidayExecutor:
                         )
                         pos.entry_price = float(new_avg)
                         pos.quantity = int(pos.quantity) + fill_qty
+                        entry_atr, recalced_stop_loss, recalced_take_profit = self._compute_entry_exit_prices(
+                            float(pos.entry_price),
+                            float(getattr(pos, "atr_at_entry", 0.0) or 0.0),
+                        )
+                        pos.atr_at_entry = entry_atr
+                        pos.stop_loss = recalced_stop_loss
+                        pos.take_profit = recalced_take_profit
+                        if float(getattr(pos, "trailing_stop", 0.0) or 0.0) < recalced_stop_loss:
+                            pos.trailing_stop = recalced_stop_loss
                         pos.highest_price = max(float(pos.highest_price or 0.0), fill_price)
                     applied_qty += fill_qty
 
@@ -1887,13 +1959,17 @@ class MultidayExecutor:
                     fill_price = float(fill["price"])
                     fill_qty = int(fill["qty"])
                     if not self.strategy.has_position:
+                        entry_atr, partial_stop_loss, partial_take_profit = self._compute_entry_exit_prices(
+                            fill_price,
+                            float(getattr(signal, "atr", 0.0) or 0.0),
+                        )
                         self.strategy.open_position(
                             symbol=self.stock_code,
                             entry_price=fill_price,
                             quantity=fill_qty,
-                            atr=signal.atr,
-                            stop_loss=fill_price - (signal.atr * settings.ATR_MULTIPLIER_SL),
-                            take_profit=fill_price + (signal.atr * settings.ATR_MULTIPLIER_TP),
+                            atr=entry_atr,
+                            stop_loss=partial_stop_loss,
+                            take_profit=partial_take_profit,
                         )
                     else:
                         pos = self.strategy.position
@@ -1905,6 +1981,15 @@ class MultidayExecutor:
                         )
                         pos.entry_price = float(new_avg)
                         pos.quantity = int(pos.quantity) + fill_qty
+                        entry_atr, recalced_stop_loss, recalced_take_profit = self._compute_entry_exit_prices(
+                            float(pos.entry_price),
+                            float(getattr(pos, "atr_at_entry", 0.0) or 0.0),
+                        )
+                        pos.atr_at_entry = entry_atr
+                        pos.stop_loss = recalced_stop_loss
+                        pos.take_profit = recalced_take_profit
+                        if float(getattr(pos, "trailing_stop", 0.0) or 0.0) < recalced_stop_loss:
+                            pos.trailing_stop = recalced_stop_loss
                     applied_qty += fill_qty
 
                 if applied_qty > 0:
