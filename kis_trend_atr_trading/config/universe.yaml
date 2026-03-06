@@ -54,7 +54,7 @@ universe:
   
   # 최소 일평균 거래대금 (원)
   # 10억 이상 권장 (유동성 확보)
-  min_volume: 2000000000
+  min_volume: 1000000000
   
   # 최소 시가총액 (억원)
   min_market_cap: 1000
@@ -63,14 +63,14 @@ universe:
   
   # ATR 비율 범위 (%)
   # ATR / 종가 * 100
-  min_atr_pct: 1.0    # 최소 변동성
-  max_atr_pct: 6.5    # 최대 변동성 (과열 구간 제한)
+  min_atr_pct: 0.4    # 최소 변동성
+  max_atr_pct: 9.0    # 최대 변동성 (과열 구간 제한)
   
   # 관리종목/정리매매 제외
   exclude_management: true
   
   # 거래대금 상위 후보 (volume_top 방식)
-  volume_top_n: 80
+  volume_top_n: 120
 
   # ATR 계산 기간
   atr_period: 14
@@ -83,7 +83,7 @@ universe:
   candidate_pool_mode: "market"
 
   # candidate_pool_mode=market에서 조회할 후보군 최대 스캔 수
-  market_scan_size: 300
+  market_scan_size: 500
 
   # candidate_pool_mode=yaml일 때 사용할 후보군
   candidate_stocks:
@@ -150,5 +150,5 @@ stock_overrides:
 # ────────────────────────────────────────────────────────────────
 # 메타정보
 # ────────────────────────────────────────────────────────────────
-updated_at: "2026-03-05"
+updated_at: "2026-03-06"
 description: "기본 유니버스 설정 - daily universe + holdings 관리"
