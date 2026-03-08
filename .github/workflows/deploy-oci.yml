@@ -22,6 +22,9 @@ jobs:
             echo ">>> Git pull"
             git pull
 
+            echo ">>> Migrate BUY entry quality env"
+            bash tools/migrate_entry_buy_quality_env.sh
+
             echo ">>> Restart service"
             sudo systemctl restart auto-trade
 
