@@ -62,6 +62,13 @@ try:
     from kis_trend_atr_trading.db.mysql import get_db_manager, QueryError
     from kis_trend_atr_trading.core.market_data import MarketDataProvider
     from kis_trend_atr_trading.utils.avg_price import calc_weighted_avg, quantize_price, reduce_quantity_after_sell
+    from kis_trend_atr_trading.utils.entry_utils import (
+        ASSET_TYPE_ETF,
+        align_price_to_tick,
+        compute_extension_pct,
+        detect_asset_type,
+        get_tick_size,
+    )
     from kis_trend_atr_trading.utils.telegram_notifier import TelegramNotifier, get_telegram_notifier
     from kis_trend_atr_trading.utils.logger import get_logger, TradeLogger
     from kis_trend_atr_trading.utils.market_hours import KST
@@ -102,6 +109,13 @@ except ImportError:
     from db.mysql import get_db_manager, QueryError
     from core.market_data import MarketDataProvider
     from utils.avg_price import calc_weighted_avg, quantize_price, reduce_quantity_after_sell
+    from utils.entry_utils import (
+        ASSET_TYPE_ETF,
+        align_price_to_tick,
+        compute_extension_pct,
+        detect_asset_type,
+        get_tick_size,
+    )
     from utils.telegram_notifier import TelegramNotifier, get_telegram_notifier
     from utils.logger import get_logger, TradeLogger
     from utils.market_hours import KST
@@ -1273,29 +1287,276 @@ class MultidayExecutor:
             tuple: (현재가, 시가)
         """
         try:
-            if self.market_data_provider is not None:
-                # REST provider가 최신가+시가 동시 조회를 지원하면 단일 API 호출만 사용합니다.
-                quote_fn = getattr(self.market_data_provider, "get_latest_price_with_open", None)
-                if callable(quote_fn):
-                    current, open_price = quote_fn(self.stock_code)
-                    return float(current or 0.0), float(open_price or 0.0)
-
-                current = float(self.market_data_provider.get_latest_price(self.stock_code) or 0.0)
-                # 멀티데이 전략은 갭 보호를 위해 시가가 필요하므로 provider-only 모드에서는
-                # REST 현재가 응답에서 시가를 보강합니다(전략/주문 파라미터 불변).
-                price_data = self.api.get_current_price(self.stock_code)
-                open_price = float(price_data.get("open_price", 0.0) or 0.0)
-                return current, open_price
-
-            price_data = self.api.get_current_price(self.stock_code)
-            current = price_data.get("current_price", 0)
-            open_price = price_data.get("open_price", 0)
-            
+            quote_snapshot = self.fetch_quote_snapshot()
+            current = float(quote_snapshot.get("current_price", 0.0) or 0.0)
+            open_price = float(quote_snapshot.get("open_price", 0.0) or 0.0)
             return current, open_price
-            
-        except _KIS_API_ERROR_TYPES as e:
+        except Exception as e:
             logger.error(f"현재가 조회 실패: {e}")
             return 0.0, 0.0
+
+    def fetch_quote_snapshot(self) -> Dict[str, Any]:
+        """현재가/시가/호가/수신시각을 포함한 quote snapshot을 반환합니다."""
+        try:
+            market_data_provider = getattr(self, "market_data_provider", None)
+            if market_data_provider is not None:
+                snapshot_fn = getattr(market_data_provider, "get_quote_snapshot", None)
+                if callable(snapshot_fn):
+                    snapshot = snapshot_fn(self.stock_code) or {}
+                    if snapshot:
+                        return snapshot
+
+                quote_fn = getattr(market_data_provider, "get_latest_price_with_open", None)
+                if callable(quote_fn):
+                    current, open_price = quote_fn(self.stock_code)
+                    return {
+                        "stock_code": self.stock_code,
+                        "stock_name": None,
+                        "current_price": float(current or 0.0),
+                        "open_price": float(open_price or 0.0),
+                        "best_ask": None,
+                        "best_bid": None,
+                        "received_at": datetime.now(KST),
+                        "quote_age_sec": 0.0,
+                        "source": "provider_quote",
+                        "data_feed": "provider",
+                        "ws_connected": False,
+                    }
+
+                current = float(market_data_provider.get_latest_price(self.stock_code) or 0.0)
+                price_data = self.api.get_current_price(self.stock_code)
+                return {
+                    "stock_code": self.stock_code,
+                    "stock_name": price_data.get("stock_name"),
+                    "current_price": current,
+                    "open_price": float(price_data.get("open_price", 0.0) or 0.0),
+                    "best_ask": None,
+                    "best_bid": None,
+                    "received_at": datetime.now(KST),
+                    "quote_age_sec": 0.0,
+                    "source": "provider_price_plus_rest_open",
+                    "data_feed": "provider",
+                    "ws_connected": False,
+                }
+
+            price_data = self.api.get_current_price(self.stock_code)
+            return {
+                "stock_code": self.stock_code,
+                "stock_name": price_data.get("stock_name"),
+                "current_price": float(price_data.get("current_price", 0.0) or 0.0),
+                "open_price": float(price_data.get("open_price", 0.0) or 0.0),
+                "best_ask": None,
+                "best_bid": None,
+                "received_at": datetime.now(KST),
+                "quote_age_sec": 0.0,
+                "source": "rest_quote",
+                "data_feed": "rest",
+                "ws_connected": False,
+            }
+        except Exception as e:
+            logger.error(f"호가 스냅샷 조회 실패: {e}")
+            return {
+                "stock_code": self.stock_code,
+                "stock_name": None,
+                "current_price": 0.0,
+                "open_price": 0.0,
+                "best_ask": None,
+                "best_bid": None,
+                "received_at": None,
+                "quote_age_sec": float("inf"),
+                "source": "quote_error",
+                "data_feed": "unknown",
+                "ws_connected": False,
+            }
+
+    @staticmethod
+    def _format_entry_log_value(value: Any) -> str:
+        if isinstance(value, float):
+            return f"{value:.6f}"
+        return str(value)
+
+    def _log_entry_event(self, prefix: str, **payload: Any) -> None:
+        details = " ".join(
+            f"{key}={self._format_entry_log_value(value)}"
+            for key, value in payload.items()
+            if value is not None
+        )
+        logger.info(f"{prefix} {details}".rstrip())
+
+    def _asset_type_max_pct(self, asset_type: str, etf_value: float, stock_value: float) -> float:
+        if str(asset_type or "").upper() == ASSET_TYPE_ETF:
+            return max(float(etf_value or 0.0), 0.0)
+        return max(float(stock_value or 0.0), 0.0)
+
+    def _apply_stale_quote_guard(
+        self,
+        signal: TradingSignal,
+        quote_snapshot: Dict[str, Any],
+    ) -> TradingSignal:
+        signal_type_value = self._signal_type_value(getattr(signal, "signal_type", SignalType.BUY.value))
+        if signal_type_value != SignalType.BUY.value:
+            return signal
+        if not bool(getattr(settings, "ENABLE_STALE_QUOTE_GUARD", False)):
+            return signal
+
+        data_feed = str(quote_snapshot.get("data_feed") or "").lower()
+        if data_feed != "ws":
+            return signal
+
+        max_age_sec = max(float(getattr(settings, "QUOTE_MAX_AGE_SEC", 0.0) or 0.0), 0.0)
+        raw_quote_age = quote_snapshot.get("quote_age_sec", float("inf"))
+        try:
+            quote_age_sec = float(raw_quote_age)
+        except (TypeError, ValueError):
+            quote_age_sec = float("inf")
+        source = str(quote_snapshot.get("source") or "")
+        ws_connected = bool(quote_snapshot.get("ws_connected"))
+
+        is_stale = (source != "ws_tick") or (not ws_connected) or (quote_age_sec > max_age_sec)
+        if not is_stale:
+            return signal
+
+        self._log_entry_event(
+            "[ENTRY_BLOCK]",
+            reason="stale_quote",
+            symbol=self.stock_code,
+            quote_age_sec=quote_age_sec,
+            max_age_sec=max_age_sec,
+            data_feed=data_feed,
+            ws_connected=ws_connected,
+            source=source,
+        )
+        meta = dict(getattr(signal, "meta", {}) or {})
+        meta.update(
+            {
+                "reason_code": "stale_quote",
+                "quote_age_sec": quote_age_sec,
+                "max_age_sec": max_age_sec,
+                "data_feed_source": source or data_feed,
+                "ws_connected": ws_connected,
+            }
+        )
+        return TradingSignal(
+            signal_type=SignalType.HOLD,
+            price=float(signal.price or 0.0),
+            stop_loss=signal.stop_loss,
+            take_profit=signal.take_profit,
+            trailing_stop=signal.trailing_stop,
+            reason="WS quote stale - 신규 BUY 차단",
+            atr=signal.atr,
+            trend=signal.trend,
+            reason_code="stale_quote",
+            meta=meta,
+        )
+
+    def _resolve_entry_order_style(self) -> str:
+        style = str(getattr(settings, "ENTRY_ORDER_STYLE", "market") or "market").strip().lower()
+        return style if style in ("market", "protected_limit") else "market"
+
+    def _build_entry_order_plan(
+        self,
+        signal: TradingSignal,
+        quote_snapshot: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        asset_type = str(
+            (getattr(signal, "meta", {}) or {}).get("asset_type")
+            or detect_asset_type(self.stock_code, str(quote_snapshot.get("stock_name") or ""))
+        ).upper()
+        current_price = float(quote_snapshot.get("current_price", 0.0) or 0.0)
+        best_ask_raw = quote_snapshot.get("best_ask")
+        best_ask = float(best_ask_raw) if best_ask_raw not in (None, "", 0, 0.0) else None
+        prev_high = float((getattr(signal, "meta", {}) or {}).get("prev_high") or 0.0)
+        style = self._resolve_entry_order_style()
+
+        if style != "protected_limit":
+            return {
+                "blocked": False,
+                "style": "market",
+                "order_type": "01",
+                "price": 0.0,
+                "asset_type": asset_type,
+                "best_ask": best_ask,
+                "current_price": current_price,
+                "prev_high": prev_high,
+                "limit_price": 0.0,
+                "slippage_cap_pct": float(getattr(settings, "ENTRY_MAX_SLIPPAGE_PCT", 0.0) or 0.0),
+                "extension_pct_at_order": compute_extension_pct(current_price, prev_high),
+            }
+
+        protect_ticks = (
+            max(int(getattr(settings, "ENTRY_PROTECT_TICKS_ETF", 0) or 0), 0)
+            if asset_type == ASSET_TYPE_ETF
+            else max(int(getattr(settings, "ENTRY_PROTECT_TICKS_STOCK", 0) or 0), 0)
+        )
+        base_price = float(best_ask if best_ask is not None and best_ask > 0 else current_price)
+        tick_size = get_tick_size(base_price, asset_type)
+        working_price = base_price + (tick_size * protect_ticks)
+        limit_price = align_price_to_tick(working_price, asset_type, direction="up")
+
+        breakout_cap_pct = 0.0
+        if bool(getattr(settings, "ENABLE_BREAKOUT_EXTENSION_CAP", False)):
+            breakout_cap_pct = self._asset_type_max_pct(
+                asset_type,
+                getattr(settings, "MAX_BREAKOUT_EXTENSION_PCT_ETF", 0.0),
+                getattr(settings, "MAX_BREAKOUT_EXTENSION_PCT_STOCK", 0.0),
+            )
+        slippage_cap_pct = max(float(getattr(settings, "ENTRY_MAX_SLIPPAGE_PCT", 0.0) or 0.0), 0.0)
+
+        limit_extension_pct = compute_extension_pct(limit_price, prev_high)
+        extension_pct_at_order = compute_extension_pct(current_price, prev_high)
+        limit_slippage_pct = compute_extension_pct(limit_price, current_price)
+
+        blocked = False
+        block_reason = ""
+        if breakout_cap_pct > 0 and prev_high > 0 and limit_extension_pct > breakout_cap_pct:
+            blocked = True
+            block_reason = "protected_limit_exceeds_cap"
+        if not blocked and slippage_cap_pct > 0 and current_price > 0 and limit_slippage_pct > slippage_cap_pct:
+            blocked = True
+            block_reason = "protected_limit_exceeds_cap"
+
+        return {
+            "blocked": blocked,
+            "reason_code": block_reason,
+            "style": "protected_limit",
+            "order_type": "00",
+            "price": float(limit_price or 0.0),
+            "asset_type": asset_type,
+            "best_ask": best_ask,
+            "current_price": current_price,
+            "prev_high": prev_high,
+            "protect_ticks": protect_ticks,
+            "tick_size": tick_size,
+            "limit_price": float(limit_price or 0.0),
+            "breakout_cap_pct": breakout_cap_pct,
+            "slippage_cap_pct": slippage_cap_pct,
+            "extension_pct_at_order": extension_pct_at_order,
+            "limit_extension_pct": limit_extension_pct,
+            "limit_slippage_pct": limit_slippage_pct,
+        }
+
+    def _log_entry_trace(self, stage: str, signal: TradingSignal, payload: Dict[str, Any]) -> None:
+        meta = dict(getattr(signal, "meta", {}) or {})
+        base = {
+            "stage": stage,
+            "symbol": self.stock_code,
+            "signal_time": meta.get("signal_time"),
+            "decision_time": meta.get("decision_time"),
+            "order_submit_time": payload.get("order_submit_time"),
+            "fill_time": payload.get("fill_time"),
+            "prev_high": meta.get("prev_high"),
+            "current_price_at_signal": meta.get("current_price_at_signal"),
+            "current_price_at_order": payload.get("current_price_at_order"),
+            "fill_price": payload.get("fill_price"),
+            "extension_pct_at_signal": meta.get("extension_pct"),
+            "extension_pct_at_order": payload.get("extension_pct_at_order"),
+            "quote_age_sec": payload.get("quote_age_sec", meta.get("quote_age_sec")),
+            "data_feed_source": payload.get("data_feed_source", meta.get("data_feed_source")),
+            "order_style": payload.get("order_style", meta.get("order_style")),
+            "best_ask": payload.get("best_ask"),
+            "limit_price": payload.get("limit_price"),
+        }
+        self._log_entry_event("[ENTRY_TRACE]", **base)
     
     # ════════════════════════════════════════════════════════════════
     # 주문 실행 (모드별)
@@ -1405,8 +1666,16 @@ class MultidayExecutor:
         if resolved_atr <= 0:
             resolved_atr = max(entry * 0.01, 1.0)
 
-        stop_loss = float(self.strategy.calculate_stop_loss(entry, resolved_atr))
-        take_profit = float(self.strategy.calculate_take_profit(entry, resolved_atr))
+        calc_stop_loss = getattr(self.strategy, "calculate_stop_loss", None)
+        calc_take_profit = getattr(self.strategy, "calculate_take_profit", None)
+        if callable(calc_stop_loss):
+            stop_loss = float(calc_stop_loss(entry, resolved_atr))
+        else:
+            stop_loss = max(entry - (resolved_atr * 2.0), 0.0)
+        if callable(calc_take_profit):
+            take_profit = float(calc_take_profit(entry, resolved_atr))
+        else:
+            take_profit = entry + (resolved_atr * 3.0)
         return resolved_atr, stop_loss, take_profit
 
     def _apply_stop_loss_guard_to_stored_position(self, stored: StoredPosition, context: str) -> StoredPosition:
@@ -1824,6 +2093,60 @@ class MultidayExecutor:
         
         # ★ REAL/PAPER/LIVE: 동기화 주문 실행 (감사 보고서 지적 해결)
         try:
+            order_quote = self.fetch_quote_snapshot()
+            guarded_signal = self._apply_stale_quote_guard(signal, order_quote)
+            if self._signal_type_value(getattr(guarded_signal, "signal_type", SignalType.BUY.value)) != SignalType.BUY.value:
+                return {
+                    "success": False,
+                    "skipped": True,
+                    "message": guarded_signal.reason,
+                }
+
+            order_plan = self._build_entry_order_plan(signal, order_quote)
+            order_quote_age = order_quote.get("quote_age_sec")
+            if order_plan.get("blocked"):
+                self._log_entry_event(
+                    "[ENTRY_BLOCK]",
+                    reason=order_plan.get("reason_code") or "protected_limit_exceeds_cap",
+                    symbol=self.stock_code,
+                    asset_type=order_plan.get("asset_type"),
+                    prev_high=order_plan.get("prev_high"),
+                    current_price=order_plan.get("current_price"),
+                    best_ask=order_plan.get("best_ask"),
+                    limit_price=order_plan.get("limit_price"),
+                    extension_pct_at_order=order_plan.get("extension_pct_at_order"),
+                    limit_extension_pct=order_plan.get("limit_extension_pct"),
+                    limit_slippage_pct=order_plan.get("limit_slippage_pct"),
+                    breakout_cap_pct=order_plan.get("breakout_cap_pct"),
+                    slippage_cap_pct=order_plan.get("slippage_cap_pct"),
+                )
+                return {
+                    "success": False,
+                    "skipped": True,
+                    "message": "보호형 지정가가 허용 상한을 초과하여 신규 BUY 차단",
+                }
+
+            signal.meta = dict(getattr(signal, "meta", {}) or {})
+            signal.meta.update(
+                {
+                    "asset_type": order_plan.get("asset_type"),
+                    "current_price_at_order": order_plan.get("current_price"),
+                    "extension_pct_at_order": order_plan.get("extension_pct_at_order"),
+                    "order_style": order_plan.get("style"),
+                }
+            )
+            self._log_entry_event(
+                "[ENTRY_ORDER]",
+                style=order_plan.get("style"),
+                symbol=self.stock_code,
+                asset_type=order_plan.get("asset_type"),
+                current_price=order_plan.get("current_price"),
+                best_ask=order_plan.get("best_ask"),
+                prev_high=order_plan.get("prev_high"),
+                limit_price=order_plan.get("limit_price"),
+                slippage_cap_pct=order_plan.get("slippage_cap_pct"),
+            )
+
             # 동기화 주문 - 체결 확인 후에만 성공 반환
             sync_result = self.order_synchronizer.execute_buy_order(
                 stock_code=self.stock_code,
@@ -1832,7 +2155,24 @@ class MultidayExecutor:
                     f"{self.stock_code}:BUY:{signal.price:.2f}:"
                     f"{datetime.now(KST).strftime('%Y%m%d%H%M')}"
                 ),
-                skip_market_check=True  # 위에서 이미 체크함
+                skip_market_check=True,  # 위에서 이미 체크함
+                price=float(order_plan.get("price") or 0.0),
+                order_type=str(order_plan.get("order_type") or "01"),
+            )
+            submitted_at = getattr(sync_result, "submitted_at", None)
+            self._log_entry_trace(
+                "order_submit",
+                signal,
+                {
+                    "order_submit_time": submitted_at.isoformat() if submitted_at else None,
+                    "current_price_at_order": order_plan.get("current_price"),
+                    "extension_pct_at_order": order_plan.get("extension_pct_at_order"),
+                    "quote_age_sec": order_quote_age,
+                    "data_feed_source": order_quote.get("source"),
+                    "order_style": order_plan.get("style"),
+                    "best_ask": order_plan.get("best_ask"),
+                    "limit_price": order_plan.get("limit_price"),
+                },
             )
             
             if sync_result.success:
@@ -1937,6 +2277,29 @@ class MultidayExecutor:
                     applied_qty,
                     actual_price,
                 )
+                first_fill = fills[0] if fills else None
+                fill_time = None
+                if isinstance(first_fill, dict) and first_fill.get("executed_at") is not None:
+                    try:
+                        fill_time = self._parse_fill_executed_at(first_fill.get("executed_at")).isoformat()
+                    except Exception:
+                        fill_time = None
+                self._log_entry_trace(
+                    "fill",
+                    signal,
+                    {
+                        "order_submit_time": submitted_at.isoformat() if submitted_at else None,
+                        "fill_time": fill_time,
+                        "current_price_at_order": order_plan.get("current_price"),
+                        "fill_price": actual_price,
+                        "extension_pct_at_order": order_plan.get("extension_pct_at_order"),
+                        "quote_age_sec": order_quote_age,
+                        "data_feed_source": order_quote.get("source"),
+                        "order_style": order_plan.get("style"),
+                        "best_ask": order_plan.get("best_ask"),
+                        "limit_price": order_plan.get("limit_price"),
+                    },
+                )
 
                 return {
                     "success": True,
@@ -2005,6 +2368,29 @@ class MultidayExecutor:
                     except Exception as notify_err:
                         logger.warning(f"부분체결 알림 전송 실패: {notify_err}")
                     logger.warning(f"부분 체결: {applied_qty}/{self.order_quantity}주")
+                    first_fill = fills[0] if fills else None
+                    fill_time = None
+                    if isinstance(first_fill, dict) and first_fill.get("executed_at") is not None:
+                        try:
+                            fill_time = self._parse_fill_executed_at(first_fill.get("executed_at")).isoformat()
+                        except Exception:
+                            fill_time = None
+                    self._log_entry_trace(
+                        "fill",
+                        signal,
+                        {
+                            "order_submit_time": submitted_at.isoformat() if submitted_at else None,
+                            "fill_time": fill_time,
+                            "current_price_at_order": order_plan.get("current_price"),
+                            "fill_price": float(pos.entry_price),
+                            "extension_pct_at_order": order_plan.get("extension_pct_at_order"),
+                            "quote_age_sec": order_quote_age,
+                            "data_feed_source": order_quote.get("source"),
+                            "order_style": order_plan.get("style"),
+                            "best_ask": order_plan.get("best_ask"),
+                            "limit_price": order_plan.get("limit_price"),
+                        },
+                    )
                 
                 return {
                     "success": False,
@@ -2544,8 +2930,18 @@ class MultidayExecutor:
                 result["error"] = "시장 데이터 없음"
                 return result
             
-            # 2. 현재가/시가 조회
-            current_price, open_price = self.fetch_current_price()
+            # 2. 현재가/시가/호가 스냅샷 조회
+            decision_time = datetime.now(KST)
+            quote_snapshot = self.fetch_quote_snapshot()
+            current_price = float(quote_snapshot.get("current_price", 0.0) or 0.0)
+            open_price = float(quote_snapshot.get("open_price", 0.0) or 0.0)
+            if current_price <= 0:
+                fallback_current, fallback_open = self.fetch_current_price()
+                current_price = float(fallback_current or 0.0)
+                open_price = float(fallback_open or 0.0)
+                quote_snapshot = dict(quote_snapshot)
+                quote_snapshot["current_price"] = current_price
+                quote_snapshot["open_price"] = open_price
             if current_price <= 0:
                 result["error"] = "현재가 조회 실패"
                 return result
@@ -2560,10 +2956,41 @@ class MultidayExecutor:
                 df=df,
                 current_price=current_price,
                 open_price=open_price,
-                stock_code=self.stock_code
+                stock_code=self.stock_code,
+                stock_name=str(quote_snapshot.get("stock_name") or ""),
+                check_time=decision_time,
             )
+            signal = self._apply_stale_quote_guard(signal, quote_snapshot)
+            signal.meta = dict(getattr(signal, "meta", {}) or {})
+            signal.meta.setdefault(
+                "signal_time",
+                (
+                    quote_snapshot.get("received_at").isoformat()
+                    if isinstance(quote_snapshot.get("received_at"), datetime)
+                    else decision_time.isoformat()
+                ),
+            )
+            signal.meta.setdefault("decision_time", decision_time.isoformat())
+            signal.meta.setdefault("current_price_at_signal", current_price)
+            signal.meta.setdefault("quote_age_sec", quote_snapshot.get("quote_age_sec"))
+            signal.meta.setdefault("data_feed_source", quote_snapshot.get("source"))
+            signal.meta.setdefault("order_style", self._resolve_entry_order_style())
             
             signal_type_value = self._signal_type_value(signal.signal_type)
+            if signal_type_value == SignalType.BUY.value:
+                self._log_entry_trace(
+                    "signal",
+                    signal,
+                    {
+                        "current_price_at_order": None,
+                        "extension_pct_at_order": None,
+                        "quote_age_sec": quote_snapshot.get("quote_age_sec"),
+                        "data_feed_source": quote_snapshot.get("source"),
+                        "order_style": self._resolve_entry_order_style(),
+                        "best_ask": quote_snapshot.get("best_ask"),
+                        "limit_price": None,
+                    },
+                )
 
             result["signal"] = {
                 "type": signal_type_value,
@@ -2573,8 +3000,9 @@ class MultidayExecutor:
                 "trailing_stop": signal.trailing_stop,
                 "exit_reason": signal.exit_reason.value if signal.exit_reason else None,
                 "reason": signal.reason,
+                "reason_code": getattr(signal, "reason_code", ""),
                 "atr": signal.atr,
-                "trend": signal.trend.value
+                "trend": signal.trend.value,
             }
             
             logger.info(
@@ -2638,7 +3066,9 @@ class MultidayExecutor:
         except Exception as e:
             result["error"] = str(e)
             logger.error(f"전략 실행 오류: {e}")
-            self.telegram.notify_error("전략 실행 오류", str(e))
+            notifier = getattr(self, "telegram", None)
+            if notifier is not None and hasattr(notifier, "notify_error"):
+                notifier.notify_error("전략 실행 오류", str(e))
         
         logger.info("=" * 50)
         return result

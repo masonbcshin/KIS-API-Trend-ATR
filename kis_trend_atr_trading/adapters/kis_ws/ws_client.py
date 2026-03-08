@@ -155,6 +155,8 @@ class KISWSClient:
         hhmmss = str(fields[1] or "000000")
         try:
             price = float(fields[2] or 0.0)
+            best_ask = float(fields[10] or 0.0)
+            best_bid = float(fields[11] or 0.0)
             volume = float(fields[12] or 0.0)
         except (TypeError, ValueError):
             return None
@@ -174,6 +176,9 @@ class KISWSClient:
             price=price,
             volume=volume,
             timestamp=ts,
+            best_ask=best_ask,
+            best_bid=best_bid,
+            received_at=now,
         )
 
     async def _listen_once(self, stock_codes: Sequence[str], on_tick: TickCallback) -> bool:

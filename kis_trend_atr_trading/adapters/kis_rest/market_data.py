@@ -94,6 +94,23 @@ class KISRestMarketDataProvider(MarketDataProvider):
         data = self._api.get_current_price(stock_code=stock_code)
         return float(data.get("current_price", 0.0) or 0.0)
 
+    def get_quote_snapshot(self, stock_code: str) -> dict:
+        data = self._api.get_current_price(stock_code=stock_code)
+        now_kst = datetime.now(KST)
+        return {
+            "stock_code": str(stock_code).zfill(6),
+            "stock_name": data.get("stock_name"),
+            "current_price": float(data.get("current_price", 0.0) or 0.0),
+            "open_price": float(data.get("open_price", 0.0) or 0.0),
+            "best_ask": None,
+            "best_bid": None,
+            "received_at": now_kst,
+            "quote_age_sec": 0.0,
+            "source": "rest_quote",
+            "data_feed": "rest",
+            "ws_connected": False,
+        }
+
     def get_latest_price_with_open(self, stock_code: str) -> Tuple[float, float]:
         """Return `(current_price, open_price)` from a single quote API call."""
         data = self._api.get_current_price(stock_code=stock_code)

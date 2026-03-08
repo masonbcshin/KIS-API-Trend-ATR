@@ -17,6 +17,9 @@ class MarketTick:
     price: float
     volume: float
     timestamp: datetime
+    best_ask: float = 0.0
+    best_bid: float = 0.0
+    received_at: Optional[datetime] = None
 
 
 class MinuteBarAggregator:
@@ -100,4 +103,3 @@ class MinuteBarAggregator:
         bars = dict(self._current)
         self._current.clear()
         return bars
-

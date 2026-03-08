@@ -54,6 +54,9 @@ class MarketDataProvider(Protocol):
     def get_latest_price(self, stock_code: str) -> float:
         """Return latest tradable price for the stock code."""
 
+    def get_quote_snapshot(self, stock_code: str) -> dict:
+        """Return current/open/best_ask/best_bid/received_at/source snapshot."""
+
     def subscribe_bars(
         self,
         stock_codes: List[str],
@@ -66,4 +69,3 @@ class MarketDataProvider(Protocol):
         Returns:
             Optional[Callable[[], None]]: stop function for the subscription.
         """
-

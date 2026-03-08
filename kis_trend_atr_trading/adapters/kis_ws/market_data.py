@@ -51,6 +51,7 @@ class KISWSMarketDataProvider(MarketDataProvider):
             lambda: deque(maxlen=max(int(max_bar_history), 100))
         )
         self._latest_price: Dict[str, float] = {}
+        self._quote_snapshot: Dict[str, Dict[str, object]] = {}
         self._on_bar_callback: Optional[BarCallback] = None
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
@@ -85,6 +86,48 @@ class KISWSMarketDataProvider(MarketDataProvider):
             return float(latest)
         return self._rest_fallback.get_latest_price(code)
 
+    def get_quote_snapshot(self, stock_code: str) -> dict:
+        code = str(stock_code).zfill(6)
+        with self._lock:
+            snapshot = dict(self._quote_snapshot.get(code) or {})
+            running = self._ws_running
+            failed = self._ws_failed
+
+        rest_snapshot = self._rest_fallback.get_quote_snapshot(code)
+        received_at = snapshot.get("received_at")
+        if received_at is None:
+            received_at = rest_snapshot.get("received_at")
+        quote_age_sec = float("inf")
+        if isinstance(received_at, datetime):
+            now = datetime.now(received_at.tzinfo) if received_at.tzinfo else datetime.now()
+            quote_age_sec = max((now - received_at).total_seconds(), 0.0)
+
+        current_price = snapshot.get("current_price")
+        if current_price in (None, 0, 0.0):
+            current_price = rest_snapshot.get("current_price", 0.0)
+
+        return {
+            "stock_code": code,
+            "stock_name": rest_snapshot.get("stock_name"),
+            "current_price": float(current_price or 0.0),
+            "open_price": float(rest_snapshot.get("open_price", 0.0) or 0.0),
+            "best_ask": (
+                float(snapshot.get("best_ask"))
+                if snapshot.get("best_ask") not in (None, "", 0, 0.0)
+                else None
+            ),
+            "best_bid": (
+                float(snapshot.get("best_bid"))
+                if snapshot.get("best_bid") not in (None, "", 0, 0.0)
+                else None
+            ),
+            "received_at": received_at,
+            "quote_age_sec": quote_age_sec,
+            "source": "ws_tick" if snapshot else "rest_quote_fallback",
+            "data_feed": "ws",
+            "ws_connected": bool(running) and not bool(failed),
+        }
+
     def get_latest_price_with_open(self, stock_code: str) -> Tuple[float, float]:
         """
         Return `(current_price, open_price)` while minimizing duplicate REST quote calls.
@@ -103,9 +146,17 @@ class KISWSMarketDataProvider(MarketDataProvider):
 
     def _handle_tick(self, tick: MarketTick) -> None:
         code = str(tick.stock_code).zfill(6)
+        received_at = tick.received_at or datetime.now()
         with self._lock:
             self._latest_price[code] = float(tick.price)
-            self._last_message_ts = datetime.now()
+            self._quote_snapshot[code] = {
+                "current_price": float(tick.price),
+                "best_ask": float(tick.best_ask or 0.0),
+                "best_bid": float(tick.best_bid or 0.0),
+                "received_at": received_at,
+                "trade_timestamp": tick.timestamp,
+            }
+            self._last_message_ts = received_at
 
         completed = self._aggregator.add_tick(tick)
         if completed is None:

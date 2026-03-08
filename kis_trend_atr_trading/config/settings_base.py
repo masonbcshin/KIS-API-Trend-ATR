@@ -269,6 +269,60 @@ NEAR_STOPLOSS_EXECUTION_INTERVAL: int = 15
 # 손절선 근접 임계값 (%)
 NEAR_STOPLOSS_THRESHOLD_PCT: float = 70.0
 
+# 신규 BUY 품질 보호 설정
+# - 기본값은 모두 기존 동작 유지(OFF)입니다.
+# - 권장 운영 예시:
+#   ENABLE_BREAKOUT_EXTENSION_CAP=true
+#   MAX_BREAKOUT_EXTENSION_PCT_ETF=0.004
+#   MAX_BREAKOUT_EXTENSION_PCT_STOCK=0.007
+#   ENABLE_ENTRY_GAP_FILTER=true
+#   MAX_ENTRY_GAP_PCT_ETF=0.01
+#   MAX_ENTRY_GAP_PCT_STOCK=0.015
+#   MAX_OPEN_VS_PREV_HIGH_PCT=0.005
+#   ENABLE_OPENING_NO_ENTRY_GUARD=true
+#   OPENING_NO_ENTRY_MINUTES=10
+#   ENTRY_ORDER_STYLE=protected_limit
+#   ENTRY_PROTECT_TICKS_ETF=1
+#   ENTRY_PROTECT_TICKS_STOCK=2
+#   ENTRY_MAX_SLIPPAGE_PCT=0.004
+#   ENABLE_STALE_QUOTE_GUARD=true
+#   QUOTE_MAX_AGE_SEC=3
+ENABLE_BREAKOUT_EXTENSION_CAP: bool = os.getenv("ENABLE_BREAKOUT_EXTENSION_CAP", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+MAX_BREAKOUT_EXTENSION_PCT_ETF: float = float(os.getenv("MAX_BREAKOUT_EXTENSION_PCT_ETF", "0.0"))
+MAX_BREAKOUT_EXTENSION_PCT_STOCK: float = float(os.getenv("MAX_BREAKOUT_EXTENSION_PCT_STOCK", "0.0"))
+
+ENABLE_ENTRY_GAP_FILTER: bool = os.getenv("ENABLE_ENTRY_GAP_FILTER", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+MAX_ENTRY_GAP_PCT_ETF: float = float(os.getenv("MAX_ENTRY_GAP_PCT_ETF", "0.0"))
+MAX_ENTRY_GAP_PCT_STOCK: float = float(os.getenv("MAX_ENTRY_GAP_PCT_STOCK", "0.0"))
+MAX_OPEN_VS_PREV_HIGH_PCT: float = float(os.getenv("MAX_OPEN_VS_PREV_HIGH_PCT", "0.0"))
+
+ENABLE_OPENING_NO_ENTRY_GUARD: bool = os.getenv("ENABLE_OPENING_NO_ENTRY_GUARD", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+OPENING_NO_ENTRY_MINUTES: int = int(os.getenv("OPENING_NO_ENTRY_MINUTES", "0"))
+
+ENTRY_ORDER_STYLE: str = os.getenv("ENTRY_ORDER_STYLE", "market").strip().lower() or "market"
+ENTRY_PROTECT_TICKS_ETF: int = int(os.getenv("ENTRY_PROTECT_TICKS_ETF", "0"))
+ENTRY_PROTECT_TICKS_STOCK: int = int(os.getenv("ENTRY_PROTECT_TICKS_STOCK", "0"))
+ENTRY_MAX_SLIPPAGE_PCT: float = float(os.getenv("ENTRY_MAX_SLIPPAGE_PCT", "0.0"))
+
+ENABLE_STALE_QUOTE_GUARD: bool = os.getenv("ENABLE_STALE_QUOTE_GUARD", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+QUOTE_MAX_AGE_SEC: float = float(os.getenv("QUOTE_MAX_AGE_SEC", "0"))
+
 # ★ 단일 인스턴스 강제 여부 (필수 True)
 ENFORCE_SINGLE_INSTANCE: bool = True
 

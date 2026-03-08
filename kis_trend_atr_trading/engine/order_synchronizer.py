@@ -400,6 +400,9 @@ class SynchronizedOrderResult:
     exec_price: float = 0.0               # 실제 체결 가격
     message: str = ""                     # 상세 메시지
     fills: List[Dict[str, Any]] = field(default_factory=list)  # fill 단위 상세
+    submitted_at: Optional[datetime] = None
+    requested_price: float = 0.0
+    requested_order_type: str = ""
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -410,6 +413,9 @@ class SynchronizedOrderResult:
             "exec_price": self.exec_price,
             "message": self.message,
             "fills": self.fills,
+            "submitted_at": self.submitted_at.isoformat() if self.submitted_at else None,
+            "requested_price": self.requested_price,
+            "requested_order_type": self.requested_order_type,
         }
 
 
@@ -752,7 +758,9 @@ class OrderSynchronizer:
         stock_code: str,
         quantity: int,
         signal_id: str = "",
-        skip_market_check: bool = False
+        skip_market_check: bool = False,
+        price: float = 0.0,
+        order_type: str = "01",
     ) -> SynchronizedOrderResult:
         """
         매수 주문을 동기화 실행합니다.
@@ -809,15 +817,22 @@ class OrderSynchronizer:
         )
         holding_before = self._get_holding_snapshot(stock_code)
 
+        requested_price = float(price or 0.0)
+        requested_order_type = str(order_type or "01").strip() or "01"
+
         # 2. 매수 주문 전송
-        logger.info(f"[SYNC] 매수 주문 시작: {stock_code} {quantity}주")
+        logger.info(
+            f"[SYNC] 매수 주문 시작: {stock_code} {quantity}주 "
+            f"(order_type={requested_order_type}, price={requested_price})"
+        )
         
         try:
+            submitted_at = datetime.now(KST)
             order_result = self.api.place_buy_order(
                 stock_code=stock_code,
                 quantity=quantity,
-                price=0,  # 시장가
-                order_type="01"
+                price=int(round(requested_price)) if requested_price > 0 else 0,
+                order_type=requested_order_type,
             )
             
             if not order_result.get("success"):
@@ -834,7 +849,10 @@ class OrderSynchronizer:
                 return SynchronizedOrderResult(
                     success=False,
                     result_type=OrderExecutionResult.FAILED,
-                    message=f"주문 전송 실패: {order_result.get('message', 'Unknown')}"
+                    message=f"주문 전송 실패: {order_result.get('message', 'Unknown')}",
+                    submitted_at=submitted_at,
+                    requested_price=requested_price,
+                    requested_order_type=requested_order_type,
                 )
             
             order_no = order_result.get("order_no", "")
@@ -866,7 +884,9 @@ class OrderSynchronizer:
             return SynchronizedOrderResult(
                 success=False,
                 result_type=OrderExecutionResult.FAILED,
-                message=f"주문 전송 오류: {str(e)}"
+                message=f"주문 전송 오류: {str(e)}",
+                requested_price=requested_price,
+                requested_order_type=requested_order_type,
             )
         
         # 3. 체결 대기
@@ -906,6 +926,9 @@ class OrderSynchronizer:
                 exec_price=exec_result.get("exec_price", 0),
                 message=exec_result.get("message", "완전 체결"),
                 fills=exec_result.get("fills", []) or [],
+                submitted_at=submitted_at,
+                requested_price=requested_price,
+                requested_order_type=requested_order_type,
             )
         
         elif exec_result.get("status") == "PARTIAL":
@@ -929,6 +952,9 @@ class OrderSynchronizer:
                 exec_price=exec_result.get("exec_price", 0),
                 message=exec_result.get("message", "부분 체결"),
                 fills=exec_result.get("fills", []) or [],
+                submitted_at=submitted_at,
+                requested_price=requested_price,
+                requested_order_type=requested_order_type,
             )
         
         else:
@@ -953,6 +979,9 @@ class OrderSynchronizer:
                     filled_qty=inferred_filled_qty,
                     remaining_qty=inferred_remaining,
                 )
+                inferred.submitted_at = submitted_at
+                inferred.requested_price = requested_price
+                inferred.requested_order_type = requested_order_type
                 return inferred
 
             self._upsert_order_state(
@@ -974,6 +1003,9 @@ class OrderSynchronizer:
                 exec_price=exec_result.get("exec_price", 0),
                 message=exec_result.get("message", "미체결/취소"),
                 fills=exec_result.get("fills", []) or [],
+                submitted_at=submitted_at,
+                requested_price=requested_price,
+                requested_order_type=requested_order_type,
             )
     
     def execute_sell_order(
