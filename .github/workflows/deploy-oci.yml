@@ -1,9 +1,11 @@
 name: Auto Deploy to OCI
 
 on:
-  push:
-    branches:
-      - main
+  # Auto deploy on push is intentionally disabled.
+  # push:
+  #   branches:
+  #     - main
+  workflow_dispatch:
 
 jobs:
   deploy:
