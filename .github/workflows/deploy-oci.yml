@@ -1,10 +1,11 @@
 name: Auto Deploy to OCI
 
 on:
-  # Auto deploy on push is intentionally disabled.
+  # OCI auto-deploy on push stays disabled to avoid duplicate production rollout.
   # push:
   #   branches:
   #     - main
+  # Manual dispatch is kept for explicit OCI deployments only.
   workflow_dispatch:
 
 jobs:
