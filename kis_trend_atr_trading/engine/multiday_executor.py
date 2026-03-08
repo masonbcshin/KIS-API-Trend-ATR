@@ -69,6 +69,12 @@ try:
         detect_asset_type,
         get_tick_size,
     )
+    from kis_trend_atr_trading.utils.market_regime import (
+        MarketRegime,
+        MarketRegimeSnapshot,
+        get_market_regime_fail_mode,
+        materialize_market_regime_snapshot,
+    )
     from kis_trend_atr_trading.utils.telegram_notifier import TelegramNotifier, get_telegram_notifier
     from kis_trend_atr_trading.utils.logger import get_logger, TradeLogger
     from kis_trend_atr_trading.utils.market_hours import KST
@@ -115,6 +121,12 @@ except ImportError:
         compute_extension_pct,
         detect_asset_type,
         get_tick_size,
+    )
+    from utils.market_regime import (
+        MarketRegime,
+        MarketRegimeSnapshot,
+        get_market_regime_fail_mode,
+        materialize_market_regime_snapshot,
     )
     from utils.telegram_notifier import TelegramNotifier, get_telegram_notifier
     from utils.logger import get_logger, TradeLogger
@@ -243,6 +255,7 @@ class MultidayExecutor:
         
         # 텔레그램 알림기
         self.telegram = telegram or get_telegram_notifier()
+        self.market_regime_snapshot: Optional[MarketRegimeSnapshot] = None
         
         # 포지션 저장소
         self.position_store = position_store or get_position_store()
@@ -387,6 +400,12 @@ class MultidayExecutor:
         self._entry_block_reason = reason or ""
         if force and allow_entry:
             self._entry_block_sticky = False
+
+    def set_market_regime_snapshot(
+        self,
+        snapshot: Optional[MarketRegimeSnapshot],
+    ) -> None:
+        self.market_regime_snapshot = snapshot
 
     def set_reconcile_entry_block(self, reason: str) -> None:
         """재동기화 실패 시 신규 진입 차단을 고정(sticky) 설정."""
@@ -1449,6 +1468,143 @@ class MultidayExecutor:
             meta=meta,
         )
 
+    def _get_market_regime_snapshot(
+        self,
+        check_time: Optional[datetime] = None,
+    ) -> Optional[MarketRegimeSnapshot]:
+        return materialize_market_regime_snapshot(
+            getattr(self, "market_regime_snapshot", None),
+            check_time,
+        )
+
+    def _annotate_signal_with_market_regime(
+        self,
+        signal: TradingSignal,
+        snapshot: Optional[MarketRegimeSnapshot],
+    ) -> None:
+        signal.meta = dict(getattr(signal, "meta", {}) or {})
+        if snapshot is None:
+            signal.meta.update({"market_regime_source": "main_loop_cache"})
+            return
+
+        signal.meta.update(
+            {
+                "market_regime": snapshot.regime.value,
+                "market_regime_reason": snapshot.reason,
+                "market_regime_as_of": snapshot.as_of.isoformat(),
+                "market_regime_is_stale": snapshot.is_stale,
+                "market_regime_source": snapshot.source,
+                "market_regime_kospi_symbol": snapshot.kospi_symbol,
+                "market_regime_kosdaq_symbol": snapshot.kosdaq_symbol,
+            }
+        )
+
+    def _apply_market_regime_guard(
+        self,
+        signal: TradingSignal,
+        check_time: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        signal_type_value = self._signal_type_value(getattr(signal, "signal_type", SignalType.BUY.value))
+        if signal_type_value != SignalType.BUY.value:
+            return {"blocked": False, "snapshot": None, "message": ""}
+        if not bool(getattr(settings, "ENABLE_MARKET_REGIME_FILTER", False)):
+            return {"blocked": False, "snapshot": None, "message": ""}
+
+        snapshot = self._get_market_regime_snapshot(check_time=check_time)
+        self._annotate_signal_with_market_regime(signal, snapshot)
+
+        if snapshot is None or snapshot.is_stale:
+            fail_mode = get_market_regime_fail_mode()
+            as_of = snapshot.as_of.isoformat() if snapshot is not None else "none"
+            stale_age_sec = (
+                f"{snapshot.stale_age_sec(check_time):.1f}"
+                if snapshot is not None
+                else "none"
+            )
+            logger.warning(
+                "[MARKET_REGIME] snapshot_stale as_of=%s stale_age_sec=%s fail_mode=%s",
+                as_of,
+                stale_age_sec,
+                fail_mode,
+            )
+            if fail_mode == "open":
+                return {
+                    "blocked": False,
+                    "snapshot": snapshot,
+                    "message": "",
+                }
+
+            self._log_entry_event(
+                "[ENTRY_BLOCK]",
+                reason="market_regime_stale",
+                fail_mode=fail_mode,
+                symbol=self.stock_code,
+            )
+            return {
+                "blocked": True,
+                "snapshot": snapshot,
+                "message": "시장 레짐 snapshot stale - 신규 BUY 차단",
+            }
+
+        regime_value = snapshot.regime.value
+
+        if (
+            snapshot.regime == MarketRegime.BAD
+            and bool(getattr(settings, "MARKET_REGIME_BAD_BLOCK_NEW_BUY", True))
+        ):
+            self._log_entry_event(
+                "[ENTRY_BLOCK]",
+                reason="market_regime_bad",
+                regime=regime_value,
+                regime_reason=snapshot.reason,
+                symbol=self.stock_code,
+            )
+            return {
+                "blocked": True,
+                "snapshot": snapshot,
+                "message": "시장 레짐 BAD - 신규 BUY 차단",
+            }
+
+        if (
+            snapshot.regime == MarketRegime.NEUTRAL
+            and not bool(getattr(settings, "MARKET_REGIME_NEUTRAL_ALLOW_BUY", True))
+        ):
+            self._log_entry_event(
+                "[ENTRY_BLOCK]",
+                reason="market_regime_neutral",
+                regime=regime_value,
+                regime_reason=snapshot.reason,
+                symbol=self.stock_code,
+            )
+            return {
+                "blocked": True,
+                "snapshot": snapshot,
+                "message": "시장 레짐 NEUTRAL - 신규 BUY 차단",
+            }
+
+        self._log_entry_event(
+            "[ENTRY_TRACE]",
+            market_regime=regime_value,
+            as_of=snapshot.as_of.isoformat(),
+            stale=snapshot.is_stale,
+            symbol=self.stock_code,
+        )
+        if snapshot.regime == MarketRegime.NEUTRAL:
+            logger.info(
+                "[MARKET_REGIME] entry_allowed regime=%s reason=%s symbol=%s neutral_allow_buy=%s position_scale=%.6f",
+                regime_value,
+                snapshot.reason,
+                self.stock_code,
+                bool(getattr(settings, "MARKET_REGIME_NEUTRAL_ALLOW_BUY", True)),
+                float(getattr(settings, "MARKET_REGIME_NEUTRAL_POSITION_SCALE", 1.0) or 1.0),
+            )
+
+        return {
+            "blocked": False,
+            "snapshot": snapshot,
+            "message": "",
+        }
+
     def _resolve_entry_order_style(self) -> str:
         style = str(getattr(settings, "ENTRY_ORDER_STYLE", "market") or "market").strip().lower()
         return style if style in ("market", "protected_limit") else "market"
@@ -2046,14 +2202,25 @@ class MultidayExecutor:
         # 이미 포지션 보유
         if self.strategy.has_position:
             return {"success": False, "message": "이미 포지션 보유 중"}
-        
+
         # ★ 장 운영시간 체크 (감사 보고서 지적 해결)
         if self._can_place_orders():
             tradeable, reason = self.market_checker.is_tradeable()
             if not tradeable:
                 logger.warning(f"매수 불가: {reason}")
                 return {"success": False, "message": reason}
-        
+
+        market_regime_guard = self._apply_market_regime_guard(
+            signal,
+            check_time=datetime.now(KST),
+        )
+        if market_regime_guard.get("blocked"):
+            return {
+                "success": False,
+                "skipped": True,
+                "message": market_regime_guard.get("message") or "시장 레짐 필터로 신규 BUY 차단",
+            }
+
         # CBT 모드: 알림만
         if self.trading_mode == "CBT":
             logger.info(f"[CBT] 매수 시그널: {self.stock_code} @ {signal.price:,.0f}원")

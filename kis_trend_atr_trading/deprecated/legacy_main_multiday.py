@@ -63,6 +63,13 @@ from kis_trend_atr_trading.universe import UniverseSelector
 from kis_trend_atr_trading.universe.universe_service import UniverseService
 from kis_trend_atr_trading.utils.logger import setup_logger, get_logger
 from kis_trend_atr_trading.utils.market_hours import KST, MarketSessionState, get_market_session_state
+from kis_trend_atr_trading.utils.market_regime import (
+    MarketRegimeService,
+    MarketRegimeLoopContext,
+    get_market_regime_refresh_budget_sec,
+    materialize_market_regime_snapshot,
+    refresh_shared_market_regime_snapshot,
+)
 from kis_trend_atr_trading.utils.position_store import PositionStore
 from kis_trend_atr_trading.utils.telegram_notifier import get_telegram_notifier
 from kis_trend_atr_trading.env import (
@@ -403,6 +410,8 @@ def run_trade(
             yaml_path=str(universe_yaml),
             kis_client=api,
         )
+        market_regime_service = MarketRegimeService(api=api)
+        shared_market_regime_snapshot = None
 
         # 주문 수량 계산
         order_quantity = settings.ORDER_QUANTITY
@@ -893,6 +902,7 @@ def run_trade(
         last_prewarm_prepare_date = None
         while True:
             iteration += 1
+            market_regime_loop_context = MarketRegimeLoopContext()
             if hasattr(api, "prewarm_access_token_if_due"):
                 api.prewarm_access_token_if_due()
 
@@ -1159,6 +1169,78 @@ def run_trade(
                         len(ranked_entry_candidates),
                     )
                 last_entry_capacity_key = cutoff_key
+
+            shared_market_regime_snapshot = materialize_market_regime_snapshot(
+                shared_market_regime_snapshot,
+                now_kst,
+            )
+            should_refresh_market_regime = (
+                bool(getattr(settings, "ENABLE_MARKET_REGIME_FILTER", False))
+                and decision.policy.allow_new_entries
+                and decision.policy.run_strategy
+                and free_slots > 0
+                and bool(entry_candidates)
+            )
+            if should_refresh_market_regime:
+                refresh_outcome = refresh_shared_market_regime_snapshot(
+                    current_snapshot=shared_market_regime_snapshot,
+                    refresh_fn=lambda refresh_now: market_regime_service.build_snapshot(
+                        check_time=refresh_now
+                    ),
+                    check_time=now_kst,
+                    loop_context=market_regime_loop_context,
+                    budget_sec=get_market_regime_refresh_budget_sec(),
+                )
+                shared_market_regime_snapshot = refresh_outcome.snapshot
+                if refresh_outcome.refreshed and shared_market_regime_snapshot is not None:
+                    ttl_sec = max(
+                        (shared_market_regime_snapshot.expires_at - shared_market_regime_snapshot.as_of).total_seconds(),
+                        0.0,
+                    )
+                    logger.info(
+                        "[MARKET_REGIME] snapshot_updated regime=%s reason=%s as_of=%s "
+                        "expires_at=%s ttl_sec=%.1f source=%s kospi_symbol=%s kosdaq_symbol=%s "
+                        "kospi_close=%.6f kospi_ma=%.6f kosdaq_close=%.6f kosdaq_ma=%.6f",
+                        shared_market_regime_snapshot.regime.value,
+                        shared_market_regime_snapshot.reason,
+                        shared_market_regime_snapshot.as_of.isoformat(),
+                        shared_market_regime_snapshot.expires_at.isoformat(),
+                        ttl_sec,
+                        shared_market_regime_snapshot.source,
+                        shared_market_regime_snapshot.kospi_symbol,
+                        shared_market_regime_snapshot.kosdaq_symbol,
+                        shared_market_regime_snapshot.kospi_close,
+                        shared_market_regime_snapshot.kospi_ma,
+                        shared_market_regime_snapshot.kosdaq_close,
+                        shared_market_regime_snapshot.kosdaq_ma,
+                    )
+                elif refresh_outcome.budget_exceeded:
+                    previous_as_of = (
+                        shared_market_regime_snapshot.as_of.isoformat()
+                        if shared_market_regime_snapshot is not None
+                        else "none"
+                    )
+                    logger.warning(
+                        "[MARKET_REGIME] snapshot_refresh_budget_exceeded budget_sec=%.3f "
+                        "elapsed_sec=%.3f using_previous_snapshot=true previous_as_of=%s",
+                        get_market_regime_refresh_budget_sec(),
+                        refresh_outcome.elapsed_sec,
+                        previous_as_of,
+                    )
+                elif refresh_outcome.error:
+                    last_success_at = (
+                        shared_market_regime_snapshot.as_of.isoformat()
+                        if shared_market_regime_snapshot is not None
+                        else "none"
+                    )
+                    logger.warning(
+                        "[MARKET_REGIME] snapshot_update_failed error=%s last_success_at=%s",
+                        refresh_outcome.error,
+                        last_success_at,
+                    )
+
+            for executor in active_executors:
+                executor.set_market_regime_snapshot(shared_market_regime_snapshot)
 
             for executor in active_executors:
                 symbol = executor.stock_code
