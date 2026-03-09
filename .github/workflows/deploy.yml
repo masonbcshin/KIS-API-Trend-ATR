@@ -25,6 +25,9 @@ jobs:
             echo ">>> Migrate BUY entry quality env"
             bash tools/migrate_entry_buy_quality_env.sh
 
+            echo ">>> Migrate market regime env"
+            bash tools/migrate_market_regime_env.sh
+
             echo ">>> Activate venv"
             if [ -d "venv" ]; then
               source venv/bin/activate
