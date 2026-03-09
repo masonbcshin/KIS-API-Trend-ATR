@@ -18,7 +18,7 @@ def _make_executor() -> MultidayExecutor:
     return executor
 
 
-def _make_buy_signal(prev_high: float = 50000.0) -> TradingSignal:
+def _make_buy_signal(prev_high: float = 50000.0, strategy_tag: str = "trend_atr") -> TradingSignal:
     return TradingSignal(
         signal_type=SignalType.BUY,
         price=50100.0,
@@ -30,6 +30,7 @@ def _make_buy_signal(prev_high: float = 50000.0) -> TradingSignal:
             "prev_high": prev_high,
             "current_price_at_signal": 50100.0,
             "extension_pct": 0.002,
+            "strategy_tag": strategy_tag,
         },
     )
 
@@ -102,3 +103,28 @@ def test_executor_blocks_protected_limit_when_cap_is_exceeded():
 
     assert plan["blocked"] is True
     assert plan["reason_code"] == "protected_limit_exceeds_cap"
+
+
+def test_executor_builds_protected_limit_plan_for_pullback_signal():
+    executor = _make_executor()
+    signal = _make_buy_signal(prev_high=174.5, strategy_tag="pullback_rebreakout")
+    signal.price = 175.2
+    signal.meta["current_price_at_signal"] = 175.2
+
+    with patch.object(multiday_executor.settings, "ENTRY_ORDER_STYLE", "protected_limit"), \
+         patch.object(multiday_executor.settings, "ENTRY_PROTECT_TICKS_STOCK", 0), \
+         patch.object(multiday_executor.settings, "ENTRY_PROTECT_TICKS_ETF", 1), \
+         patch.object(multiday_executor.settings, "ENTRY_MAX_SLIPPAGE_PCT", 0.05), \
+         patch.object(multiday_executor.settings, "ENABLE_BREAKOUT_EXTENSION_CAP", False):
+        plan = executor._build_entry_order_plan(
+            signal,
+            {
+                "stock_name": "삼성전자",
+                "current_price": 175.2,
+                "best_ask": 175.2,
+            },
+        )
+
+    assert plan["blocked"] is False
+    assert plan["style"] == "protected_limit"
+    assert plan["order_type"] == "00"

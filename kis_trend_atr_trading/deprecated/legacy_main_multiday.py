@@ -63,6 +63,7 @@ from kis_trend_atr_trading.universe import UniverseSelector
 from kis_trend_atr_trading.universe.universe_service import UniverseService
 from kis_trend_atr_trading.utils.logger import setup_logger, get_logger
 from kis_trend_atr_trading.utils.market_hours import KST, MarketSessionState, get_market_session_state
+from kis_trend_atr_trading.utils.market_phase import TradingVenue, resolve_market_phase_context
 from kis_trend_atr_trading.utils.market_regime import (
     MarketRegimeService,
     MarketRegimeLoopContext,
@@ -1109,8 +1110,19 @@ def run_trade(
 
             target_feed = _resolve_effective_feed_mode(decision)
             active_provider = ws_provider if target_feed == "ws" else rest_provider
+            market_phase_context = resolve_market_phase_context(
+                check_time=now_kst,
+                venue=TradingVenue.KRX,
+                session_state=decision.market_state,
+            )
             for executor in active_executors:
                 executor.market_data_provider = active_provider
+                set_market_phase_context = getattr(executor, "set_market_phase_context", None)
+                if callable(set_market_phase_context):
+                    set_market_phase_context(
+                        market_phase_context.phase,
+                        venue=market_phase_context.venue,
+                    )
             if active_feed_name != target_feed:
                 logger.info(
                     "[RUNTIME] active feed switched %s -> %s",

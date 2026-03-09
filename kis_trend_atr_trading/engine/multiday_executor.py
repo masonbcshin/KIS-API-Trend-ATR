@@ -256,6 +256,8 @@ class MultidayExecutor:
         # 텔레그램 알림기
         self.telegram = telegram or get_telegram_notifier()
         self.market_regime_snapshot: Optional[MarketRegimeSnapshot] = None
+        self.market_phase_context: Optional[Any] = None
+        self.market_venue_context: str = "KRX"
         
         # 포지션 저장소
         self.position_store = position_store or get_position_store()
@@ -406,6 +408,14 @@ class MultidayExecutor:
         snapshot: Optional[MarketRegimeSnapshot],
     ) -> None:
         self.market_regime_snapshot = snapshot
+
+    def set_market_phase_context(
+        self,
+        market_phase: Optional[Any],
+        venue: Optional[Any] = "KRX",
+    ) -> None:
+        self.market_phase_context = market_phase
+        self.market_venue_context = str(getattr(venue, "value", venue) or "KRX").strip().upper() or "KRX"
 
     def set_reconcile_entry_block(self, reason: str) -> None:
         """재동기화 실패 시 신규 진입 차단을 고정(sticky) 설정."""
@@ -1402,6 +1412,11 @@ class MultidayExecutor:
         )
         logger.info(f"{prefix} {details}".rstrip())
 
+    @staticmethod
+    def _strategy_tag(signal: Optional[TradingSignal]) -> str:
+        meta = dict(getattr(signal, "meta", {}) or {})
+        return str(meta.get("strategy_tag") or "trend_atr")
+
     def _asset_type_max_pct(self, asset_type: str, etf_value: float, stock_value: float) -> float:
         if str(asset_type or "").upper() == ASSET_TYPE_ETF:
             return max(float(etf_value or 0.0), 0.0)
@@ -1695,6 +1710,7 @@ class MultidayExecutor:
         meta = dict(getattr(signal, "meta", {}) or {})
         base = {
             "stage": stage,
+            "strategy_tag": meta.get("strategy_tag"),
             "symbol": self.stock_code,
             "signal_time": meta.get("signal_time"),
             "decision_time": meta.get("decision_time"),
@@ -1713,6 +1729,18 @@ class MultidayExecutor:
             "limit_price": payload.get("limit_price"),
         }
         self._log_entry_event("[ENTRY_TRACE]", **base)
+
+    def _has_active_pending_buy_order(self) -> bool:
+        syncer = getattr(self, "order_synchronizer", None)
+        if syncer is None:
+            return False
+        checker = getattr(syncer, "has_open_order_for_symbol", None)
+        if callable(checker):
+            try:
+                return bool(checker(self.stock_code, side="BUY"))
+            except Exception as exc:
+                logger.debug("[SYNC] pending buy order check failed: symbol=%s err=%s", self.stock_code, exc)
+        return False
     
     # ════════════════════════════════════════════════════════════════
     # 주문 실행 (모드별)
@@ -2191,6 +2219,7 @@ class MultidayExecutor:
             - 체결 확인 후에만 포지션 상태 갱신
             - 장 운영시간 체크
         """
+        strategy_tag = self._strategy_tag(signal)
         # 리스크 체크
         risk_check = self.risk_manager.check_order_allowed(is_closing_position=False)
         if not risk_check.passed:
@@ -2202,6 +2231,23 @@ class MultidayExecutor:
         # 이미 포지션 보유
         if self.strategy.has_position:
             return {"success": False, "message": "이미 포지션 보유 중"}
+
+        if (
+            strategy_tag == "pullback_rebreakout"
+            and bool(getattr(settings, "PULLBACK_BLOCK_IF_PENDING_ORDER", True))
+            and self._has_active_pending_buy_order()
+        ):
+            self._log_entry_event(
+                "[ENTRY_BLOCK]",
+                reason="pullback_pending_order",
+                symbol=self.stock_code,
+                strategy_tag=strategy_tag,
+            )
+            return {
+                "success": False,
+                "skipped": True,
+                "message": "미종결 주문 존재 - Pullback 신규 진입 차단",
+            }
 
         # ★ 장 운영시간 체크 (감사 보고서 지적 해결)
         if self._can_place_orders():
@@ -2252,7 +2298,7 @@ class MultidayExecutor:
                 price=signal.price,
                 quantity=self.order_quantity,
                 order_no="CBT-VIRTUAL",
-                reason="CBT_VIRTUAL_BUY",
+                reason=f"CBT_VIRTUAL_BUY:{strategy_tag}",
             )
             self._persist_account_snapshot(force=True)
             
@@ -2275,6 +2321,7 @@ class MultidayExecutor:
                 self._log_entry_event(
                     "[ENTRY_BLOCK]",
                     reason=order_plan.get("reason_code") or "protected_limit_exceeds_cap",
+                    strategy_tag=strategy_tag,
                     symbol=self.stock_code,
                     asset_type=order_plan.get("asset_type"),
                     prev_high=order_plan.get("prev_high"),
@@ -2305,6 +2352,7 @@ class MultidayExecutor:
             self._log_entry_event(
                 "[ENTRY_ORDER]",
                 style=order_plan.get("style"),
+                strategy_tag=strategy_tag,
                 symbol=self.stock_code,
                 asset_type=order_plan.get("asset_type"),
                 current_price=order_plan.get("current_price"),
@@ -2319,7 +2367,7 @@ class MultidayExecutor:
                 stock_code=self.stock_code,
                 quantity=self.order_quantity,
                 signal_id=(
-                    f"{self.stock_code}:BUY:{signal.price:.2f}:"
+                    f"{self.stock_code}:{strategy_tag}:BUY:{signal.price:.2f}:"
                     f"{datetime.now(KST).strftime('%Y%m%d%H%M')}"
                 ),
                 skip_market_check=True,  # 위에서 이미 체크함
@@ -2413,6 +2461,7 @@ class MultidayExecutor:
                 self._daily_trades.append({
                     "time": datetime.now(KST).isoformat(),
                     "type": "BUY",
+                    "strategy_tag": strategy_tag,
                     "price": actual_price,
                     "quantity": applied_qty,
                     "order_no": sync_result.order_no,
@@ -2439,10 +2488,11 @@ class MultidayExecutor:
                     logger.warning(f"매수 알림 전송 실패(주문은 성공): {notify_err}")
 
                 logger.info(
-                    "매수 체결 완료: %s qty=%s avg=%s",
+                    "매수 체결 완료: %s qty=%s avg=%s strategy_tag=%s",
                     sync_result.order_no,
                     applied_qty,
                     actual_price,
+                    strategy_tag,
                 )
                 first_fill = fills[0] if fills else None
                 fill_time = None
@@ -2474,6 +2524,7 @@ class MultidayExecutor:
                     "exec_price": actual_price,
                     "exec_qty": applied_qty,
                     "message": sync_result.message,
+                    "strategy_tag": strategy_tag,
                 }
             
             elif sync_result.result_type == OrderExecutionResult.PARTIAL:
@@ -2563,7 +2614,8 @@ class MultidayExecutor:
                     "success": False,
                     "order_no": sync_result.order_no,
                     "exec_qty": applied_qty,
-                    "message": sync_result.message
+                    "message": sync_result.message,
+                    "strategy_tag": strategy_tag,
                 }
             
             else:
@@ -2579,12 +2631,14 @@ class MultidayExecutor:
                         "message": (
                             "API 계좌 보유 확인으로 로컬 포지션을 자동 복구했습니다."
                         ),
+                        "strategy_tag": strategy_tag,
                     }
                 logger.error(f"매수 실패: {sync_result.message}")
                 return {
                     "success": False,
                     "order_no": sync_result.order_no,
-                    "message": sync_result.message
+                    "message": sync_result.message,
+                    "strategy_tag": strategy_tag,
                 }
             
         except Exception as e:
@@ -3126,6 +3180,15 @@ class MultidayExecutor:
                 stock_code=self.stock_code,
                 stock_name=str(quote_snapshot.get("stock_name") or ""),
                 check_time=decision_time,
+                market_phase=getattr(self, "market_phase_context", None),
+                market_venue=getattr(self, "market_venue_context", "KRX"),
+                has_pending_order=(
+                    self._has_active_pending_buy_order()
+                    if bool(getattr(settings, "ENABLE_PULLBACK_REBREAKOUT_STRATEGY", False))
+                    and not self.strategy.has_position
+                    else False
+                ),
+                market_regime_snapshot=getattr(self, "market_regime_snapshot", None),
             )
             signal = self._apply_stale_quote_guard(signal, quote_snapshot)
             signal.meta = dict(getattr(signal, "meta", {}) or {})
@@ -3161,6 +3224,7 @@ class MultidayExecutor:
 
             result["signal"] = {
                 "type": signal_type_value,
+                "strategy_tag": self._strategy_tag(signal),
                 "price": signal.price,
                 "stop_loss": signal.stop_loss,
                 "take_profit": signal.take_profit,
@@ -3174,6 +3238,7 @@ class MultidayExecutor:
             
             logger.info(
                 f"시그널: {signal_type_value} | "
+                f"전략: {self._strategy_tag(signal)} | "
                 f"가격: {current_price:,.0f}원 | "
                 f"추세: {signal.trend.value} | "
                 f"사유: {signal.reason}"

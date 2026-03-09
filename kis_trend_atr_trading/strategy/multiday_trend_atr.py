@@ -46,6 +46,7 @@ from utils.entry_utils import (
     compute_extension_pct,
     detect_asset_type,
 )
+from strategy.pullback_rebreakout import PullbackDecision, PullbackRebreakoutStrategy
 
 logger = get_logger("multiday_strategy")
 trade_logger = TradeLogger("multiday_strategy")
@@ -189,6 +190,7 @@ class MultidayTrendATRStrategy:
         
         # 상태 머신
         self._state_machine = TradingStateMachine()
+        self.pullback_strategy = PullbackRebreakoutStrategy()
         
         logger.info(
             f"멀티데이 전략 초기화: "
@@ -294,6 +296,7 @@ class MultidayTrendATRStrategy:
         
         df['atr'] = self.calculate_atr(df)
         df['ma'] = self.calculate_ma(df)
+        df['ma20'] = df['close'].rolling(window=20).mean()
         df['adx'] = self.calculate_adx(df)
         df['trend'] = np.where(
             df['close'] > df['ma'],
@@ -615,6 +618,142 @@ class MultidayTrendATRStrategy:
         if str(asset_type or ASSET_TYPE_STOCK).upper() == ASSET_TYPE_ETF:
             return max(float(etf_value or 0.0), 0.0)
         return max(float(stock_value or 0.0), 0.0)
+
+    def _apply_shared_entry_guards(
+        self,
+        *,
+        stock_code: str,
+        stock_name: str,
+        current_price: float,
+        open_price: Optional[float],
+        trigger_price: float,
+        prev_close: float,
+        check_time: Optional[datetime],
+        base_meta: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[bool, str, Dict[str, Any]]:
+        decision_time = self._resolve_entry_time(check_time)
+        asset_type = detect_asset_type(stock_code=stock_code, stock_name=stock_name)
+        extension_pct = compute_extension_pct(current_price, trigger_price)
+        entry_meta = self._entry_block_meta(
+            asset_type=asset_type,
+            prev_high=trigger_price,
+            prev_close=prev_close,
+            current_price=current_price,
+            open_price=open_price,
+            extension_pct=extension_pct,
+            signal_time=decision_time,
+        )
+        if base_meta:
+            entry_meta.update(dict(base_meta))
+        entry_meta.setdefault("strategy_tag", "trend_atr")
+
+        if bool(getattr(settings, "ENABLE_OPENING_NO_ENTRY_GUARD", False)):
+            guard_minutes = max(int(getattr(settings, "OPENING_NO_ENTRY_MINUTES", 0) or 0), 0)
+            if guard_minutes > 0:
+                market_open_at = decision_time.replace(
+                    hour=MARKET_OPEN.hour,
+                    minute=MARKET_OPEN.minute,
+                    second=0,
+                    microsecond=0,
+                )
+                guard_end_at = market_open_at + timedelta(minutes=guard_minutes)
+                minutes_since_open = max((decision_time - market_open_at).total_seconds() / 60.0, 0.0)
+                if market_open_at <= decision_time < guard_end_at:
+                    self._log_entry_block(
+                        "opening_guard",
+                        symbol=stock_code or "UNKNOWN",
+                        now=decision_time.isoformat(),
+                        minutes_since_open=f"{minutes_since_open:.2f}",
+                        market_state="OPEN",
+                    )
+                    entry_meta.update(
+                        {
+                            "reason_code": "opening_guard",
+                            "minutes_since_open": minutes_since_open,
+                            "market_state": "OPEN",
+                        }
+                    )
+                    return False, "장초 신규 BUY 금지 시간", entry_meta
+
+        if bool(getattr(settings, "ENABLE_BREAKOUT_EXTENSION_CAP", False)):
+            max_extension_pct = self._asset_type_max_pct(
+                asset_type,
+                getattr(settings, "MAX_BREAKOUT_EXTENSION_PCT_ETF", 0.0),
+                getattr(settings, "MAX_BREAKOUT_EXTENSION_PCT_STOCK", 0.0),
+            )
+            if max_extension_pct > 0 and extension_pct > max_extension_pct:
+                self._log_entry_block(
+                    "breakout_extension_exceeded",
+                    symbol=stock_code or "UNKNOWN",
+                    asset_type=asset_type,
+                    prev_high=f"{float(trigger_price):.6f}",
+                    current_price=f"{float(current_price):.6f}",
+                    extension_pct=f"{extension_pct:.6f}",
+                    max_allowed_pct=f"{max_extension_pct:.6f}",
+                )
+                entry_meta.update(
+                    {
+                        "reason_code": "breakout_extension_exceeded",
+                        "max_allowed_pct": max_extension_pct,
+                    }
+                )
+                return False, "돌파 확장폭 상한 초과", entry_meta
+
+        if bool(getattr(settings, "ENABLE_ENTRY_GAP_FILTER", False)) and open_price and open_price > 0:
+            max_entry_gap_pct = self._asset_type_max_pct(
+                asset_type,
+                getattr(settings, "MAX_ENTRY_GAP_PCT_ETF", 0.0),
+                getattr(settings, "MAX_ENTRY_GAP_PCT_STOCK", 0.0),
+            )
+            max_open_vs_prev_high_pct = max(
+                float(getattr(settings, "MAX_OPEN_VS_PREV_HIGH_PCT", 0.0) or 0.0),
+                0.0,
+            )
+            gap_pct = compute_extension_pct(open_price, prev_close)
+            open_vs_prev_high_pct = compute_extension_pct(open_price, trigger_price)
+            gap_exceeded = (
+                max_entry_gap_pct > 0
+                and prev_close > 0
+                and gap_pct > max_entry_gap_pct
+            )
+            open_vs_prev_high_exceeded = (
+                max_open_vs_prev_high_pct > 0
+                and open_vs_prev_high_pct > max_open_vs_prev_high_pct
+            )
+            if gap_exceeded or open_vs_prev_high_exceeded:
+                self._log_entry_block(
+                    "entry_gap_filter",
+                    symbol=stock_code or "UNKNOWN",
+                    open_price=f"{float(open_price):.6f}",
+                    prev_close=f"{float(prev_close):.6f}",
+                    prev_high=f"{float(trigger_price):.6f}",
+                    gap_pct=f"{gap_pct:.6f}",
+                    open_vs_prev_high_pct=f"{open_vs_prev_high_pct:.6f}",
+                )
+                entry_meta.update(
+                    {
+                        "reason_code": "entry_gap_filter",
+                        "gap_pct": gap_pct,
+                        "open_vs_prev_high_pct": open_vs_prev_high_pct,
+                        "max_entry_gap_pct": max_entry_gap_pct,
+                        "max_open_vs_prev_high_pct": max_open_vs_prev_high_pct,
+                    }
+                )
+                return False, "장초 갭 과열 필터 차단", entry_meta
+
+        if settings.ENABLE_EVENT_RISK_CHECK:
+            today = decision_time.strftime("%Y-%m-%d")
+            if today in settings.HIGH_RISK_EVENT_DATES:
+                entry_meta.update(
+                    {
+                        "reason_code": "high_risk_event",
+                        "event_date": today,
+                    }
+                )
+                return False, f"고위험 이벤트일 ({today})", entry_meta
+
+        entry_meta.update({"reason_code": ""})
+        return True, "", entry_meta
     
     def check_entry_conditions(
         self,
@@ -676,119 +815,20 @@ class MultidayTrendATRStrategy:
         prev_close = latest.get("prev_close", 0)
         if pd.isna(prev_close):
             prev_close = 0.0
-        asset_type = detect_asset_type(stock_code=stock_code, stock_name=stock_name)
-        extension_pct = compute_extension_pct(current_price, prev_high)
-        entry_meta = self._entry_block_meta(
-            asset_type=asset_type,
-            prev_high=prev_high,
-            prev_close=prev_close,
+        guards_ok, guard_reason, entry_meta = self._apply_shared_entry_guards(
+            stock_code=stock_code,
+            stock_name=stock_name,
             current_price=current_price,
             open_price=open_price,
-            extension_pct=extension_pct,
-            signal_time=decision_time,
+            trigger_price=prev_high,
+            prev_close=float(prev_close or 0.0),
+            check_time=decision_time,
+            base_meta={"strategy_tag": "trend_atr"},
         )
+        if not guards_ok:
+            return False, guard_reason, atr, entry_meta
 
-        if bool(getattr(settings, "ENABLE_OPENING_NO_ENTRY_GUARD", False)):
-            guard_minutes = max(int(getattr(settings, "OPENING_NO_ENTRY_MINUTES", 0) or 0), 0)
-            if guard_minutes > 0:
-                market_open_at = decision_time.replace(
-                    hour=MARKET_OPEN.hour,
-                    minute=MARKET_OPEN.minute,
-                    second=0,
-                    microsecond=0,
-                )
-                guard_end_at = market_open_at + timedelta(minutes=guard_minutes)
-                minutes_since_open = max((decision_time - market_open_at).total_seconds() / 60.0, 0.0)
-                if market_open_at <= decision_time < guard_end_at:
-                    self._log_entry_block(
-                        "opening_guard",
-                        symbol=stock_code or "UNKNOWN",
-                        now=decision_time.isoformat(),
-                        minutes_since_open=f"{minutes_since_open:.2f}",
-                        market_state="OPEN",
-                    )
-                    entry_meta.update(
-                        {
-                            "reason_code": "opening_guard",
-                            "minutes_since_open": minutes_since_open,
-                            "market_state": "OPEN",
-                        }
-                    )
-                    return False, "장초 신규 BUY 금지 시간", atr, entry_meta
-
-        if bool(getattr(settings, "ENABLE_BREAKOUT_EXTENSION_CAP", False)):
-            max_extension_pct = self._asset_type_max_pct(
-                asset_type,
-                getattr(settings, "MAX_BREAKOUT_EXTENSION_PCT_ETF", 0.0),
-                getattr(settings, "MAX_BREAKOUT_EXTENSION_PCT_STOCK", 0.0),
-            )
-            if max_extension_pct > 0 and extension_pct > max_extension_pct:
-                self._log_entry_block(
-                    "breakout_extension_exceeded",
-                    symbol=stock_code or "UNKNOWN",
-                    asset_type=asset_type,
-                    prev_high=f"{float(prev_high):.6f}",
-                    current_price=f"{float(current_price):.6f}",
-                    extension_pct=f"{extension_pct:.6f}",
-                    max_allowed_pct=f"{max_extension_pct:.6f}",
-                )
-                entry_meta.update(
-                    {
-                        "reason_code": "breakout_extension_exceeded",
-                        "max_allowed_pct": max_extension_pct,
-                    }
-                )
-                return False, "돌파 확장폭 상한 초과", atr, entry_meta
-
-        if bool(getattr(settings, "ENABLE_ENTRY_GAP_FILTER", False)) and open_price and open_price > 0:
-            max_entry_gap_pct = self._asset_type_max_pct(
-                asset_type,
-                getattr(settings, "MAX_ENTRY_GAP_PCT_ETF", 0.0),
-                getattr(settings, "MAX_ENTRY_GAP_PCT_STOCK", 0.0),
-            )
-            max_open_vs_prev_high_pct = max(
-                float(getattr(settings, "MAX_OPEN_VS_PREV_HIGH_PCT", 0.0) or 0.0),
-                0.0,
-            )
-            gap_pct = compute_extension_pct(open_price, prev_close)
-            open_vs_prev_high_pct = compute_extension_pct(open_price, prev_high)
-            gap_exceeded = (
-                max_entry_gap_pct > 0
-                and prev_close > 0
-                and gap_pct > max_entry_gap_pct
-            )
-            open_vs_prev_high_exceeded = (
-                max_open_vs_prev_high_pct > 0
-                and open_vs_prev_high_pct > max_open_vs_prev_high_pct
-            )
-            if gap_exceeded or open_vs_prev_high_exceeded:
-                self._log_entry_block(
-                    "entry_gap_filter",
-                    symbol=stock_code or "UNKNOWN",
-                    open_price=f"{float(open_price):.6f}",
-                    prev_close=f"{float(prev_close):.6f}",
-                    prev_high=f"{float(prev_high):.6f}",
-                    gap_pct=f"{gap_pct:.6f}",
-                    open_vs_prev_high_pct=f"{open_vs_prev_high_pct:.6f}",
-                )
-                entry_meta.update(
-                    {
-                        "reason_code": "entry_gap_filter",
-                        "gap_pct": gap_pct,
-                        "open_vs_prev_high_pct": open_vs_prev_high_pct,
-                        "max_entry_gap_pct": max_entry_gap_pct,
-                        "max_open_vs_prev_high_pct": max_open_vs_prev_high_pct,
-                    }
-                )
-                return False, "장초 갭 과열 필터 차단", atr, entry_meta
-        
-        # 이벤트 리스크 체크
-        if settings.ENABLE_EVENT_RISK_CHECK:
-            today = decision_time.strftime("%Y-%m-%d")
-            if today in settings.HIGH_RISK_EVENT_DATES:
-                return False, f"고위험 이벤트일 ({today})", atr, entry_meta
-        
-        entry_meta.update({"reason_code": "", "adx": float(adx or 0.0)})
+        entry_meta.update({"adx": float(adx or 0.0), "strategy_tag": "trend_atr"})
         return True, f"상승 추세(ADX:{adx:.1f}) + 직전 고가({prev_high:,.0f}) 돌파", atr, entry_meta
     
     def _check_atr_validity(self, df: pd.DataFrame) -> Tuple[bool, str]:
@@ -825,6 +865,10 @@ class MultidayTrendATRStrategy:
         stock_code: str = "",
         stock_name: str = "",
         check_time: Optional[datetime] = None,
+        market_phase: Optional[object] = None,
+        market_venue: Optional[object] = None,
+        has_pending_order: bool = False,
+        market_regime_snapshot: Optional[object] = None,
     ) -> TradingSignal:
         """
         매매 시그널 생성
@@ -942,6 +986,83 @@ class MultidayTrendATRStrategy:
         # ════════════════════════════════════════════════════════════
         # 포지션 미보유 → Entry 조건 체크
         # ════════════════════════════════════════════════════════════
+        pullback_candidate = self.pullback_strategy.evaluate(
+            df=df_with_indicators,
+            current_price=current_price,
+            stock_code=stock_code,
+            stock_name=stock_name,
+            check_time=check_time,
+            market_phase=market_phase,
+            market_venue=market_venue,
+            has_existing_position=self.has_position,
+            has_pending_order=has_pending_order,
+            market_regime_snapshot=market_regime_snapshot,
+        )
+        if pullback_candidate.decision == PullbackDecision.BLOCKED:
+            pullback_meta = dict(pullback_candidate.meta or {})
+            return TradingSignal(
+                signal_type=SignalType.HOLD,
+                price=current_price,
+                reason=pullback_candidate.reason,
+                atr=current_atr,
+                trend=trend,
+                reason_code=str(pullback_candidate.reason_code or ""),
+                meta=pullback_meta,
+            )
+
+        if pullback_candidate.decision == PullbackDecision.BUY:
+            latest_prev_close = latest.get("prev_close", 0.0)
+            if pd.isna(latest_prev_close):
+                latest_prev_close = 0.0
+            guards_ok, guard_reason, pullback_meta = self._apply_shared_entry_guards(
+                stock_code=stock_code,
+                stock_name=stock_name,
+                current_price=current_price,
+                open_price=open_price,
+                trigger_price=float(pullback_candidate.trigger_price or 0.0),
+                prev_close=float(latest_prev_close or 0.0),
+                check_time=check_time,
+                base_meta=dict(pullback_candidate.meta or {}),
+            )
+            pullback_meta.update(
+                {
+                    "strategy_tag": pullback_candidate.meta.get("strategy_tag", "pullback_rebreakout"),
+                    "adx": float(pullback_candidate.meta.get("adx", latest.get("adx", 0.0)) or 0.0),
+                }
+            )
+            if not guards_ok:
+                return TradingSignal(
+                    signal_type=SignalType.HOLD,
+                    price=current_price,
+                    reason=guard_reason,
+                    atr=current_atr,
+                    trend=trend,
+                    reason_code=str(pullback_meta.get("reason_code") or ""),
+                    meta=pullback_meta,
+                )
+
+            stop_loss = self.calculate_stop_loss(current_price, pullback_candidate.atr)
+            take_profit = self.calculate_take_profit(current_price, pullback_candidate.atr)
+
+            trade_logger.log_signal(
+                signal_type="BUY",
+                stock_code=stock_code,
+                price=current_price,
+                reason=pullback_candidate.reason,
+            )
+
+            return TradingSignal(
+                signal_type=SignalType.BUY,
+                price=current_price,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                trailing_stop=stop_loss,
+                reason=pullback_candidate.reason,
+                atr=pullback_candidate.atr,
+                trend=trend,
+                meta=pullback_meta,
+            )
+
         can_enter, entry_reason, entry_atr, entry_meta = self.check_entry_conditions(
             df_with_indicators,
             current_price,
@@ -950,10 +1071,12 @@ class MultidayTrendATRStrategy:
             stock_name=stock_name,
             check_time=check_time,
         )
-        
+
         if can_enter:
             stop_loss = self.calculate_stop_loss(current_price, entry_atr)
             take_profit = self.calculate_take_profit(current_price, entry_atr)
+            entry_meta = dict(entry_meta or {})
+            entry_meta.setdefault("strategy_tag", "trend_atr")
             
             trade_logger.log_signal(
                 signal_type="BUY",

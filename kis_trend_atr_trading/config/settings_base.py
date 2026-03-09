@@ -323,6 +323,72 @@ ENABLE_STALE_QUOTE_GUARD: bool = os.getenv("ENABLE_STALE_QUOTE_GUARD", "false").
 )
 QUOTE_MAX_AGE_SEC: float = float(os.getenv("QUOTE_MAX_AGE_SEC", "0"))
 
+# Pullback / Re-breakout 보조 진입 슬리브 설정
+# - Trend-ATR의 기존 돌파 진입을 대체하지 않고 보완하는 보조 전략입니다.
+# - 기본값은 OFF로 두어 기존 동작을 보호합니다.
+# - 권장 운영 예시:
+#   ENABLE_PULLBACK_REBREAKOUT_STRATEGY=true
+#   PULLBACK_LOOKBACK_BARS=12
+#   PULLBACK_SWING_LOOKBACK_BARS=15
+#   PULLBACK_MIN_PULLBACK_PCT=0.015
+#   PULLBACK_MAX_PULLBACK_PCT=0.06
+#   PULLBACK_REQUIRE_ABOVE_MA20=true
+#   PULLBACK_REBREAKOUT_LOOKBACK_BARS=3
+#   PULLBACK_USE_ADX_FILTER=true
+#   PULLBACK_MIN_ADX=20
+#   PULLBACK_ONLY_MAIN_MARKET=true
+#   PULLBACK_ALLOWED_ENTRY_VENUES=KRX
+#   PULLBACK_BLOCK_IF_EXISTING_POSITION=true
+#   PULLBACK_BLOCK_IF_PENDING_ORDER=true
+ENABLE_PULLBACK_REBREAKOUT_STRATEGY: bool = os.getenv(
+    "ENABLE_PULLBACK_REBREAKOUT_STRATEGY",
+    "false",
+).lower() in (
+    "true",
+    "1",
+    "yes",
+)
+PULLBACK_LOOKBACK_BARS: int = int(os.getenv("PULLBACK_LOOKBACK_BARS", "12"))
+PULLBACK_SWING_LOOKBACK_BARS: int = int(os.getenv("PULLBACK_SWING_LOOKBACK_BARS", "15"))
+PULLBACK_MIN_PULLBACK_PCT: float = float(os.getenv("PULLBACK_MIN_PULLBACK_PCT", "0.015"))
+PULLBACK_MAX_PULLBACK_PCT: float = float(os.getenv("PULLBACK_MAX_PULLBACK_PCT", "0.06"))
+PULLBACK_REQUIRE_ABOVE_MA20: bool = os.getenv("PULLBACK_REQUIRE_ABOVE_MA20", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+PULLBACK_REBREAKOUT_LOOKBACK_BARS: int = int(os.getenv("PULLBACK_REBREAKOUT_LOOKBACK_BARS", "3"))
+PULLBACK_USE_ADX_FILTER: bool = os.getenv("PULLBACK_USE_ADX_FILTER", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+PULLBACK_MIN_ADX: float = float(os.getenv("PULLBACK_MIN_ADX", "20"))
+PULLBACK_ONLY_MAIN_MARKET: bool = os.getenv("PULLBACK_ONLY_MAIN_MARKET", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+PULLBACK_ALLOWED_ENTRY_VENUES: str = (
+    str(os.getenv("PULLBACK_ALLOWED_ENTRY_VENUES", "KRX") or "KRX").strip().upper() or "KRX"
+)
+PULLBACK_BLOCK_IF_EXISTING_POSITION: bool = os.getenv(
+    "PULLBACK_BLOCK_IF_EXISTING_POSITION",
+    "true",
+).lower() in (
+    "true",
+    "1",
+    "yes",
+)
+PULLBACK_BLOCK_IF_PENDING_ORDER: bool = os.getenv(
+    "PULLBACK_BLOCK_IF_PENDING_ORDER",
+    "true",
+).lower() in (
+    "true",
+    "1",
+    "yes",
+)
+
 # 시장 레짐 필터 설정
 # - 1차 버전은 대표 ETF 2개만으로 BUY 상위 필터를 제공합니다.
 # - 기본값은 모두 기존 동작 유지(필터 OFF 또는 통과 허용)입니다.

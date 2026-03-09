@@ -694,6 +694,44 @@ class OrderSynchronizer:
             logger.warning(f"[SYNC] order_state 조회 실패: {e}")
             return None
 
+    def has_open_order_for_symbol(self, stock_code: str, side: str = "") -> bool:
+        if not self._db:
+            return False
+        self._ensure_order_state_table()
+        normalized_side = str(side or "").strip().upper()
+        try:
+            if normalized_side:
+                row = self._db.execute_query(
+                    """
+                    SELECT 1
+                      FROM order_state
+                     WHERE mode = %s
+                       AND symbol = %s
+                       AND side = %s
+                       AND status IN ('PENDING','SUBMITTED','PARTIAL')
+                     LIMIT 1
+                    """,
+                    (self.mode, stock_code, normalized_side),
+                    fetch_one=True,
+                )
+            else:
+                row = self._db.execute_query(
+                    """
+                    SELECT 1
+                      FROM order_state
+                     WHERE mode = %s
+                       AND symbol = %s
+                       AND status IN ('PENDING','SUBMITTED','PARTIAL')
+                     LIMIT 1
+                    """,
+                    (self.mode, stock_code),
+                    fetch_one=True,
+                )
+            return row is not None
+        except Exception as e:
+            logger.warning(f"[SYNC] open order 조회 실패: {e}")
+            return False
+
     def recover_pending_orders(self) -> List[Dict[str, Any]]:
         """
         재시작 시 DB의 pending/submitted/partial 주문을 재구성합니다.
