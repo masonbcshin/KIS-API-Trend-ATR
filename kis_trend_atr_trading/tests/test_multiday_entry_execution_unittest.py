@@ -128,3 +128,34 @@ def test_executor_builds_protected_limit_plan_for_pullback_signal():
     assert plan["blocked"] is False
     assert plan["style"] == "protected_limit"
     assert plan["order_type"] == "00"
+
+
+def test_executor_builds_protected_limit_plan_using_orb_reference_price_and_cap():
+    executor = _make_executor()
+    signal = _make_buy_signal(prev_high=50000.0, strategy_tag="opening_range_breakout")
+    signal.price = 50900.0
+    signal.meta["current_price_at_signal"] = 50900.0
+    signal.meta["entry_reference_price"] = 50750.0
+    signal.meta["entry_reference_label"] = "opening_range_high"
+    signal.meta["max_allowed_pct"] = 0.006
+
+    with patch.object(multiday_executor.settings, "ENTRY_ORDER_STYLE", "protected_limit"), \
+         patch.object(multiday_executor.settings, "ENTRY_PROTECT_TICKS_STOCK", 0), \
+         patch.object(multiday_executor.settings, "ENTRY_PROTECT_TICKS_ETF", 1), \
+         patch.object(multiday_executor.settings, "ENTRY_MAX_SLIPPAGE_PCT", 0.02), \
+         patch.object(multiday_executor.settings, "ENABLE_BREAKOUT_EXTENSION_CAP", True), \
+         patch.object(multiday_executor.settings, "MAX_BREAKOUT_EXTENSION_PCT_STOCK", 0.001), \
+         patch.object(multiday_executor.settings, "MAX_BREAKOUT_EXTENSION_PCT_ETF", 0.001):
+        plan = executor._build_entry_order_plan(
+            signal,
+            {
+                "stock_name": "삼성전자",
+                "current_price": 50900.0,
+                "best_ask": 50900.0,
+            },
+        )
+
+    assert plan["blocked"] is False
+    assert plan["entry_reference_price"] == 50750.0
+    assert plan["entry_reference_label"] == "opening_range_high"
+    assert round(plan["extension_pct_at_order"], 6) == round((50900.0 / 50750.0) - 1.0, 6)

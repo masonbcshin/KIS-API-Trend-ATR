@@ -275,6 +275,13 @@ NEAR_STOPLOSS_THRESHOLD_PCT: float = 70.0
 #   ENABLE_BREAKOUT_EXTENSION_CAP=true
 #   MAX_BREAKOUT_EXTENSION_PCT_ETF=0.004
 #   MAX_BREAKOUT_EXTENSION_PCT_STOCK=0.007
+#   BREAKOUT_EXTENSION_OPENING_CAP_MINUTES=90
+#   MAX_BREAKOUT_EXTENSION_PCT_ETF_OPENING=0.012
+#   MAX_BREAKOUT_EXTENSION_PCT_STOCK_OPENING=0.018
+#   ENABLE_BREAKOUT_EXTENSION_ATR_CAP=true
+#   BREAKOUT_EXTENSION_ATR_MULTIPLIER=0.35
+#   MAX_BREAKOUT_EXTENSION_PCT_ETF_HARD=0.02
+#   MAX_BREAKOUT_EXTENSION_PCT_STOCK_HARD=0.035
 #   ENABLE_ENTRY_GAP_FILTER=true
 #   MAX_ENTRY_GAP_PCT_ETF=0.01
 #   MAX_ENTRY_GAP_PCT_STOCK=0.015
@@ -294,6 +301,23 @@ ENABLE_BREAKOUT_EXTENSION_CAP: bool = os.getenv("ENABLE_BREAKOUT_EXTENSION_CAP",
 )
 MAX_BREAKOUT_EXTENSION_PCT_ETF: float = float(os.getenv("MAX_BREAKOUT_EXTENSION_PCT_ETF", "0.0"))
 MAX_BREAKOUT_EXTENSION_PCT_STOCK: float = float(os.getenv("MAX_BREAKOUT_EXTENSION_PCT_STOCK", "0.0"))
+BREAKOUT_EXTENSION_OPENING_CAP_MINUTES: int = int(os.getenv("BREAKOUT_EXTENSION_OPENING_CAP_MINUTES", "0"))
+MAX_BREAKOUT_EXTENSION_PCT_ETF_OPENING: float = float(
+    os.getenv("MAX_BREAKOUT_EXTENSION_PCT_ETF_OPENING", "0.0")
+)
+MAX_BREAKOUT_EXTENSION_PCT_STOCK_OPENING: float = float(
+    os.getenv("MAX_BREAKOUT_EXTENSION_PCT_STOCK_OPENING", "0.0")
+)
+ENABLE_BREAKOUT_EXTENSION_ATR_CAP: bool = os.getenv("ENABLE_BREAKOUT_EXTENSION_ATR_CAP", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+BREAKOUT_EXTENSION_ATR_MULTIPLIER: float = float(os.getenv("BREAKOUT_EXTENSION_ATR_MULTIPLIER", "0.0"))
+MAX_BREAKOUT_EXTENSION_PCT_ETF_HARD: float = float(os.getenv("MAX_BREAKOUT_EXTENSION_PCT_ETF_HARD", "0.0"))
+MAX_BREAKOUT_EXTENSION_PCT_STOCK_HARD: float = float(
+    os.getenv("MAX_BREAKOUT_EXTENSION_PCT_STOCK_HARD", "0.0")
+)
 
 ENABLE_ENTRY_GAP_FILTER: bool = os.getenv("ENABLE_ENTRY_GAP_FILTER", "false").lower() in (
     "true",
@@ -322,6 +346,67 @@ ENABLE_STALE_QUOTE_GUARD: bool = os.getenv("ENABLE_STALE_QUOTE_GUARD", "false").
     "yes",
 )
 QUOTE_MAX_AGE_SEC: float = float(os.getenv("QUOTE_MAX_AGE_SEC", "0"))
+
+# Opening Range Breakout(ORB) 보조 진입 슬리브 설정
+# - 장초 갭으로 기존 prev_high 기반 cap/gap 필터를 통과하기 어려운 강한 종목을
+#   opening range 재돌파로만 제한적으로 허용합니다.
+# - 기본값은 OFF로 두어 기존 동작을 보호합니다.
+# - 권장 운영 예시:
+#   ENABLE_OPENING_RANGE_BREAKOUT_STRATEGY=true
+#   ORB_OPENING_RANGE_MINUTES=5
+#   ORB_ENTRY_CUTOFF_MINUTES=90
+#   ORB_MIN_OPEN_ABOVE_PREV_HIGH_PCT=0.003
+#   ORB_MAX_OPEN_ABOVE_PREV_HIGH_PCT_ETF=0.05
+#   ORB_MAX_OPEN_ABOVE_PREV_HIGH_PCT_STOCK=0.10
+#   ORB_MAX_EXTENSION_PCT_ETF=0.006
+#   ORB_MAX_EXTENSION_PCT_STOCK=0.01
+#   ORB_REQUIRE_ABOVE_VWAP=true
+#   ORB_RECENT_BREAKOUT_LOOKBACK_BARS=3
+#   ORB_REARM_BAND_PCT=0.002
+ENABLE_OPENING_RANGE_BREAKOUT_STRATEGY: bool = os.getenv(
+    "ENABLE_OPENING_RANGE_BREAKOUT_STRATEGY",
+    "false",
+).lower() in (
+    "true",
+    "1",
+    "yes",
+)
+ORB_OPENING_RANGE_MINUTES: int = int(os.getenv("ORB_OPENING_RANGE_MINUTES", "5"))
+ORB_ENTRY_START_MINUTES: int = int(os.getenv("ORB_ENTRY_START_MINUTES", "0"))
+ORB_ENTRY_CUTOFF_MINUTES: int = int(os.getenv("ORB_ENTRY_CUTOFF_MINUTES", "90"))
+ORB_MIN_OPEN_ABOVE_PREV_HIGH_PCT: float = float(os.getenv("ORB_MIN_OPEN_ABOVE_PREV_HIGH_PCT", "0.0"))
+ORB_MAX_OPEN_ABOVE_PREV_HIGH_PCT_ETF: float = float(
+    os.getenv("ORB_MAX_OPEN_ABOVE_PREV_HIGH_PCT_ETF", "0.0")
+)
+ORB_MAX_OPEN_ABOVE_PREV_HIGH_PCT_STOCK: float = float(
+    os.getenv("ORB_MAX_OPEN_ABOVE_PREV_HIGH_PCT_STOCK", "0.0")
+)
+ORB_MAX_EXTENSION_PCT_ETF: float = float(os.getenv("ORB_MAX_EXTENSION_PCT_ETF", "0.0"))
+ORB_MAX_EXTENSION_PCT_STOCK: float = float(os.getenv("ORB_MAX_EXTENSION_PCT_STOCK", "0.0"))
+ORB_REQUIRE_ABOVE_VWAP: bool = os.getenv("ORB_REQUIRE_ABOVE_VWAP", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+ORB_USE_ADX_FILTER: bool = os.getenv("ORB_USE_ADX_FILTER", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+ORB_MIN_ADX: float = float(os.getenv("ORB_MIN_ADX", "20.0"))
+ORB_RECENT_BREAKOUT_LOOKBACK_BARS: int = int(os.getenv("ORB_RECENT_BREAKOUT_LOOKBACK_BARS", "3"))
+ORB_REARM_BAND_PCT: float = float(os.getenv("ORB_REARM_BAND_PCT", "0.002"))
+ORB_BLOCK_IF_PENDING_ORDER: bool = os.getenv("ORB_BLOCK_IF_PENDING_ORDER", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+ORB_ONLY_MAIN_MARKET: bool = os.getenv("ORB_ONLY_MAIN_MARKET", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+ORB_ALLOWED_ENTRY_VENUES: str = os.getenv("ORB_ALLOWED_ENTRY_VENUES", "KRX").strip() or "KRX"
 
 # Pullback / Re-breakout 보조 진입 슬리브 설정
 # - Trend-ATR의 기존 돌파 진입을 대체하지 않고 보완하는 보조 전략입니다.

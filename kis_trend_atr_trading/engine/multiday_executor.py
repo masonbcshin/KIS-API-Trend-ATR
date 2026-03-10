@@ -1307,7 +1307,30 @@ class MultidayExecutor:
         except _KIS_API_ERROR_TYPES as e:
             logger.error(f"시장 데이터 조회 실패: {e}")
             return pd.DataFrame()
-    
+
+    def fetch_intraday_bars(self, n: int = 120) -> list[dict]:
+        """장중 1분봉 조회. 실시간 분봉이 없거나 synthetic bar만 있으면 빈 리스트를 반환합니다."""
+        provider = getattr(self, "market_data_provider", None)
+        if provider is None:
+            return []
+        try:
+            bars = provider.get_recent_bars(
+                stock_code=self.stock_code,
+                n=max(int(n), 1),
+                timeframe="1m",
+            )
+        except Exception as exc:
+            logger.debug("[ORB] intraday bars unavailable: symbol=%s err=%s", self.stock_code, exc)
+            return []
+
+        normalized = [bar for bar in list(bars or []) if isinstance(bar, dict)]
+        if not normalized:
+            return []
+        # REST fallback minute bars are synthetic and carry zero volume only.
+        if all(float(bar.get("volume", 0.0) or 0.0) <= 0.0 for bar in normalized):
+            return []
+        return normalized
+
     def fetch_current_price(self) -> tuple:
         """
         현재가 및 시가 조회
@@ -1636,7 +1659,10 @@ class MultidayExecutor:
         current_price = float(quote_snapshot.get("current_price", 0.0) or 0.0)
         best_ask_raw = quote_snapshot.get("best_ask")
         best_ask = float(best_ask_raw) if best_ask_raw not in (None, "", 0, 0.0) else None
-        prev_high = float((getattr(signal, "meta", {}) or {}).get("prev_high") or 0.0)
+        meta = dict(getattr(signal, "meta", {}) or {})
+        prev_high = float(meta.get("prev_high") or 0.0)
+        entry_reference_price = float(meta.get("entry_reference_price") or prev_high or 0.0)
+        entry_reference_label = str(meta.get("entry_reference_label") or "prev_high")
         style = self._resolve_entry_order_style()
 
         if style != "protected_limit":
@@ -1649,9 +1675,11 @@ class MultidayExecutor:
                 "best_ask": best_ask,
                 "current_price": current_price,
                 "prev_high": prev_high,
+                "entry_reference_price": entry_reference_price,
+                "entry_reference_label": entry_reference_label,
                 "limit_price": 0.0,
                 "slippage_cap_pct": float(getattr(settings, "ENTRY_MAX_SLIPPAGE_PCT", 0.0) or 0.0),
-                "extension_pct_at_order": compute_extension_pct(current_price, prev_high),
+                "extension_pct_at_order": compute_extension_pct(current_price, entry_reference_price),
             }
 
         protect_ticks = (
@@ -1664,8 +1692,8 @@ class MultidayExecutor:
         working_price = base_price + (tick_size * protect_ticks)
         limit_price = align_price_to_tick(working_price, asset_type, direction="up")
 
-        breakout_cap_pct = 0.0
-        if bool(getattr(settings, "ENABLE_BREAKOUT_EXTENSION_CAP", False)):
+        breakout_cap_pct = max(float(meta.get("max_allowed_pct") or 0.0), 0.0)
+        if breakout_cap_pct <= 0 and bool(getattr(settings, "ENABLE_BREAKOUT_EXTENSION_CAP", False)):
             breakout_cap_pct = self._asset_type_max_pct(
                 asset_type,
                 getattr(settings, "MAX_BREAKOUT_EXTENSION_PCT_ETF", 0.0),
@@ -1673,13 +1701,13 @@ class MultidayExecutor:
             )
         slippage_cap_pct = max(float(getattr(settings, "ENTRY_MAX_SLIPPAGE_PCT", 0.0) or 0.0), 0.0)
 
-        limit_extension_pct = compute_extension_pct(limit_price, prev_high)
-        extension_pct_at_order = compute_extension_pct(current_price, prev_high)
+        limit_extension_pct = compute_extension_pct(limit_price, entry_reference_price)
+        extension_pct_at_order = compute_extension_pct(current_price, entry_reference_price)
         limit_slippage_pct = compute_extension_pct(limit_price, current_price)
 
         blocked = False
         block_reason = ""
-        if breakout_cap_pct > 0 and prev_high > 0 and limit_extension_pct > breakout_cap_pct:
+        if breakout_cap_pct > 0 and entry_reference_price > 0 and limit_extension_pct > breakout_cap_pct:
             blocked = True
             block_reason = "protected_limit_exceeds_cap"
         if not blocked and slippage_cap_pct > 0 and current_price > 0 and limit_slippage_pct > slippage_cap_pct:
@@ -1696,6 +1724,8 @@ class MultidayExecutor:
             "best_ask": best_ask,
             "current_price": current_price,
             "prev_high": prev_high,
+            "entry_reference_price": entry_reference_price,
+            "entry_reference_label": entry_reference_label,
             "protect_ticks": protect_ticks,
             "tick_size": tick_size,
             "limit_price": float(limit_price or 0.0),
@@ -3171,6 +3201,26 @@ class MultidayExecutor:
                 result["error"] = "네트워크 단절 60초 이상 지속 - 안전모드로 거래 중단"
                 logger.error(result["error"])
                 return result
+
+            intraday_bars: list[dict] = []
+            if bool(getattr(settings, "ENABLE_OPENING_RANGE_BREAKOUT_STRATEGY", False)):
+                intraday_lookback = max(
+                    int(getattr(settings, "ORB_ENTRY_CUTOFF_MINUTES", 90) or 90)
+                    + int(getattr(settings, "ORB_OPENING_RANGE_MINUTES", 5) or 5)
+                    + 5,
+                    30,
+                )
+                intraday_bars = self.fetch_intraday_bars(n=intraday_lookback)
+
+            has_pending_order = (
+                self._has_active_pending_buy_order()
+                if (
+                    bool(getattr(settings, "ENABLE_PULLBACK_REBREAKOUT_STRATEGY", False))
+                    or bool(getattr(settings, "ENABLE_OPENING_RANGE_BREAKOUT_STRATEGY", False))
+                )
+                and not self.strategy.has_position
+                else False
+            )
             
             # 3. 시그널 생성
             signal = self.strategy.generate_signal(
@@ -3182,13 +3232,9 @@ class MultidayExecutor:
                 check_time=decision_time,
                 market_phase=getattr(self, "market_phase_context", None),
                 market_venue=getattr(self, "market_venue_context", "KRX"),
-                has_pending_order=(
-                    self._has_active_pending_buy_order()
-                    if bool(getattr(settings, "ENABLE_PULLBACK_REBREAKOUT_STRATEGY", False))
-                    and not self.strategy.has_position
-                    else False
-                ),
+                has_pending_order=has_pending_order,
                 market_regime_snapshot=getattr(self, "market_regime_snapshot", None),
+                intraday_bars=intraday_bars,
             )
             signal = self._apply_stale_quote_guard(signal, quote_snapshot)
             signal.meta = dict(getattr(signal, "meta", {}) or {})

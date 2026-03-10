@@ -46,6 +46,7 @@ from utils.entry_utils import (
     compute_extension_pct,
     detect_asset_type,
 )
+from strategy.opening_range_breakout import ORBDecision, OpeningRangeBreakoutStrategy
 from strategy.pullback_rebreakout import PullbackDecision, PullbackRebreakoutStrategy
 
 logger = get_logger("multiday_strategy")
@@ -191,6 +192,7 @@ class MultidayTrendATRStrategy:
         # 상태 머신
         self._state_machine = TradingStateMachine()
         self.pullback_strategy = PullbackRebreakoutStrategy()
+        self.orb_strategy = OpeningRangeBreakoutStrategy()
         
         logger.info(
             f"멀티데이 전략 초기화: "
@@ -583,6 +585,8 @@ class MultidayTrendATRStrategy:
         gap_pct: float = 0.0,
         open_vs_prev_high_pct: float = 0.0,
         max_allowed_pct: float = 0.0,
+        entry_reference_price: float = 0.0,
+        entry_reference_label: str = "prev_high",
         signal_time: Optional[datetime] = None,
     ) -> Dict[str, Any]:
         return {
@@ -596,6 +600,8 @@ class MultidayTrendATRStrategy:
             "gap_pct": float(gap_pct or 0.0),
             "open_vs_prev_high_pct": float(open_vs_prev_high_pct or 0.0),
             "max_allowed_pct": float(max_allowed_pct or 0.0),
+            "entry_reference_price": float(entry_reference_price or 0.0),
+            "entry_reference_label": str(entry_reference_label or "prev_high"),
             "signal_time": signal_time.isoformat() if signal_time is not None else None,
         }
 
@@ -614,10 +620,89 @@ class MultidayTrendATRStrategy:
         return check_time.astimezone(KST)
 
     @staticmethod
+    def _market_open_at(decision_time: datetime) -> datetime:
+        return decision_time.replace(
+            hour=MARKET_OPEN.hour,
+            minute=MARKET_OPEN.minute,
+            second=0,
+            microsecond=0,
+        )
+
+    @staticmethod
     def _asset_type_max_pct(asset_type: str, etf_value: float, stock_value: float) -> float:
         if str(asset_type or ASSET_TYPE_STOCK).upper() == ASSET_TYPE_ETF:
             return max(float(etf_value or 0.0), 0.0)
         return max(float(stock_value or 0.0), 0.0)
+
+    def _resolve_breakout_cap_pct(
+        self,
+        *,
+        asset_type: str,
+        decision_time: datetime,
+        atr: float,
+        reference_price: float,
+    ) -> Tuple[float, Dict[str, Any]]:
+        if not bool(getattr(settings, "ENABLE_BREAKOUT_EXTENSION_CAP", False)):
+            return 0.0, {
+                "max_allowed_pct": 0.0,
+                "breakout_cap_source": "",
+                "breakout_cap_base_pct": 0.0,
+                "breakout_cap_opening_pct": 0.0,
+                "breakout_cap_atr_pct": 0.0,
+                "breakout_cap_hard_pct": 0.0,
+            }
+
+        base_cap_pct = self._asset_type_max_pct(
+            asset_type,
+            getattr(settings, "MAX_BREAKOUT_EXTENSION_PCT_ETF", 0.0),
+            getattr(settings, "MAX_BREAKOUT_EXTENSION_PCT_STOCK", 0.0),
+        )
+        opening_cap_pct = 0.0
+        opening_cap_minutes = max(int(getattr(settings, "BREAKOUT_EXTENSION_OPENING_CAP_MINUTES", 0) or 0), 0)
+        market_open_at = self._market_open_at(decision_time)
+        if opening_cap_minutes > 0 and market_open_at <= decision_time < market_open_at + timedelta(minutes=opening_cap_minutes):
+            opening_cap_pct = self._asset_type_max_pct(
+                asset_type,
+                getattr(settings, "MAX_BREAKOUT_EXTENSION_PCT_ETF_OPENING", 0.0),
+                getattr(settings, "MAX_BREAKOUT_EXTENSION_PCT_STOCK_OPENING", 0.0),
+            )
+
+        atr_cap_pct = 0.0
+        if (
+            bool(getattr(settings, "ENABLE_BREAKOUT_EXTENSION_ATR_CAP", False))
+            and atr > 0
+            and reference_price > 0
+        ):
+            atr_multiplier = max(float(getattr(settings, "BREAKOUT_EXTENSION_ATR_MULTIPLIER", 0.0) or 0.0), 0.0)
+            atr_cap_pct = max((float(atr or 0.0) / float(reference_price or 0.0)) * atr_multiplier, 0.0)
+
+        hard_cap_pct = self._asset_type_max_pct(
+            asset_type,
+            getattr(settings, "MAX_BREAKOUT_EXTENSION_PCT_ETF_HARD", 0.0),
+            getattr(settings, "MAX_BREAKOUT_EXTENSION_PCT_STOCK_HARD", 0.0),
+        )
+
+        cap_candidates = {
+            "base": base_cap_pct,
+            "opening": opening_cap_pct,
+            "atr": atr_cap_pct,
+        }
+        resolved_cap_pct = max(cap_candidates.values())
+        resolved_source = ""
+        if resolved_cap_pct > 0:
+            resolved_source = max(cap_candidates, key=cap_candidates.get)
+        if hard_cap_pct > 0 and (resolved_cap_pct <= 0 or resolved_cap_pct > hard_cap_pct):
+            resolved_cap_pct = hard_cap_pct
+            resolved_source = "hard_cap"
+
+        return resolved_cap_pct, {
+            "max_allowed_pct": resolved_cap_pct,
+            "breakout_cap_source": resolved_source,
+            "breakout_cap_base_pct": base_cap_pct,
+            "breakout_cap_opening_pct": opening_cap_pct,
+            "breakout_cap_atr_pct": atr_cap_pct,
+            "breakout_cap_hard_pct": hard_cap_pct,
+        }
 
     def _apply_shared_entry_guards(
         self,
@@ -629,7 +714,10 @@ class MultidayTrendATRStrategy:
         trigger_price: float,
         prev_close: float,
         check_time: Optional[datetime],
+        atr: float = 0.0,
         base_meta: Optional[Dict[str, Any]] = None,
+        skip_breakout_extension_cap: bool = False,
+        skip_entry_gap_filter: bool = False,
     ) -> Tuple[bool, str, Dict[str, Any]]:
         decision_time = self._resolve_entry_time(check_time)
         asset_type = detect_asset_type(stock_code=stock_code, stock_name=stock_name)
@@ -641,21 +729,20 @@ class MultidayTrendATRStrategy:
             current_price=current_price,
             open_price=open_price,
             extension_pct=extension_pct,
+            entry_reference_price=trigger_price,
+            entry_reference_label="prev_high",
             signal_time=decision_time,
         )
         if base_meta:
             entry_meta.update(dict(base_meta))
+        entry_meta.setdefault("entry_reference_price", float(trigger_price or 0.0))
+        entry_meta.setdefault("entry_reference_label", "prev_high")
         entry_meta.setdefault("strategy_tag", "trend_atr")
 
         if bool(getattr(settings, "ENABLE_OPENING_NO_ENTRY_GUARD", False)):
             guard_minutes = max(int(getattr(settings, "OPENING_NO_ENTRY_MINUTES", 0) or 0), 0)
             if guard_minutes > 0:
-                market_open_at = decision_time.replace(
-                    hour=MARKET_OPEN.hour,
-                    minute=MARKET_OPEN.minute,
-                    second=0,
-                    microsecond=0,
-                )
+                market_open_at = self._market_open_at(decision_time)
                 guard_end_at = market_open_at + timedelta(minutes=guard_minutes)
                 minutes_since_open = max((decision_time - market_open_at).total_seconds() / 60.0, 0.0)
                 if market_open_at <= decision_time < guard_end_at:
@@ -675,12 +762,14 @@ class MultidayTrendATRStrategy:
                     )
                     return False, "장초 신규 BUY 금지 시간", entry_meta
 
-        if bool(getattr(settings, "ENABLE_BREAKOUT_EXTENSION_CAP", False)):
-            max_extension_pct = self._asset_type_max_pct(
-                asset_type,
-                getattr(settings, "MAX_BREAKOUT_EXTENSION_PCT_ETF", 0.0),
-                getattr(settings, "MAX_BREAKOUT_EXTENSION_PCT_STOCK", 0.0),
+        if not skip_breakout_extension_cap and bool(getattr(settings, "ENABLE_BREAKOUT_EXTENSION_CAP", False)):
+            max_extension_pct, cap_meta = self._resolve_breakout_cap_pct(
+                asset_type=asset_type,
+                decision_time=decision_time,
+                atr=float(atr or 0.0),
+                reference_price=float(trigger_price or 0.0),
             )
+            entry_meta.update(cap_meta)
             if max_extension_pct > 0 and extension_pct > max_extension_pct:
                 self._log_entry_block(
                     "breakout_extension_exceeded",
@@ -699,7 +788,7 @@ class MultidayTrendATRStrategy:
                 )
                 return False, "돌파 확장폭 상한 초과", entry_meta
 
-        if bool(getattr(settings, "ENABLE_ENTRY_GAP_FILTER", False)) and open_price and open_price > 0:
+        if not skip_entry_gap_filter and bool(getattr(settings, "ENABLE_ENTRY_GAP_FILTER", False)) and open_price and open_price > 0:
             max_entry_gap_pct = self._asset_type_max_pct(
                 asset_type,
                 getattr(settings, "MAX_ENTRY_GAP_PCT_ETF", 0.0),
@@ -823,6 +912,7 @@ class MultidayTrendATRStrategy:
             trigger_price=prev_high,
             prev_close=float(prev_close or 0.0),
             check_time=decision_time,
+            atr=float(atr or 0.0),
             base_meta={"strategy_tag": "trend_atr"},
         )
         if not guards_ok:
@@ -869,6 +959,7 @@ class MultidayTrendATRStrategy:
         market_venue: Optional[object] = None,
         has_pending_order: bool = False,
         market_regime_snapshot: Optional[object] = None,
+        intraday_bars: Optional[list[dict]] = None,
     ) -> TradingSignal:
         """
         매매 시그널 생성
@@ -1022,6 +1113,7 @@ class MultidayTrendATRStrategy:
                 trigger_price=float(pullback_candidate.trigger_price or 0.0),
                 prev_close=float(latest_prev_close or 0.0),
                 check_time=check_time,
+                atr=float(pullback_candidate.atr or 0.0),
                 base_meta=dict(pullback_candidate.meta or {}),
             )
             pullback_meta.update(
@@ -1060,7 +1152,89 @@ class MultidayTrendATRStrategy:
                 reason=pullback_candidate.reason,
                 atr=pullback_candidate.atr,
                 trend=trend,
-                meta=pullback_meta,
+                    meta=pullback_meta,
+                )
+
+        orb_candidate = self.orb_strategy.evaluate(
+            df=df_with_indicators,
+            current_price=current_price,
+            open_price=open_price,
+            intraday_bars=intraday_bars,
+            stock_code=stock_code,
+            stock_name=stock_name,
+            check_time=check_time,
+            market_phase=market_phase,
+            market_venue=market_venue,
+            has_existing_position=self.has_position,
+            has_pending_order=has_pending_order,
+            market_regime_snapshot=market_regime_snapshot,
+        )
+        if orb_candidate.decision == ORBDecision.BLOCKED:
+            orb_meta = dict(orb_candidate.meta or {})
+            return TradingSignal(
+                signal_type=SignalType.HOLD,
+                price=current_price,
+                reason=orb_candidate.reason,
+                atr=current_atr,
+                trend=trend,
+                reason_code=str(orb_candidate.reason_code or ""),
+                meta=orb_meta,
+            )
+
+        if orb_candidate.decision == ORBDecision.BUY:
+            latest_prev_close = latest.get("prev_close", 0.0)
+            if pd.isna(latest_prev_close):
+                latest_prev_close = 0.0
+            guards_ok, guard_reason, orb_meta = self._apply_shared_entry_guards(
+                stock_code=stock_code,
+                stock_name=stock_name,
+                current_price=current_price,
+                open_price=open_price,
+                trigger_price=float(orb_candidate.trigger_price or 0.0),
+                prev_close=float(latest_prev_close or 0.0),
+                check_time=check_time,
+                atr=float(orb_candidate.atr or 0.0),
+                base_meta=dict(orb_candidate.meta or {}),
+                skip_breakout_extension_cap=True,
+                skip_entry_gap_filter=True,
+            )
+            orb_meta.update(
+                {
+                    "strategy_tag": orb_candidate.meta.get("strategy_tag", "opening_range_breakout"),
+                    "adx": float(orb_candidate.meta.get("adx", latest.get("adx", 0.0)) or 0.0),
+                }
+            )
+            if not guards_ok:
+                return TradingSignal(
+                    signal_type=SignalType.HOLD,
+                    price=current_price,
+                    reason=guard_reason,
+                    atr=current_atr,
+                    trend=trend,
+                    reason_code=str(orb_meta.get("reason_code") or ""),
+                    meta=orb_meta,
+                )
+
+            stop_loss = self.calculate_stop_loss(current_price, orb_candidate.atr)
+            take_profit = self.calculate_take_profit(current_price, orb_candidate.atr)
+
+            trade_logger.log_signal(
+                signal_type="BUY",
+                stock_code=stock_code,
+                price=current_price,
+                reason=orb_candidate.reason,
+            )
+
+            return TradingSignal(
+                signal_type=SignalType.BUY,
+                price=current_price,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                trailing_stop=stop_loss,
+                reason=orb_candidate.reason,
+                atr=orb_candidate.atr,
+                trend=trend,
+                meta=orb_meta,
             )
 
         can_enter, entry_reason, entry_atr, entry_meta = self.check_entry_conditions(

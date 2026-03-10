@@ -81,6 +81,35 @@ def test_multiday_buy_fails_when_entry_gap_filter_blocks_open_gap(sample_uptrend
     assert signal.reason_code == "entry_gap_filter"
 
 
+def test_multiday_buy_allows_opening_extension_when_adaptive_cap_is_wider(sample_uptrend_df):
+    strategy = MultidayTrendATRStrategy()
+    df_with_indicators = strategy.add_indicators(sample_uptrend_df)
+    prev_high = float(df_with_indicators.iloc[-1]["prev_high"])
+    prev_close = float(df_with_indicators.iloc[-1]["prev_close"])
+
+    with patch.object(multiday_trend_atr.settings, "ENABLE_BREAKOUT_EXTENSION_CAP", True), \
+         patch.object(multiday_trend_atr.settings, "MAX_BREAKOUT_EXTENSION_PCT_STOCK", 0.005), \
+         patch.object(multiday_trend_atr.settings, "MAX_BREAKOUT_EXTENSION_PCT_ETF", 0.004), \
+         patch.object(multiday_trend_atr.settings, "BREAKOUT_EXTENSION_OPENING_CAP_MINUTES", 90), \
+         patch.object(multiday_trend_atr.settings, "MAX_BREAKOUT_EXTENSION_PCT_STOCK_OPENING", 0.015), \
+         patch.object(multiday_trend_atr.settings, "MAX_BREAKOUT_EXTENSION_PCT_ETF_OPENING", 0.012), \
+         patch.object(multiday_trend_atr.settings, "ENABLE_BREAKOUT_EXTENSION_ATR_CAP", False), \
+         patch.object(multiday_trend_atr.settings, "ENABLE_ENTRY_GAP_FILTER", False), \
+         patch.object(multiday_trend_atr.settings, "ENABLE_OPENING_NO_ENTRY_GUARD", False):
+        signal = strategy.generate_signal(
+            df=sample_uptrend_df,
+            current_price=prev_high * 1.009,
+            open_price=prev_close * 1.001,
+            stock_code="005930",
+            stock_name="삼성전자",
+            check_time=_kst_dt(2026, 2, 16, 9, 35),
+        )
+
+    assert signal.signal_type == SignalType.BUY
+    assert signal.meta["max_allowed_pct"] == 0.015
+    assert signal.meta["breakout_cap_source"] == "opening"
+
+
 def test_multiday_buy_fails_when_opening_guard_active(sample_uptrend_df):
     strategy = MultidayTrendATRStrategy()
     df_with_indicators = strategy.add_indicators(sample_uptrend_df)
