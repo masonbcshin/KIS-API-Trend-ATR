@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import threading
 import sys
@@ -14,8 +14,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import strategy.multiday_trend_atr as multiday_trend_atr
-from engine.pullback_pipeline_stores import ArmedCandidateStore, DirtySymbolSet, EntryIntentQueue
-from engine.pullback_pipeline_workers import PullbackTimingWorker
+from engine.pullback_pipeline_models import DailyContext
+from engine.pullback_pipeline_stores import ArmedCandidateStore, DailyContextStore, DirtySymbolSet, EntryIntentQueue
+from engine.pullback_pipeline_workers import DailyRefreshThread, PullbackSetupWorker, PullbackTimingWorker
 from strategy.multiday_trend_atr import MultidayTrendATRStrategy, SignalType
 from strategy.pullback_rebreakout import PullbackDecision, PullbackRebreakoutStrategy
 from utils.market_hours import KST
@@ -24,6 +25,10 @@ from utils.market_phase import VenueMarketPhase
 
 def _kst_dt(year: int, month: int, day: int, hour: int, minute: int) -> datetime:
     return KST.localize(datetime(year, month, day, hour, minute, 0))
+
+
+def _today_trade_date() -> str:
+    return datetime.now(KST).date().isoformat()
 
 
 def _make_pullback_indicator_df() -> pd.DataFrame:
@@ -67,6 +72,7 @@ def _patch_pullback_enabled():
         multiday_trend_atr.settings,
         ENABLE_PULLBACK_REBREAKOUT_STRATEGY=True,
         ENABLE_THREADED_PULLBACK_PIPELINE=True,
+        ENABLE_PULLBACK_DAILY_REFRESH_THREAD=False,
         PULLBACK_LOOKBACK_BARS=12,
         PULLBACK_SWING_LOOKBACK_BARS=15,
         PULLBACK_MIN_PULLBACK_PCT=0.015,
@@ -79,6 +85,10 @@ def _patch_pullback_enabled():
         PULLBACK_ALLOWED_ENTRY_VENUES="KRX",
         PULLBACK_BLOCK_IF_EXISTING_POSITION=True,
         PULLBACK_BLOCK_IF_PENDING_ORDER=True,
+        DAILY_CONTEXT_REFRESH_SEC=60,
+        DAILY_CONTEXT_FORCE_REFRESH_ON_TRADE_DATE_CHANGE=True,
+        DAILY_CONTEXT_STORE_MAX_SYMBOLS=256,
+        DAILY_CONTEXT_STALE_SEC=180,
         ENABLE_OPENING_NO_ENTRY_GUARD=False,
         ENABLE_BREAKOUT_EXTENSION_CAP=False,
         ENABLE_ENTRY_GAP_FILTER=False,
@@ -124,11 +134,79 @@ class _TimingExecutorStub:
     def fetch_quote_snapshot(self):
         return dict(self._quote_snapshot)
 
+    def get_cached_pullback_quote_snapshot(self):
+        return dict(self._quote_snapshot)
+
     def fetch_cached_intraday_bars_if_available(self, n: int = 120):
         return []
 
     def _has_active_pending_buy_order(self):
         return self._pending_buy
+
+
+class _DailyRefreshExecutorStub:
+    def __init__(self):
+        self.stock_code = "005930"
+        self.strategy = type("StrategyStub", (), {})()
+        self.strategy.has_position = False
+        self.strategy.position = None
+        self.strategy.pullback_strategy = PullbackRebreakoutStrategy()
+        self.strategy.add_indicators = self._add_indicators
+        self.market_phase_context = VenueMarketPhase.KRX_CONTINUOUS
+        self.market_venue_context = "KRX"
+        self.market_regime_snapshot = None
+        self._pullback_daily_context_version = ""
+        self._pullback_threaded_context_version = ""
+        self._pullback_setup_skip_reason = ""
+        self._pullback_latest_quote_snapshot = {
+            "stock_code": "005930",
+            "stock_name": "삼성전자",
+            "current_price": 175.2,
+            "open_price": 173.4,
+            "received_at": _kst_dt(2026, 2, 20, 10, 30),
+        }
+        self.fetch_market_data_for_symbol_calls = 0
+        self.fetch_market_data_called = 0
+
+    @staticmethod
+    def _add_indicators(df):
+        prepared = _make_pullback_indicator_df()
+        if "date" in df.columns and len(df) == len(prepared):
+            prepared["date"] = pd.to_datetime(df["date"]).values
+        return prepared
+
+    def fetch_market_data_for_symbol(self, stock_code: str):
+        self.fetch_market_data_for_symbol_calls += 1
+        df = _make_pullback_indicator_df()[["date", "open", "high", "low", "close", "volume"]].copy()
+        override_dates = getattr(self, "_context_trade_dates", None)
+        if override_dates is not None:
+            df.loc[df.index[-1], "date"] = next(override_dates)
+        else:
+            df.loc[df.index[-1], "date"] = pd.Timestamp(self._trade_date_key())
+        return df
+
+    def fetch_market_data(self):
+        self.fetch_market_data_called += 1
+        raise AssertionError("setup worker should not fetch market data directly when daily refresh is enabled")
+
+    def get_pullback_daily_refresh_symbols(self):
+        return [self.stock_code]
+
+    def get_cached_pullback_quote_snapshot(self):
+        return dict(self._pullback_latest_quote_snapshot)
+
+    def _has_active_pending_buy_order(self):
+        return False
+
+    def _trade_date_key(self, check_time=None):
+        return (check_time or datetime.now(KST)).astimezone(KST).date().isoformat()
+
+    def _extract_market_data_trade_date(self, value):
+        if isinstance(value, pd.Timestamp):
+            return value.date().isoformat()
+        if isinstance(value, datetime):
+            return value.date().isoformat()
+        return str(value)[:10]
 
 
 def test_pullback_rebreakout_buy_signal_when_setup_is_valid():
@@ -502,3 +580,200 @@ def test_duplicate_dirty_events_do_not_create_duplicate_pullback_intents():
     worker._process_symbol(candidate.symbol)
 
     assert entry_queue.qsize() == 1
+
+
+def test_daily_context_store_validates_stale_trade_date_and_version():
+    store = DailyContextStore(max_symbols=8)
+    trade_date = _today_trade_date()
+    refreshed_at = datetime.now(KST)
+    context = DailyContext(
+        symbol="005930",
+        trade_date=trade_date,
+        context_version="ctx-1",
+        recent_bars=tuple(_make_pullback_indicator_df().tail(5).to_dict(orient="records")),
+        prev_high=176.5,
+        prev_close=173.2,
+        atr=2.0,
+        adx=32.0,
+        trend="UPTREND",
+        ma20=171.0,
+        ma50=160.0,
+        swing_high=180.5,
+        swing_low=169.5,
+        refreshed_at=refreshed_at,
+        source="unittest",
+    )
+    store.upsert(context)
+
+    valid, reason = store.get_validated(
+        "005930",
+        expected_trade_date=trade_date,
+        stale_after_sec=180,
+        expected_context_version="ctx-1",
+        now=refreshed_at + timedelta(seconds=30),
+    )
+    stale, stale_reason = store.get_validated(
+        "005930",
+        expected_trade_date=trade_date,
+        stale_after_sec=10,
+        now=refreshed_at + timedelta(seconds=30),
+    )
+    mismatch, mismatch_reason = store.get_validated(
+        "005930",
+        expected_trade_date="2099-01-01",
+        stale_after_sec=180,
+        now=refreshed_at + timedelta(seconds=30),
+    )
+    version_mismatch, version_reason = store.get_validated(
+        "005930",
+        expected_trade_date=trade_date,
+        expected_context_version="ctx-2",
+        stale_after_sec=180,
+        now=refreshed_at + timedelta(seconds=30),
+    )
+
+    assert valid is not None
+    assert reason == ""
+    assert stale is None
+    assert stale_reason == "stale"
+    assert mismatch is None
+    assert mismatch_reason == "trade_date_mismatch"
+    assert version_mismatch is None
+    assert version_reason == "version_mismatch"
+
+
+def test_daily_context_store_overwrite_updates_context_version():
+    store = DailyContextStore(max_symbols=8)
+    trade_date = _today_trade_date()
+    base = DailyContext(
+        symbol="005930",
+        trade_date=trade_date,
+        context_version="ctx-1",
+        recent_bars=tuple(_make_pullback_indicator_df().tail(5).to_dict(orient="records")),
+        prev_high=176.5,
+        prev_close=173.2,
+        atr=2.0,
+        adx=32.0,
+        trend="UPTREND",
+        ma20=171.0,
+        ma50=160.0,
+        swing_high=180.5,
+        swing_low=169.5,
+        refreshed_at=datetime.now(KST),
+        source="unittest",
+    )
+    store.upsert(base)
+    store.upsert(replace(base, context_version="ctx-2"))
+
+    assert store.get("005930").context_version == "ctx-2"
+
+
+def test_daily_refresh_thread_populates_daily_context_store():
+    executor = _DailyRefreshExecutorStub()
+    store = DailyContextStore(max_symbols=8)
+    worker = DailyRefreshThread(
+        executor=executor,
+        daily_context_store=store,
+        stop_event=threading.Event(),
+        on_error=lambda *_args: None,
+    )
+
+    with _patch_pullback_enabled(), patch.object(multiday_trend_atr.settings, "ENABLE_PULLBACK_DAILY_REFRESH_THREAD", True):
+        worker._run_cycle()
+
+    context = store.get("005930")
+    assert context is not None
+    assert context.trade_date == _today_trade_date()
+    assert context.context_version
+    assert executor.fetch_market_data_for_symbol_calls == 1
+
+
+def test_setup_worker_reads_daily_context_store_only_when_enabled():
+    executor = _DailyRefreshExecutorStub()
+    context_store = DailyContextStore(max_symbols=8)
+    refresh_worker = DailyRefreshThread(
+        executor=executor,
+        daily_context_store=context_store,
+        stop_event=threading.Event(),
+        on_error=lambda *_args: None,
+    )
+    setup_worker = PullbackSetupWorker(
+        executor=executor,
+        candidate_store=ArmedCandidateStore(),
+        daily_context_store=context_store,
+        dirty_symbols=DirtySymbolSet(),
+        stop_event=threading.Event(),
+        on_error=lambda *_args: None,
+    )
+
+    with _patch_pullback_enabled(), patch.object(multiday_trend_atr.settings, "ENABLE_PULLBACK_DAILY_REFRESH_THREAD", True):
+        refresh_worker._run_cycle()
+        setup_worker._run_cycle()
+
+    assert executor.fetch_market_data_called == 0
+    assert setup_worker._candidate_store.get("005930") is not None
+
+
+def test_setup_worker_skips_stale_daily_context():
+    executor = _DailyRefreshExecutorStub()
+    context_store = DailyContextStore(max_symbols=8)
+    refreshed_at = datetime.now(KST) - timedelta(minutes=10)
+    stale_context = DailyContext(
+        symbol="005930",
+        trade_date=_today_trade_date(),
+        context_version="ctx-1",
+        recent_bars=tuple(_make_pullback_indicator_df().tail(50).to_dict(orient="records")),
+        prev_high=176.5,
+        prev_close=173.2,
+        atr=2.0,
+        adx=32.0,
+        trend="UPTREND",
+        ma20=171.0,
+        ma50=160.0,
+        swing_high=180.5,
+        swing_low=169.5,
+        refreshed_at=refreshed_at,
+        source="unittest",
+    )
+    context_store.upsert(stale_context)
+    executor._pullback_daily_context_version = "ctx-1"
+    setup_worker = PullbackSetupWorker(
+        executor=executor,
+        candidate_store=ArmedCandidateStore(),
+        daily_context_store=context_store,
+        dirty_symbols=DirtySymbolSet(),
+        stop_event=threading.Event(),
+        on_error=lambda *_args: None,
+    )
+
+    with _patch_pullback_enabled(), \
+         patch.object(multiday_trend_atr.settings, "ENABLE_PULLBACK_DAILY_REFRESH_THREAD", True), \
+         patch.object(multiday_trend_atr.settings, "DAILY_CONTEXT_STALE_SEC", 60):
+        setup_worker._run_cycle()
+
+    assert setup_worker._candidate_store.get("005930") is None
+    assert executor._pullback_setup_skip_reason == "stale"
+
+
+def test_daily_refresh_thread_force_refreshes_on_trade_date_change():
+    executor = _DailyRefreshExecutorStub()
+    executor._context_trade_dates = iter([pd.Timestamp("2026-02-20"), pd.Timestamp("2026-02-21")])
+    store = DailyContextStore(max_symbols=8)
+    worker = DailyRefreshThread(
+        executor=executor,
+        daily_context_store=store,
+        stop_event=threading.Event(),
+        on_error=lambda *_args: None,
+    )
+    times = iter([
+        _kst_dt(2026, 2, 20, 10, 30),
+        _kst_dt(2026, 2, 21, 9, 1),
+    ])
+    worker._now = lambda: next(times)
+
+    with _patch_pullback_enabled(), patch.object(multiday_trend_atr.settings, "ENABLE_PULLBACK_DAILY_REFRESH_THREAD", True):
+        worker._run_cycle()
+        worker._run_cycle()
+
+    assert executor.fetch_market_data_for_symbol_calls == 2
+    assert store.get("005930").trade_date == "2026-02-21"

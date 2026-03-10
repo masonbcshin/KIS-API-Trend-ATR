@@ -65,10 +65,12 @@ try:
     from kis_trend_atr_trading.core.market_data import MarketDataProvider
     from kis_trend_atr_trading.engine.pullback_pipeline_stores import (
         ArmedCandidateStore,
+        DailyContextStore,
         DirtySymbolSet,
         EntryIntentQueue,
     )
     from kis_trend_atr_trading.engine.pullback_pipeline_workers import (
+        DailyRefreshThread,
         PullbackSetupWorker,
         PullbackTimingWorker,
         OrderExecutionWorker,
@@ -126,8 +128,14 @@ except ImportError:
     from db.repository import get_trade_repository
     from db.mysql import get_db_manager, QueryError
     from core.market_data import MarketDataProvider
-    from engine.pullback_pipeline_stores import ArmedCandidateStore, DirtySymbolSet, EntryIntentQueue
+    from engine.pullback_pipeline_stores import (
+        ArmedCandidateStore,
+        DailyContextStore,
+        DirtySymbolSet,
+        EntryIntentQueue,
+    )
     from engine.pullback_pipeline_workers import (
+        DailyRefreshThread,
         PullbackSetupWorker,
         PullbackTimingWorker,
         OrderExecutionWorker,
@@ -384,15 +392,23 @@ class MultidayExecutor:
         self._last_fast_risk_sync_at: Optional[datetime] = None
         self._pullback_pipeline_stop_event: Optional[threading.Event] = None
         self._pullback_candidate_store: Optional[ArmedCandidateStore] = None
+        self._pullback_daily_context_store: Optional[DailyContextStore] = None
         self._pullback_dirty_symbols: Optional[DirtySymbolSet] = None
         self._pullback_entry_queue: Optional[EntryIntentQueue] = None
+        self._pullback_daily_refresh_worker: Optional[DailyRefreshThread] = None
         self._pullback_setup_worker: Optional[PullbackSetupWorker] = None
         self._pullback_timing_worker: Optional[PullbackTimingWorker] = None
         self._pullback_order_worker: Optional[OrderExecutionWorker] = None
         self._pullback_quote_unsubscribe: Optional[Any] = None
         self._pullback_threaded_context_version: str = ""
+        self._pullback_daily_context_version: str = ""
+        self._pullback_latest_quote_snapshot: Dict[str, Any] = {}
         self._threaded_pullback_pipeline_disabled: bool = False
+        self._daily_context_refresh_ms: float = 0.0
+        self._daily_context_refresh_count: int = 0
+        self._daily_context_store_size: int = 0
         self._pullback_setup_eval_ms: float = 0.0
+        self._pullback_setup_skip_reason: str = ""
         self._pullback_timing_eval_ms: float = 0.0
         self._pullback_intent_queue_depth: int = 0
         self._pullback_end_to_end_latency_ms: float = 0.0
@@ -499,6 +515,11 @@ class MultidayExecutor:
             and not bool(getattr(self, "_threaded_pullback_pipeline_disabled", False))
         )
 
+    def _is_pullback_daily_refresh_enabled(self) -> bool:
+        return self._is_threaded_pullback_pipeline_enabled() and bool(
+            getattr(settings, "ENABLE_PULLBACK_DAILY_REFRESH_THREAD", False)
+        )
+
     def _is_threaded_pullback_pipeline_running(self) -> bool:
         stop_event = getattr(self, "_pullback_pipeline_stop_event", None)
         workers = (
@@ -532,13 +553,24 @@ class MultidayExecutor:
         self._stop_threaded_pullback_pipeline()
         self._pullback_pipeline_stop_event = threading.Event()
         self._pullback_candidate_store = ArmedCandidateStore()
+        self._pullback_daily_context_store = DailyContextStore(
+            max_symbols=max(int(getattr(settings, "DAILY_CONTEXT_STORE_MAX_SYMBOLS", 256) or 256), 1)
+        )
         self._pullback_dirty_symbols = DirtySymbolSet()
         self._pullback_entry_queue = EntryIntentQueue(
             maxsize=max(int(getattr(settings, "PULLBACK_ENTRY_INTENT_QUEUE_MAXSIZE", 256) or 256), 1)
         )
+        if self._is_pullback_daily_refresh_enabled():
+            self._pullback_daily_refresh_worker = DailyRefreshThread(
+                executor=self,
+                daily_context_store=self._pullback_daily_context_store,
+                stop_event=self._pullback_pipeline_stop_event,
+                on_error=self._handle_pullback_pipeline_worker_error,
+            )
         self._pullback_setup_worker = PullbackSetupWorker(
             executor=self,
             candidate_store=self._pullback_candidate_store,
+            daily_context_store=self._pullback_daily_context_store,
             dirty_symbols=self._pullback_dirty_symbols,
             stop_event=self._pullback_pipeline_stop_event,
             on_error=self._handle_pullback_pipeline_worker_error,
@@ -567,6 +599,15 @@ class MultidayExecutor:
                         return
                     if str(symbol).zfill(6) != str(self.stock_code).zfill(6):
                         return
+                    self.update_pullback_quote_snapshot(
+                        {
+                            "stock_code": str(symbol).zfill(6),
+                            **dict(_snapshot or {}),
+                            "data_feed": "ws",
+                            "source": str((_snapshot or {}).get("source") or "ws_tick"),
+                            "ws_connected": True,
+                        }
+                    )
                     dirty_symbols.mark(symbol)
 
                 self._pullback_quote_unsubscribe = subscribe_quotes(_on_quote)
@@ -574,6 +615,13 @@ class MultidayExecutor:
                 logger.warning("[PULLBACK_PIPELINE] quote subscription unavailable: %s", exc)
                 self._pullback_quote_unsubscribe = None
 
+        try:
+            self.update_pullback_quote_snapshot(self.fetch_quote_snapshot())
+        except Exception:
+            pass
+
+        if self._pullback_daily_refresh_worker is not None:
+            self._pullback_daily_refresh_worker.start()
         self._pullback_setup_worker.start()
         self._pullback_timing_worker.start()
         self._pullback_order_worker.start()
@@ -594,6 +642,7 @@ class MultidayExecutor:
 
         current_thread = threading.current_thread()
         for attr_name in (
+            "_pullback_daily_refresh_worker",
             "_pullback_setup_worker",
             "_pullback_timing_worker",
             "_pullback_order_worker",
@@ -609,7 +658,9 @@ class MultidayExecutor:
         self._pullback_entry_queue = None
         self._pullback_dirty_symbols = None
         self._pullback_candidate_store = None
+        self._pullback_daily_context_store = None
         self._pullback_threaded_context_version = ""
+        self._pullback_daily_context_version = ""
 
     def fetch_cached_intraday_bars_if_available(self, n: int = 120) -> list[dict]:
         provider = getattr(self, "market_data_provider", None)
@@ -641,7 +692,11 @@ class MultidayExecutor:
 
     def _pullback_pipeline_metrics(self) -> Dict[str, Any]:
         return {
+            "daily_context_refresh_ms": float(getattr(self, "_daily_context_refresh_ms", 0.0) or 0.0),
+            "daily_context_refresh_count": int(getattr(self, "_daily_context_refresh_count", 0) or 0),
+            "daily_context_store_size": int(getattr(self, "_daily_context_store_size", 0) or 0),
             "pullback_setup_eval_ms": float(getattr(self, "_pullback_setup_eval_ms", 0.0) or 0.0),
+            "pullback_setup_skip_reason": str(getattr(self, "_pullback_setup_skip_reason", "") or ""),
             "pullback_timing_eval_ms": float(getattr(self, "_pullback_timing_eval_ms", 0.0) or 0.0),
             "pullback_intent_queue_depth": int(getattr(self, "_pullback_intent_queue_depth", 0) or 0),
             "pullback_end_to_end_latency_ms": float(
@@ -654,6 +709,31 @@ class MultidayExecutor:
             ),
             "pullback_timing_skip_reason": str(getattr(self, "_pullback_timing_skip_reason", "") or ""),
         }
+
+    def update_pullback_quote_snapshot(self, snapshot: Optional[Dict[str, Any]]) -> None:
+        if not isinstance(snapshot, dict) or not snapshot:
+            return
+        current = dict(getattr(self, "_pullback_latest_quote_snapshot", {}) or {})
+        merged = dict(current)
+        for key, value in snapshot.items():
+            if value is not None:
+                merged[key] = value
+        merged.setdefault("stock_code", str(self.stock_code).zfill(6))
+        self._pullback_latest_quote_snapshot = merged
+
+    def get_cached_pullback_quote_snapshot(self) -> Dict[str, Any]:
+        return dict(getattr(self, "_pullback_latest_quote_snapshot", {}) or {})
+
+    def get_pullback_daily_refresh_symbols(self) -> List[str]:
+        symbols: List[str] = []
+        primary = str(self.stock_code or "").zfill(6)
+        if primary:
+            symbols.append(primary)
+        position = getattr(self.strategy, "position", None)
+        held_symbol = str(getattr(position, "symbol", "") or "").zfill(6)
+        if held_symbol and held_symbol not in symbols:
+            symbols.append(held_symbol)
+        return symbols
 
     def retry_entry_unblock_via_resync(self) -> bool:
         """재동기화 재시도로 sticky 차단 해제를 시도."""
@@ -1505,17 +1585,17 @@ class MultidayExecutor:
     # 데이터 조회
     # ════════════════════════════════════════════════════════════════
     
-    def fetch_market_data(self) -> pd.DataFrame:
-        """시장 데이터 조회"""
+    def fetch_market_data_for_symbol(self, stock_code: str) -> pd.DataFrame:
+        """지정 종목의 일봉 시장 데이터 조회"""
         try:
             if self.market_data_provider is not None:
                 bars = self.market_data_provider.get_recent_bars(
-                    stock_code=self.stock_code,
+                    stock_code=stock_code,
                     n=100,
                     timeframe="D",
                 )
                 if not bars:
-                    logger.warning(f"시장 데이터 없음(provider): {self.stock_code}")
+                    logger.warning(f"시장 데이터 없음(provider): {stock_code}")
                     return pd.DataFrame()
                 df = pd.DataFrame(bars)
                 if "date" in df.columns:
@@ -1524,18 +1604,22 @@ class MultidayExecutor:
 
             self._daily_fetch_count += 1
             df = self.api.get_daily_ohlcv(
-                stock_code=self.stock_code,
+                stock_code=stock_code,
                 period_type="D"
             )
             
             if df.empty:
-                logger.warning(f"시장 데이터 없음: {self.stock_code}")
+                logger.warning(f"시장 데이터 없음: {stock_code}")
             
             return df
             
         except _KIS_API_ERROR_TYPES as e:
             logger.error(f"시장 데이터 조회 실패: {e}")
             return pd.DataFrame()
+
+    def fetch_market_data(self) -> pd.DataFrame:
+        """시장 데이터 조회"""
+        return self.fetch_market_data_for_symbol(self.stock_code)
 
     @staticmethod
     def _normalize_market_data_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -1866,18 +1950,20 @@ class MultidayExecutor:
     def fetch_quote_snapshot(self) -> Dict[str, Any]:
         """현재가/시가/호가/수신시각을 포함한 quote snapshot을 반환합니다."""
         try:
+            snapshot: Dict[str, Any]
             market_data_provider = getattr(self, "market_data_provider", None)
             if market_data_provider is not None:
                 snapshot_fn = getattr(market_data_provider, "get_quote_snapshot", None)
                 if callable(snapshot_fn):
                     snapshot = snapshot_fn(self.stock_code) or {}
                     if snapshot:
+                        self.update_pullback_quote_snapshot(snapshot)
                         return snapshot
 
                 quote_fn = getattr(market_data_provider, "get_latest_price_with_open", None)
                 if callable(quote_fn):
                     current, open_price = quote_fn(self.stock_code)
-                    return {
+                    snapshot = {
                         "stock_code": self.stock_code,
                         "stock_name": None,
                         "current_price": float(current or 0.0),
@@ -1890,10 +1976,12 @@ class MultidayExecutor:
                         "data_feed": "provider",
                         "ws_connected": False,
                     }
+                    self.update_pullback_quote_snapshot(snapshot)
+                    return snapshot
 
                 current = float(market_data_provider.get_latest_price(self.stock_code) or 0.0)
                 price_data = self.api.get_current_price(self.stock_code)
-                return {
+                snapshot = {
                     "stock_code": self.stock_code,
                     "stock_name": price_data.get("stock_name"),
                     "current_price": current,
@@ -1906,9 +1994,11 @@ class MultidayExecutor:
                     "data_feed": "provider",
                     "ws_connected": False,
                 }
+                self.update_pullback_quote_snapshot(snapshot)
+                return snapshot
 
             price_data = self.api.get_current_price(self.stock_code)
-            return {
+            snapshot = {
                 "stock_code": self.stock_code,
                 "stock_name": price_data.get("stock_name"),
                 "current_price": float(price_data.get("current_price", 0.0) or 0.0),
@@ -1921,9 +2011,11 @@ class MultidayExecutor:
                 "data_feed": "rest",
                 "ws_connected": False,
             }
+            self.update_pullback_quote_snapshot(snapshot)
+            return snapshot
         except Exception as e:
             logger.error(f"호가 스냅샷 조회 실패: {e}")
-            return {
+            snapshot = {
                 "stock_code": self.stock_code,
                 "stock_name": None,
                 "current_price": 0.0,
@@ -1936,6 +2028,8 @@ class MultidayExecutor:
                 "data_feed": "unknown",
                 "ws_connected": False,
             }
+            self.update_pullback_quote_snapshot(snapshot)
+            return snapshot
 
     @staticmethod
     def _format_entry_log_value(value: Any) -> str:

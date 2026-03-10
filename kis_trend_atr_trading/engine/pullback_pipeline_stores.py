@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+from collections import OrderedDict
+from datetime import datetime
 import queue
 import threading
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 try:
-    from engine.pullback_pipeline_models import PullbackEntryIntent, PullbackSetupCandidate
+    from engine.pullback_pipeline_models import DailyContext, PullbackEntryIntent, PullbackSetupCandidate
 except ImportError:
     from kis_trend_atr_trading.engine.pullback_pipeline_models import (
+        DailyContext,
         PullbackEntryIntent,
         PullbackSetupCandidate,
     )
@@ -37,6 +40,67 @@ class ArmedCandidateStore:
     def symbols(self) -> List[str]:
         with self._lock:
             return list(self._candidates.keys())
+
+
+class DailyContextStore:
+    def __init__(self, max_symbols: int = 256) -> None:
+        self._lock = threading.Lock()
+        self._max_symbols = max(int(max_symbols), 1)
+        self._contexts: "OrderedDict[str, DailyContext]" = OrderedDict()
+
+    def upsert(self, context: DailyContext) -> None:
+        symbol = str(context.symbol).zfill(6)
+        with self._lock:
+            if symbol in self._contexts:
+                self._contexts.pop(symbol, None)
+            self._contexts[symbol] = context
+            while len(self._contexts) > self._max_symbols:
+                self._contexts.popitem(last=False)
+
+    def get(self, symbol: str) -> Optional[DailyContext]:
+        with self._lock:
+            return self._contexts.get(str(symbol).zfill(6))
+
+    def remove(self, symbol: str) -> Optional[DailyContext]:
+        with self._lock:
+            return self._contexts.pop(str(symbol).zfill(6), None)
+
+    def size(self) -> int:
+        with self._lock:
+            return len(self._contexts)
+
+    def get_validated(
+        self,
+        symbol: str,
+        *,
+        expected_trade_date: Optional[str] = None,
+        stale_after_sec: float = 180.0,
+        expected_context_version: Optional[str] = None,
+        now: Optional[datetime] = None,
+    ) -> Tuple[Optional[DailyContext], str]:
+        context = self.get(symbol)
+        if context is None:
+            return None, "missing"
+        if expected_trade_date and str(context.trade_date) != str(expected_trade_date):
+            return None, "trade_date_mismatch"
+        if expected_context_version and str(context.context_version) != str(expected_context_version):
+            return None, "version_mismatch"
+
+        refreshed_at = context.refreshed_at
+        if not isinstance(refreshed_at, datetime):
+            return None, "stale"
+        current_now = now
+        if current_now is None:
+            current_now = (
+                datetime.now(refreshed_at.tzinfo)
+                if refreshed_at.tzinfo is not None
+                else datetime.now()
+            )
+        if max(float(stale_after_sec or 0.0), 0.0) > 0.0:
+            age_sec = max((current_now - refreshed_at).total_seconds(), 0.0)
+            if age_sec > float(stale_after_sec):
+                return None, "stale"
+        return context, ""
 
 
 class DirtySymbolSet:

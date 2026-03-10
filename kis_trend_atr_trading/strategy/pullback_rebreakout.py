@@ -10,7 +10,7 @@ import pandas as pd
 
 try:
     from config import settings
-    from engine.pullback_pipeline_models import PullbackSetupCandidate, PullbackTimingDecision
+    from engine.pullback_pipeline_models import DailyContext, PullbackSetupCandidate, PullbackTimingDecision
     from utils.logger import get_logger
     from utils.market_hours import KST
     from utils.market_phase import (
@@ -23,6 +23,7 @@ try:
 except ImportError:
     from kis_trend_atr_trading.config import settings
     from kis_trend_atr_trading.engine.pullback_pipeline_models import (
+        DailyContext,
         PullbackSetupCandidate,
         PullbackTimingDecision,
     )
@@ -202,6 +203,7 @@ class PullbackRebreakoutStrategy:
         has_existing_position: bool = False,
         has_pending_order: bool = False,
         market_regime_snapshot: Optional[object] = None,
+        context_version_override: Optional[str] = None,
     ) -> Tuple[Optional[PullbackSetupCandidate], Optional[PullbackCandidate]]:
         if not bool(getattr(settings, "ENABLE_PULLBACK_REBREAKOUT_STRATEGY", False)):
             return None, PullbackCandidate(decision=PullbackDecision.NOOP)
@@ -376,7 +378,11 @@ class PullbackRebreakoutStrategy:
             strategy_tag=self.strategy_tag,
             created_at=now_kst,
             expires_at=self._setup_expiry_at(now_kst),
-            context_version=self._build_context_version(working, phase_context=phase_context),
+            context_version=(
+                str(context_version_override).strip()
+                if str(context_version_override or "").strip()
+                else self._build_context_version(working, phase_context=phase_context)
+            ),
             swing_high=float(swing_high),
             swing_low=float(swing_low),
             micro_high=float(micro_high),
@@ -395,6 +401,36 @@ class PullbackRebreakoutStrategy:
             },
         )
         return candidate, None
+
+    def evaluate_setup_candidate_from_daily_context(
+        self,
+        *,
+        daily_context: DailyContext,
+        current_price: float,
+        stock_code: str,
+        stock_name: str = "",
+        check_time: Optional[datetime] = None,
+        market_phase: Optional[object] = None,
+        market_venue: Optional[object] = None,
+        has_existing_position: bool = False,
+        has_pending_order: bool = False,
+        market_regime_snapshot: Optional[object] = None,
+    ) -> Tuple[Optional[PullbackSetupCandidate], Optional[PullbackCandidate]]:
+        recent_bars = [dict(bar) for bar in tuple(daily_context.recent_bars or ())]
+        df = pd.DataFrame(recent_bars)
+        return self.evaluate_setup_candidate(
+            df=df,
+            current_price=current_price,
+            stock_code=stock_code,
+            stock_name=stock_name,
+            check_time=check_time,
+            market_phase=market_phase,
+            market_venue=market_venue,
+            has_existing_position=has_existing_position,
+            has_pending_order=has_pending_order,
+            market_regime_snapshot=market_regime_snapshot,
+            context_version_override=daily_context.context_version,
+        )
 
     def evaluate_daily_timing(
         self,

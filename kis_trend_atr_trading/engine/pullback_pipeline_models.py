@@ -2,7 +2,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
+
+
+@dataclass(frozen=True)
+class DailyContext:
+    symbol: str
+    trade_date: str
+    context_version: str
+    recent_bars: Tuple[Dict[str, Any], ...]
+    prev_high: float
+    prev_close: float
+    atr: float
+    adx: float
+    trend: str
+    ma20: float
+    ma50: float
+    swing_high: float
+    swing_low: float
+    refreshed_at: datetime
+    source: str
 
 
 @dataclass(frozen=True)
