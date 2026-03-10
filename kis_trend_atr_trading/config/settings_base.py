@@ -512,6 +512,20 @@ DAILY_CONTEXT_FORCE_REFRESH_ON_TRADE_DATE_CHANGE: bool = os.getenv(
 )
 DAILY_CONTEXT_STORE_MAX_SYMBOLS: int = int(os.getenv("DAILY_CONTEXT_STORE_MAX_SYMBOLS", "256"))
 DAILY_CONTEXT_STALE_SEC: int = int(os.getenv("DAILY_CONTEXT_STALE_SEC", "180"))
+ENABLE_RISK_SNAPSHOT_THREAD: bool = os.getenv(
+    "ENABLE_RISK_SNAPSHOT_THREAD",
+    "false",
+).lower() in (
+    "true",
+    "1",
+    "yes",
+)
+RISK_SNAPSHOT_REFRESH_SEC: int = int(os.getenv("RISK_SNAPSHOT_REFRESH_SEC", "30"))
+RISK_SNAPSHOT_TTL_SEC: int = int(os.getenv("RISK_SNAPSHOT_TTL_SEC", "60"))
+HOLDINGS_SNAPSHOT_TTL_SEC: int = int(os.getenv("HOLDINGS_SNAPSHOT_TTL_SEC", "30"))
+ORDER_FINAL_VALIDATION_MODE: str = (
+    str(os.getenv("ORDER_FINAL_VALIDATION_MODE", "light") or "light").strip().lower() or "light"
+)
 
 # 시장 레짐 필터 설정
 # - 1차 버전은 대표 ETF 2개만으로 BUY 상위 필터를 제공합니다.

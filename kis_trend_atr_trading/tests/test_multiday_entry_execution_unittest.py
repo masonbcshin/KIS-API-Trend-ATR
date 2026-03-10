@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 import threading
 import sys
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pandas as pd
@@ -12,8 +13,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import engine.multiday_executor as multiday_executor
-from engine.pullback_pipeline_models import PullbackEntryIntent, PullbackSetupCandidate
-from engine.pullback_pipeline_stores import ArmedCandidateStore, EntryIntentQueue
+from engine.pullback_pipeline_models import (
+    AccountRiskSnapshot,
+    HoldingsRiskSnapshot,
+    PullbackEntryIntent,
+    PullbackSetupCandidate,
+)
+from engine.pullback_pipeline_stores import AccountRiskStore, ArmedCandidateStore, EntryIntentQueue
 from engine.pullback_pipeline_workers import OrderExecutionWorker
 from engine.multiday_executor import MultidayExecutor
 from strategy.multiday_trend_atr import TradingSignal, SignalType, TrendType
@@ -41,6 +47,42 @@ def _make_buy_signal(prev_high: float = 50000.0, strategy_tag: str = "trend_atr"
             "extension_pct": 0.002,
             "strategy_tag": strategy_tag,
         },
+    )
+
+
+def _make_account_snapshot(
+    *,
+    cash_balance: float = 5_000_000.0,
+    total_eval: float = 12_000_000.0,
+    source: str = "background_refresh",
+) -> AccountRiskSnapshot:
+    fetched_at = datetime.now(KST)
+    return AccountRiskSnapshot(
+        fetched_at=fetched_at,
+        total_eval=total_eval,
+        cash_balance=cash_balance,
+        total_pnl=0.0,
+        holdings=(),
+        source=source,
+        success=True,
+        stale=False,
+        version="acct-1",
+    )
+
+
+def _make_holdings_snapshot(
+    *,
+    holdings: tuple[dict, ...] = (),
+    source: str = "background_refresh",
+) -> HoldingsRiskSnapshot:
+    fetched_at = datetime.now(KST)
+    return HoldingsRiskSnapshot(
+        fetched_at=fetched_at,
+        holdings=holdings,
+        source=source,
+        success=True,
+        stale=False,
+        version="hold-1",
     )
 
 
@@ -206,6 +248,7 @@ class _OrderWorkerExecutorStub:
         self.market_venue_context = "KRX"
         self.market_regime_snapshot = None
         self.execute_buy_calls = 0
+        self.cached_account_has_holding = lambda _symbol: False
 
     def _has_active_pending_buy_order(self):
         return False
@@ -296,3 +339,143 @@ def test_order_worker_single_dispatches_pullback_entry_intent_once():
         entry_queue.complete(intent)
 
     assert executor.execute_buy_calls == 1
+
+
+def test_order_worker_prefers_cached_holdings_snapshot_precheck():
+    executor = _OrderWorkerExecutorStub()
+    executor.cached_account_has_holding = lambda symbol: str(symbol).zfill(6) == "005930"
+    store = ArmedCandidateStore()
+    entry_queue = EntryIntentQueue(maxsize=8)
+    worker = OrderExecutionWorker(
+        executor=executor,
+        candidate_store=store,
+        entry_queue=entry_queue,
+        stop_event=threading.Event(),
+        on_error=lambda *_args: None,
+    )
+    candidate = PullbackSetupCandidate(
+        symbol="005930",
+        strategy_tag="pullback_rebreakout",
+        created_at=KST.localize(datetime(2026, 2, 20, 10, 0)),
+        expires_at=KST.localize(datetime(2026, 2, 20, 12, 0)),
+        context_version="ctx-1",
+        swing_high=180.5,
+        swing_low=170.0,
+        micro_high=174.5,
+        atr=2.0,
+        source="daily_setup",
+    )
+    store.upsert(candidate)
+    intent = PullbackEntryIntent(
+        symbol="005930",
+        strategy_tag="pullback_rebreakout",
+        created_at=KST.localize(datetime(2026, 2, 20, 10, 30)),
+        candidate_created_at=candidate.created_at,
+        expires_at=candidate.expires_at,
+        context_version="ctx-1",
+        entry_reference_price=174.5,
+        source="background_refresh",
+    )
+
+    worker._process_intent(intent)
+
+    assert executor.execute_buy_calls == 0
+    assert store.get("005930") is None
+
+
+def test_order_final_validation_uses_fresh_store_snapshot_without_sync_fallback():
+    executor = _make_executor()
+    executor.order_quantity = 2
+    executor._report_mode = "REAL"
+    executor._threaded_pullback_pipeline_disabled = False
+    executor._pullback_account_risk_store = AccountRiskStore()
+    executor._pullback_account_risk_store.replace_account_snapshot(_make_account_snapshot(cash_balance=5_000_000.0))
+    executor._pullback_account_risk_store.replace_holdings_snapshot(_make_holdings_snapshot())
+    executor.api = SimpleNamespace(
+        get_account_balance=lambda: (_ for _ in ()).throw(AssertionError("account fallback should not run")),
+        get_holdings=lambda: (_ for _ in ()).throw(AssertionError("holdings fallback should not run")),
+    )
+
+    with patch.object(multiday_executor.settings, "ENABLE_THREADED_PULLBACK_PIPELINE", True), \
+         patch.object(multiday_executor.settings, "ENABLE_PULLBACK_REBREAKOUT_STRATEGY", True), \
+         patch.object(multiday_executor.settings, "ENABLE_RISK_SNAPSHOT_THREAD", True), \
+         patch.object(multiday_executor.settings, "ORDER_FINAL_VALIDATION_MODE", "light"):
+        result = executor._run_order_final_validation(_make_buy_signal(strategy_tag="pullback_rebreakout"))
+
+    assert result["allowed"] is True
+
+
+def test_order_final_validation_falls_back_sync_when_real_snapshot_is_stale():
+    executor = _make_executor()
+    executor.order_quantity = 1
+    executor._report_mode = "REAL"
+    executor._threaded_pullback_pipeline_disabled = False
+    executor._pullback_account_risk_store = AccountRiskStore()
+    stale_time = KST.localize(datetime(2026, 2, 20, 10, 0))
+    executor._pullback_account_risk_store.replace_account_snapshot(
+        AccountRiskSnapshot(
+            fetched_at=stale_time,
+            total_eval=10_000_000.0,
+            cash_balance=0.0,
+            total_pnl=0.0,
+            holdings=(),
+            source="background_refresh",
+            success=True,
+            stale=False,
+            version="acct-stale",
+        )
+    )
+    executor._pullback_account_risk_store.replace_holdings_snapshot(
+        HoldingsRiskSnapshot(
+            fetched_at=stale_time,
+            holdings=(),
+            source="background_refresh",
+            success=True,
+            stale=False,
+            version="hold-stale",
+        )
+    )
+    account_calls = {"count": 0}
+    holdings_calls = {"count": 0}
+    executor.api = SimpleNamespace(
+        get_account_balance=lambda: (account_calls.__setitem__("count", account_calls["count"] + 1) or {
+            "success": True,
+            "total_eval": 12_000_000.0,
+            "cash_balance": 8_000_000.0,
+            "total_pnl": 0.0,
+            "holdings": [],
+        }),
+        get_holdings=lambda: (holdings_calls.__setitem__("count", holdings_calls["count"] + 1) or []),
+    )
+
+    with patch.object(multiday_executor.settings, "ENABLE_THREADED_PULLBACK_PIPELINE", True), \
+         patch.object(multiday_executor.settings, "ENABLE_PULLBACK_REBREAKOUT_STRATEGY", True), \
+         patch.object(multiday_executor.settings, "ENABLE_RISK_SNAPSHOT_THREAD", True), \
+         patch.object(multiday_executor.settings, "ORDER_FINAL_VALIDATION_MODE", "light"), \
+         patch.object(multiday_executor.settings, "RISK_SNAPSHOT_TTL_SEC", 60), \
+         patch.object(multiday_executor.settings, "HOLDINGS_SNAPSHOT_TTL_SEC", 30):
+        result = executor._run_order_final_validation(_make_buy_signal(strategy_tag="pullback_rebreakout"))
+
+    assert result["allowed"] is True
+    assert account_calls["count"] == 1
+    assert holdings_calls["count"] == 1
+
+
+def test_order_final_validation_feature_flag_off_preserves_existing_behavior():
+    executor = _make_executor()
+    executor.order_quantity = 1
+    executor._report_mode = "REAL"
+    executor._threaded_pullback_pipeline_disabled = False
+    executor._pullback_account_risk_store = AccountRiskStore()
+    executor.api = SimpleNamespace(
+        get_account_balance=lambda: (_ for _ in ()).throw(AssertionError("account fallback should not run when feature is off")),
+        get_holdings=lambda: (_ for _ in ()).throw(AssertionError("holdings fallback should not run when feature is off")),
+    )
+
+    with patch.object(multiday_executor.settings, "ENABLE_THREADED_PULLBACK_PIPELINE", False), \
+         patch.object(multiday_executor.settings, "ENABLE_PULLBACK_REBREAKOUT_STRATEGY", True), \
+         patch.object(multiday_executor.settings, "ENABLE_RISK_SNAPSHOT_THREAD", True), \
+         patch.object(multiday_executor.settings, "ORDER_FINAL_VALIDATION_MODE", "light"):
+        result = executor._run_order_final_validation(_make_buy_signal(strategy_tag="pullback_rebreakout"))
+
+    assert result["allowed"] is True

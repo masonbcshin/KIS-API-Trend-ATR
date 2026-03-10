@@ -11,8 +11,13 @@ import pandas as pd
 
 try:
     from config import settings
-    from engine.pullback_pipeline_models import DailyContext, PullbackEntryIntent, PullbackSetupCandidate
+    from engine.pullback_pipeline_models import (
+        DailyContext,
+        PullbackEntryIntent,
+        PullbackSetupCandidate,
+    )
     from engine.pullback_pipeline_stores import (
+        AccountRiskStore,
         ArmedCandidateStore,
         DailyContextStore,
         DirtySymbolSet,
@@ -30,6 +35,7 @@ except ImportError:
         PullbackSetupCandidate,
     )
     from kis_trend_atr_trading.engine.pullback_pipeline_stores import (
+        AccountRiskStore,
         ArmedCandidateStore,
         DailyContextStore,
         DirtySymbolSet,
@@ -42,6 +48,124 @@ except ImportError:
 
 
 logger = get_logger("pullback_pipeline")
+
+
+class RiskSnapshotThread(threading.Thread):
+    def __init__(
+        self,
+        *,
+        executor: Any,
+        account_risk_store: AccountRiskStore,
+        stop_event: threading.Event,
+        on_error: Callable[[str, Exception], None],
+    ) -> None:
+        super().__init__(name="RiskSnapshotThread", daemon=True)
+        self._executor = executor
+        self._account_risk_store = account_risk_store
+        self._stop_event = stop_event
+        self._on_error = on_error
+        self.error_state: str = ""
+
+    def run(self) -> None:
+        interval_sec = max(float(getattr(settings, "RISK_SNAPSHOT_REFRESH_SEC", 30) or 30.0), 1.0)
+        while not self._stop_event.is_set():
+            started = time.perf_counter()
+            try:
+                self._run_cycle()
+            except Exception as exc:
+                self.error_state = str(exc)
+                logger.error("[PULLBACK_RISK] worker_error=%s", exc)
+                self._on_error(self.name, exc)
+                return
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            setattr(self._executor, "_risk_snapshot_refresh_ms", elapsed_ms)
+            self._stop_event.wait(interval_sec)
+
+    def _run_cycle(self) -> None:
+        now_kst = datetime.now(KST)
+        account_ttl = max(float(getattr(settings, "RISK_SNAPSHOT_TTL_SEC", 60) or 60.0), 1.0)
+        holdings_ttl = max(float(getattr(settings, "HOLDINGS_SNAPSHOT_TTL_SEC", 30) or 30.0), 1.0)
+        _, account_state = self._account_risk_store.get_account_state(ttl_sec=account_ttl, now=now_kst)
+        _, holdings_state = self._account_risk_store.get_holdings_state(ttl_sec=holdings_ttl, now=now_kst)
+
+        if account_state != "fresh":
+            self._refresh_account_snapshot()
+        if holdings_state != "fresh":
+            self._refresh_holdings_snapshot()
+
+        account_snapshot, account_state = self._account_risk_store.get_account_state(
+            ttl_sec=account_ttl,
+            now=now_kst,
+        )
+        holdings_snapshot, holdings_state = self._account_risk_store.get_holdings_state(
+            ttl_sec=holdings_ttl,
+            now=now_kst,
+        )
+        stale = account_state != "fresh" or holdings_state != "fresh"
+        setattr(self._executor, "_risk_snapshot_stale", stale)
+        last_success_age = self._account_risk_store.get_last_account_success_age_sec(now=now_kst)
+        setattr(
+            self._executor,
+            "_risk_snapshot_last_success_age_sec",
+            float(last_success_age) if last_success_age is not None else -1.0,
+        )
+        logger.debug(
+            "[PULLBACK_RISK] cycle account_state=%s holdings_state=%s last_success_age_sec=%.2f",
+            account_state,
+            holdings_state,
+            float(last_success_age) if last_success_age is not None else -1.0,
+        )
+        if account_snapshot is not None or holdings_snapshot is not None:
+            logger.info(
+                "[PULLBACK_RISK] refreshed account_state=%s holdings_state=%s",
+                account_state,
+                holdings_state,
+            )
+
+    def _refresh_account_snapshot(self) -> None:
+        snapshot = self._executor.refresh_account_risk_snapshot_sync(source="background_refresh")
+        if snapshot is None:
+            setattr(
+                self._executor,
+                "_risk_snapshot_refresh_fail_count",
+                int(getattr(self._executor, "_risk_snapshot_refresh_fail_count", 0) or 0) + 1,
+            )
+            logger.warning("[PULLBACK_RISK] account_refresh_failed mode=%s", getattr(self._executor, "_report_mode", "PAPER"))
+            return
+        self._account_risk_store.replace_account_snapshot(snapshot)
+        setattr(
+            self._executor,
+            "_risk_snapshot_refresh_count",
+            int(getattr(self._executor, "_risk_snapshot_refresh_count", 0) or 0) + 1,
+        )
+        logger.info(
+            "[PULLBACK_RISK] account_refreshed source=%s total_eval=%.2f cash_balance=%.2f",
+            snapshot.source,
+            float(snapshot.total_eval or 0.0),
+            float(snapshot.cash_balance or 0.0),
+        )
+
+    def _refresh_holdings_snapshot(self) -> None:
+        snapshot = self._executor.refresh_holdings_risk_snapshot_sync(source="background_refresh")
+        if snapshot is None:
+            setattr(
+                self._executor,
+                "_risk_snapshot_refresh_fail_count",
+                int(getattr(self._executor, "_risk_snapshot_refresh_fail_count", 0) or 0) + 1,
+            )
+            logger.warning("[PULLBACK_RISK] holdings_refresh_failed mode=%s", getattr(self._executor, "_report_mode", "PAPER"))
+            return
+        self._account_risk_store.replace_holdings_snapshot(snapshot)
+        setattr(
+            self._executor,
+            "_holdings_snapshot_refresh_count",
+            int(getattr(self._executor, "_holdings_snapshot_refresh_count", 0) or 0) + 1,
+        )
+        logger.info(
+            "[PULLBACK_RISK] holdings_refreshed source=%s count=%s",
+            snapshot.source,
+            len(snapshot.holdings),
+        )
 
 
 class DailyRefreshThread(threading.Thread):
@@ -496,6 +620,10 @@ class OrderExecutionWorker(threading.Thread):
             return
 
         if self._executor._has_active_pending_buy_order():
+            self._candidate_store.remove(intent.symbol)
+            return
+
+        if bool(getattr(self._executor, "cached_account_has_holding", lambda *_args, **_kwargs: False)(intent.symbol)):
             self._candidate_store.remove(intent.symbol)
             return
 

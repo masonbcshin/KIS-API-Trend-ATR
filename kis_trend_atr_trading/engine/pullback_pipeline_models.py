@@ -66,3 +66,28 @@ class PullbackEntryIntent:
     @property
     def intent_key(self) -> str:
         return f"{self.strategy_tag}:{self.symbol}"
+
+
+@dataclass(frozen=True)
+class AccountRiskSnapshot:
+    fetched_at: datetime
+    total_eval: float
+    cash_balance: float
+    total_pnl: float
+    holdings: Tuple[Dict[str, Any], ...] = ()
+    source: str = ""
+    success: bool = True
+    stale: bool = False
+    version: str = ""
+    last_error: str = ""
+
+
+@dataclass(frozen=True)
+class HoldingsRiskSnapshot:
+    fetched_at: datetime
+    holdings: Tuple[Dict[str, Any], ...]
+    source: str = ""
+    success: bool = True
+    stale: bool = False
+    version: str = ""
+    last_error: str = ""

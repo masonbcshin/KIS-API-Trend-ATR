@@ -1,16 +1,25 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from dataclasses import replace
 from datetime import datetime
 import queue
 import threading
 from typing import Dict, List, Optional, Tuple
 
 try:
-    from engine.pullback_pipeline_models import DailyContext, PullbackEntryIntent, PullbackSetupCandidate
+    from engine.pullback_pipeline_models import (
+        AccountRiskSnapshot,
+        DailyContext,
+        HoldingsRiskSnapshot,
+        PullbackEntryIntent,
+        PullbackSetupCandidate,
+    )
 except ImportError:
     from kis_trend_atr_trading.engine.pullback_pipeline_models import (
+        AccountRiskSnapshot,
         DailyContext,
+        HoldingsRiskSnapshot,
         PullbackEntryIntent,
         PullbackSetupCandidate,
     )
@@ -163,3 +172,114 @@ class EntryIntentQueue:
 
     def qsize(self) -> int:
         return self._queue.qsize()
+
+
+class AccountRiskStore:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._account_snapshot: Optional[AccountRiskSnapshot] = None
+        self._holdings_snapshot: Optional[HoldingsRiskSnapshot] = None
+        self._last_account_success_at: Optional[datetime] = None
+        self._last_holdings_success_at: Optional[datetime] = None
+        self._last_account_error: str = ""
+        self._last_holdings_error: str = ""
+
+    def replace_account_snapshot(self, snapshot: AccountRiskSnapshot) -> None:
+        with self._lock:
+            self._account_snapshot = snapshot
+            if snapshot.success:
+                self._last_account_success_at = snapshot.fetched_at
+                self._last_account_error = ""
+            elif snapshot.last_error:
+                self._last_account_error = str(snapshot.last_error)
+
+    def replace_holdings_snapshot(self, snapshot: HoldingsRiskSnapshot) -> None:
+        with self._lock:
+            self._holdings_snapshot = snapshot
+            if snapshot.success:
+                self._last_holdings_success_at = snapshot.fetched_at
+                self._last_holdings_error = ""
+            elif snapshot.last_error:
+                self._last_holdings_error = str(snapshot.last_error)
+
+    def get_account_snapshot(self) -> Optional[AccountRiskSnapshot]:
+        with self._lock:
+            return self._account_snapshot
+
+    def get_holdings_snapshot(self) -> Optional[HoldingsRiskSnapshot]:
+        with self._lock:
+            return self._holdings_snapshot
+
+    def get_account_state(
+        self,
+        *,
+        ttl_sec: float,
+        now: Optional[datetime] = None,
+    ) -> Tuple[Optional[AccountRiskSnapshot], str]:
+        snapshot = self.get_account_snapshot()
+        if snapshot is None:
+            return None, "absent"
+        current_now = now
+        if current_now is None:
+            current_now = (
+                datetime.now(snapshot.fetched_at.tzinfo)
+                if snapshot.fetched_at.tzinfo is not None
+                else datetime.now()
+            )
+        age_sec = max((current_now - snapshot.fetched_at).total_seconds(), 0.0)
+        if max(float(ttl_sec or 0.0), 0.0) > 0.0 and age_sec > float(ttl_sec):
+            return replace(snapshot, stale=True), "stale"
+        return replace(snapshot, stale=False), "fresh"
+
+    def get_holdings_state(
+        self,
+        *,
+        ttl_sec: float,
+        now: Optional[datetime] = None,
+    ) -> Tuple[Optional[HoldingsRiskSnapshot], str]:
+        snapshot = self.get_holdings_snapshot()
+        if snapshot is None:
+            return None, "absent"
+        current_now = now
+        if current_now is None:
+            current_now = (
+                datetime.now(snapshot.fetched_at.tzinfo)
+                if snapshot.fetched_at.tzinfo is not None
+                else datetime.now()
+            )
+        age_sec = max((current_now - snapshot.fetched_at).total_seconds(), 0.0)
+        if max(float(ttl_sec or 0.0), 0.0) > 0.0 and age_sec > float(ttl_sec):
+            return replace(snapshot, stale=True), "stale"
+        return replace(snapshot, stale=False), "fresh"
+
+    def get_last_account_success_age_sec(self, now: Optional[datetime] = None) -> Optional[float]:
+        with self._lock:
+            success_at = self._last_account_success_at
+        if success_at is None:
+            return None
+        current_now = now
+        if current_now is None:
+            tzinfo = success_at.tzinfo if success_at is not None else None
+            current_now = datetime.now(tzinfo) if tzinfo is not None else datetime.now()
+        return max((current_now - success_at).total_seconds(), 0.0)
+
+    def get_last_holdings_success_age_sec(self, now: Optional[datetime] = None) -> Optional[float]:
+        with self._lock:
+            success_at = self._last_holdings_success_at
+        if success_at is None:
+            return None
+        current_now = now
+        if current_now is None:
+            current_now = (
+                datetime.now(success_at.tzinfo)
+                if success_at.tzinfo is not None
+                else datetime.now()
+            )
+        return max((current_now - success_at).total_seconds(), 0.0)
+
+    def get_last_errors(self) -> Dict[str, str]:
+        with self._lock:
+            return {
+                "account": self._last_account_error,
+                "holdings": self._last_holdings_error,
+            }

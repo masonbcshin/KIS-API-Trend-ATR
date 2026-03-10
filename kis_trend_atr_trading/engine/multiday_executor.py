@@ -63,7 +63,12 @@ try:
     from kis_trend_atr_trading.db.repository import get_trade_repository
     from kis_trend_atr_trading.db.mysql import get_db_manager, QueryError
     from kis_trend_atr_trading.core.market_data import MarketDataProvider
+    from kis_trend_atr_trading.engine.pullback_pipeline_models import (
+        AccountRiskSnapshot,
+        HoldingsRiskSnapshot,
+    )
     from kis_trend_atr_trading.engine.pullback_pipeline_stores import (
+        AccountRiskStore,
         ArmedCandidateStore,
         DailyContextStore,
         DirtySymbolSet,
@@ -71,6 +76,7 @@ try:
     )
     from kis_trend_atr_trading.engine.pullback_pipeline_workers import (
         DailyRefreshThread,
+        RiskSnapshotThread,
         PullbackSetupWorker,
         PullbackTimingWorker,
         OrderExecutionWorker,
@@ -128,7 +134,12 @@ except ImportError:
     from db.repository import get_trade_repository
     from db.mysql import get_db_manager, QueryError
     from core.market_data import MarketDataProvider
+    from engine.pullback_pipeline_models import (
+        AccountRiskSnapshot,
+        HoldingsRiskSnapshot,
+    )
     from engine.pullback_pipeline_stores import (
+        AccountRiskStore,
         ArmedCandidateStore,
         DailyContextStore,
         DirtySymbolSet,
@@ -136,6 +147,7 @@ except ImportError:
     )
     from engine.pullback_pipeline_workers import (
         DailyRefreshThread,
+        RiskSnapshotThread,
         PullbackSetupWorker,
         PullbackTimingWorker,
         OrderExecutionWorker,
@@ -393,9 +405,11 @@ class MultidayExecutor:
         self._pullback_pipeline_stop_event: Optional[threading.Event] = None
         self._pullback_candidate_store: Optional[ArmedCandidateStore] = None
         self._pullback_daily_context_store: Optional[DailyContextStore] = None
+        self._pullback_account_risk_store: Optional[AccountRiskStore] = None
         self._pullback_dirty_symbols: Optional[DirtySymbolSet] = None
         self._pullback_entry_queue: Optional[EntryIntentQueue] = None
         self._pullback_daily_refresh_worker: Optional[DailyRefreshThread] = None
+        self._pullback_risk_snapshot_worker: Optional[RiskSnapshotThread] = None
         self._pullback_setup_worker: Optional[PullbackSetupWorker] = None
         self._pullback_timing_worker: Optional[PullbackTimingWorker] = None
         self._pullback_order_worker: Optional[OrderExecutionWorker] = None
@@ -413,6 +427,13 @@ class MultidayExecutor:
         self._pullback_intent_queue_depth: int = 0
         self._pullback_end_to_end_latency_ms: float = 0.0
         self._pullback_timing_skip_reason: str = ""
+        self._risk_snapshot_refresh_ms: float = 0.0
+        self._risk_snapshot_refresh_count: int = 0
+        self._holdings_snapshot_refresh_count: int = 0
+        self._risk_snapshot_stale: bool = False
+        self._order_final_validation_ms: float = 0.0
+        self._risk_snapshot_last_success_age_sec: float = -1.0
+        self._risk_snapshot_refresh_fail_count: int = 0
         
         # 일별 거래 기록
         self._daily_trades = []
@@ -520,9 +541,15 @@ class MultidayExecutor:
             getattr(settings, "ENABLE_PULLBACK_DAILY_REFRESH_THREAD", False)
         )
 
+    def _is_pullback_risk_snapshot_enabled(self) -> bool:
+        return self._is_threaded_pullback_pipeline_enabled() and bool(
+            getattr(settings, "ENABLE_RISK_SNAPSHOT_THREAD", False)
+        )
+
     def _is_threaded_pullback_pipeline_running(self) -> bool:
         stop_event = getattr(self, "_pullback_pipeline_stop_event", None)
         workers = (
+            getattr(self, "_pullback_risk_snapshot_worker", None),
             getattr(self, "_pullback_setup_worker", None),
             getattr(self, "_pullback_timing_worker", None),
             getattr(self, "_pullback_order_worker", None),
@@ -556,6 +583,7 @@ class MultidayExecutor:
         self._pullback_daily_context_store = DailyContextStore(
             max_symbols=max(int(getattr(settings, "DAILY_CONTEXT_STORE_MAX_SYMBOLS", 256) or 256), 1)
         )
+        self._pullback_account_risk_store = AccountRiskStore()
         self._pullback_dirty_symbols = DirtySymbolSet()
         self._pullback_entry_queue = EntryIntentQueue(
             maxsize=max(int(getattr(settings, "PULLBACK_ENTRY_INTENT_QUEUE_MAXSIZE", 256) or 256), 1)
@@ -564,6 +592,13 @@ class MultidayExecutor:
             self._pullback_daily_refresh_worker = DailyRefreshThread(
                 executor=self,
                 daily_context_store=self._pullback_daily_context_store,
+                stop_event=self._pullback_pipeline_stop_event,
+                on_error=self._handle_pullback_pipeline_worker_error,
+            )
+        if self._is_pullback_risk_snapshot_enabled():
+            self._pullback_risk_snapshot_worker = RiskSnapshotThread(
+                executor=self,
+                account_risk_store=self._pullback_account_risk_store,
                 stop_event=self._pullback_pipeline_stop_event,
                 on_error=self._handle_pullback_pipeline_worker_error,
             )
@@ -622,6 +657,8 @@ class MultidayExecutor:
 
         if self._pullback_daily_refresh_worker is not None:
             self._pullback_daily_refresh_worker.start()
+        if self._pullback_risk_snapshot_worker is not None:
+            self._pullback_risk_snapshot_worker.start()
         self._pullback_setup_worker.start()
         self._pullback_timing_worker.start()
         self._pullback_order_worker.start()
@@ -643,6 +680,7 @@ class MultidayExecutor:
         current_thread = threading.current_thread()
         for attr_name in (
             "_pullback_daily_refresh_worker",
+            "_pullback_risk_snapshot_worker",
             "_pullback_setup_worker",
             "_pullback_timing_worker",
             "_pullback_order_worker",
@@ -659,6 +697,7 @@ class MultidayExecutor:
         self._pullback_dirty_symbols = None
         self._pullback_candidate_store = None
         self._pullback_daily_context_store = None
+        self._pullback_account_risk_store = None
         self._pullback_threaded_context_version = ""
         self._pullback_daily_context_version = ""
 
@@ -708,6 +747,17 @@ class MultidayExecutor:
                 else 0
             ),
             "pullback_timing_skip_reason": str(getattr(self, "_pullback_timing_skip_reason", "") or ""),
+            "risk_snapshot_refresh_ms": float(getattr(self, "_risk_snapshot_refresh_ms", 0.0) or 0.0),
+            "risk_snapshot_refresh_count": int(getattr(self, "_risk_snapshot_refresh_count", 0) or 0),
+            "holdings_snapshot_refresh_count": int(getattr(self, "_holdings_snapshot_refresh_count", 0) or 0),
+            "risk_snapshot_stale": bool(getattr(self, "_risk_snapshot_stale", False)),
+            "order_final_validation_ms": float(getattr(self, "_order_final_validation_ms", 0.0) or 0.0),
+            "risk_snapshot_last_success_age_sec": float(
+                getattr(self, "_risk_snapshot_last_success_age_sec", -1.0) or -1.0
+            ),
+            "risk_snapshot_refresh_fail_count": int(
+                getattr(self, "_risk_snapshot_refresh_fail_count", 0) or 0
+            ),
         }
 
     def update_pullback_quote_snapshot(self, snapshot: Optional[Dict[str, Any]]) -> None:
@@ -904,7 +954,192 @@ class MultidayExecutor:
             f"(source={source}, mode={getattr(self, '_report_mode', 'PAPER')})"
         )
 
-    def _sync_risk_account_snapshot(self) -> None:
+    @staticmethod
+    def _normalize_holdings_rows(payload: Any) -> List[Dict[str, Any]]:
+        if isinstance(payload, dict):
+            rows = payload.get("holdings", [])
+        else:
+            rows = payload
+        return [dict(row) for row in list(rows or []) if isinstance(row, dict)]
+
+    def _build_account_risk_snapshot(
+        self,
+        raw_snapshot: Dict[str, Any],
+        *,
+        source: str,
+        fetched_at: Optional[datetime] = None,
+    ) -> Optional[AccountRiskSnapshot]:
+        if not isinstance(raw_snapshot, dict) or not raw_snapshot:
+            return None
+        if not bool(raw_snapshot.get("success", True)):
+            return None
+        fetched = fetched_at or datetime.now(KST)
+        holdings_rows = tuple(self._normalize_holdings_rows(raw_snapshot))
+        total_eval = float(raw_snapshot.get("total_eval") or raw_snapshot.get("total_equity") or 0.0)
+        cash_balance = float(raw_snapshot.get("cash_balance") or raw_snapshot.get("cash") or 0.0)
+        total_pnl = float(raw_snapshot.get("total_pnl") or 0.0)
+        version = hashlib.sha1(
+            (
+                f"{fetched.isoformat()}|{total_eval:.4f}|{cash_balance:.4f}|"
+                f"{total_pnl:.4f}|{len(holdings_rows)}"
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        return AccountRiskSnapshot(
+            fetched_at=fetched,
+            total_eval=total_eval,
+            cash_balance=cash_balance,
+            total_pnl=total_pnl,
+            holdings=holdings_rows,
+            source=str(source or "sync_fallback"),
+            success=True,
+            stale=False,
+            version=version,
+        )
+
+    def _build_holdings_risk_snapshot(
+        self,
+        holdings_payload: Any,
+        *,
+        source: str,
+        fetched_at: Optional[datetime] = None,
+    ) -> HoldingsRiskSnapshot:
+        fetched = fetched_at or datetime.now(KST)
+        holdings_rows = tuple(self._normalize_holdings_rows(holdings_payload))
+        total_qty = sum(self._extract_holding_qty(row) for row in holdings_rows)
+        version = hashlib.sha1(
+            f"{fetched.isoformat()}|{len(holdings_rows)}|{int(total_qty)}".encode("utf-8")
+        ).hexdigest()[:16]
+        return HoldingsRiskSnapshot(
+            fetched_at=fetched,
+            holdings=holdings_rows,
+            source=str(source or "sync_fallback"),
+            success=True,
+            stale=False,
+            version=version,
+        )
+
+    @staticmethod
+    def _account_snapshot_to_dict(snapshot: AccountRiskSnapshot) -> Dict[str, Any]:
+        return {
+            "success": bool(snapshot.success),
+            "total_eval": float(snapshot.total_eval or 0.0),
+            "cash_balance": float(snapshot.cash_balance or 0.0),
+            "total_pnl": float(snapshot.total_pnl or 0.0),
+            "holdings": [dict(row) for row in snapshot.holdings],
+            "source": snapshot.source,
+            "version": snapshot.version,
+        }
+
+    def refresh_account_risk_snapshot_sync(self, source: str = "sync_fallback") -> Optional[AccountRiskSnapshot]:
+        report_mode = str(getattr(self, "_report_mode", "PAPER")).upper()
+        fetched_at = datetime.now(KST)
+        try:
+            if report_mode == "DRY_RUN":
+                raw_snapshot = self._build_dry_run_virtual_snapshot()
+            else:
+                raw_snapshot = self.api.get_account_balance()
+                self.__class__._shared_account_snapshot_fetch_count += 1
+        except Exception as err:
+            logger.warning("[PULLBACK_RISK] account snapshot fetch failed: source=%s err=%s", source, err)
+            return None
+
+        snapshot = self._build_account_risk_snapshot(
+            raw_snapshot,
+            source=source,
+            fetched_at=fetched_at,
+        )
+        if snapshot is None:
+            logger.warning("[PULLBACK_RISK] account snapshot empty: source=%s", source)
+            return None
+        store = getattr(self, "_pullback_account_risk_store", None)
+        if store is not None:
+            store.replace_account_snapshot(snapshot)
+        return snapshot
+
+    def refresh_holdings_risk_snapshot_sync(self, source: str = "sync_fallback") -> Optional[HoldingsRiskSnapshot]:
+        report_mode = str(getattr(self, "_report_mode", "PAPER")).upper()
+        fetched_at = datetime.now(KST)
+        try:
+            if report_mode == "DRY_RUN":
+                payload = self._build_dry_run_virtual_snapshot().get("holdings", [])
+            elif hasattr(self.api, "get_holdings"):
+                payload = self.api.get_holdings()
+            else:
+                balance = self.api.get_account_balance()
+                self.__class__._shared_account_snapshot_fetch_count += 1
+                if not isinstance(balance, dict) or not balance.get("success"):
+                    logger.warning("[PULLBACK_RISK] holdings fallback balance unavailable: source=%s", source)
+                    return None
+                payload = balance.get("holdings", [])
+        except Exception as err:
+            logger.warning("[PULLBACK_RISK] holdings snapshot fetch failed: source=%s err=%s", source, err)
+            return None
+
+        snapshot = self._build_holdings_risk_snapshot(
+            payload,
+            source=source,
+            fetched_at=fetched_at,
+        )
+        store = getattr(self, "_pullback_account_risk_store", None)
+        if store is not None:
+            store.replace_holdings_snapshot(snapshot)
+        return snapshot
+
+    def get_account_risk_snapshot_state(
+        self,
+        *,
+        ttl_sec: Optional[float] = None,
+        now: Optional[datetime] = None,
+    ) -> tuple[Optional[AccountRiskSnapshot], str]:
+        store = getattr(self, "_pullback_account_risk_store", None)
+        if store is None:
+            return None, "absent"
+        effective_ttl = float(
+            ttl_sec
+            if ttl_sec is not None
+            else float(getattr(settings, "RISK_SNAPSHOT_TTL_SEC", 60) or 60.0)
+        )
+        return store.get_account_state(ttl_sec=effective_ttl, now=now)
+
+    def get_holdings_risk_snapshot_state(
+        self,
+        *,
+        ttl_sec: Optional[float] = None,
+        now: Optional[datetime] = None,
+    ) -> tuple[Optional[HoldingsRiskSnapshot], str]:
+        store = getattr(self, "_pullback_account_risk_store", None)
+        if store is None:
+            return None, "absent"
+        effective_ttl = float(
+            ttl_sec
+            if ttl_sec is not None
+            else float(getattr(settings, "HOLDINGS_SNAPSHOT_TTL_SEC", 30) or 30.0)
+        )
+        return store.get_holdings_state(ttl_sec=effective_ttl, now=now)
+
+    def cached_account_has_holding(self, stock_code: str) -> bool:
+        snapshot, state = self.get_holdings_risk_snapshot_state()
+        if snapshot is None or state != "fresh":
+            return False
+        return self._find_holding_row(snapshot.holdings, stock_code) is not None
+
+    def _find_holding_row(self, holdings_rows: Any, stock_code: str) -> Optional[Dict[str, Any]]:
+        target = str(stock_code or "").strip()
+        for raw_holding in self._normalize_holdings_rows(holdings_rows):
+            symbol = str(
+                raw_holding.get("stock_code")
+                or raw_holding.get("pdno")
+                or raw_holding.get("symbol")
+                or ""
+            ).strip()
+            if symbol != target:
+                continue
+            if self._extract_holding_qty(raw_holding) <= 0:
+                continue
+            return raw_holding
+        return None
+
+    def _sync_risk_account_snapshot_legacy(self) -> None:
         """리스크 패널용 계좌 스냅샷 동기화 (짧은 TTL 캐시 적용)."""
         ttl_sec = int(getattr(settings, "RISK_ACCOUNT_SNAPSHOT_TTL_SEC", 60))
         now = datetime.now(KST)
@@ -960,6 +1195,33 @@ class MultidayExecutor:
             "[RISK] 계좌 스냅샷 반영: "
             f"holdings={len(snapshot.get('holdings', []))}, total_pnl={total_pnl:+,.0f}원"
         )
+
+    def _sync_risk_account_snapshot(self) -> None:
+        now = datetime.now(KST)
+        if self._is_pullback_risk_snapshot_enabled():
+            snapshot, state = self.get_account_risk_snapshot_state(now=now)
+            store = getattr(self, "_pullback_account_risk_store", None)
+            if store is not None:
+                last_success_age = store.get_last_account_success_age_sec(now=now)
+                self._risk_snapshot_last_success_age_sec = (
+                    float(last_success_age) if last_success_age is not None else -1.0
+                )
+            self._risk_snapshot_stale = state != "fresh"
+            if snapshot is not None:
+                self.risk_manager.update_account_snapshot(self._account_snapshot_to_dict(snapshot))
+                self._sync_risk_starting_capital_from_equity(
+                    float(snapshot.total_eval or 0.0),
+                    source=str(snapshot.source or "BACKGROUND_REFRESH").upper(),
+                )
+                logger.info(
+                    "[RISK] 계좌 스냅샷 반영(source=%s state=%s): holdings=%s total_pnl=%+.0f원",
+                    snapshot.source,
+                    state,
+                    len(snapshot.holdings),
+                    float(snapshot.total_pnl or 0.0),
+                )
+                return
+        self._sync_risk_account_snapshot_legacy()
 
     # ════════════════════════════════════════════════════════════════
     # 리포트 DB 적재 (매매 로직과 분리된 보조 기능)
@@ -2381,7 +2643,90 @@ class MultidayExecutor:
             except Exception as exc:
                 logger.debug("[SYNC] pending buy order check failed: symbol=%s err=%s", self.stock_code, exc)
         return False
-    
+
+    def _resolve_holdings_snapshot_for_final_validation(self) -> tuple[Optional[HoldingsRiskSnapshot], str]:
+        report_mode = str(getattr(self, "_report_mode", "PAPER")).upper()
+        snapshot, state = self.get_holdings_risk_snapshot_state(now=datetime.now(KST))
+        if snapshot is not None and state == "fresh":
+            return snapshot, "background_refresh"
+        if snapshot is not None and state == "stale" and report_mode in ("PAPER", "DRY_RUN"):
+            return snapshot, "last_known_good"
+
+        fallback = self.refresh_holdings_risk_snapshot_sync(source="final_validation")
+        if fallback is not None:
+            return fallback, "final_validation"
+        if snapshot is not None and report_mode in ("PAPER", "DRY_RUN"):
+            return snapshot, "last_known_good"
+        return None, state or "absent"
+
+    def _resolve_account_snapshot_for_final_validation(self) -> tuple[Optional[AccountRiskSnapshot], str]:
+        report_mode = str(getattr(self, "_report_mode", "PAPER")).upper()
+        snapshot, state = self.get_account_risk_snapshot_state(now=datetime.now(KST))
+        if snapshot is not None and state == "fresh":
+            return snapshot, "background_refresh"
+        if snapshot is not None and state == "stale" and report_mode in ("PAPER", "DRY_RUN"):
+            return snapshot, "last_known_good"
+
+        fallback = self.refresh_account_risk_snapshot_sync(source="final_validation")
+        if fallback is not None:
+            return fallback, "final_validation"
+        if snapshot is not None and report_mode in ("PAPER", "DRY_RUN"):
+            return snapshot, "last_known_good"
+        return None, state or "absent"
+
+    def _run_order_final_validation(self, signal: TradingSignal) -> Dict[str, Any]:
+        started = time.perf_counter()
+        try:
+            strategy_tag = self._strategy_tag(signal)
+            if strategy_tag != "pullback_rebreakout" or not self._is_pullback_risk_snapshot_enabled():
+                return {"allowed": True, "mode": "disabled"}
+            if str(getattr(settings, "ORDER_FINAL_VALIDATION_MODE", "light") or "light").strip().lower() != "light":
+                return {"allowed": True, "mode": "bypass"}
+
+            holdings_snapshot, holdings_source = self._resolve_holdings_snapshot_for_final_validation()
+            if holdings_snapshot is None:
+                if str(getattr(self, "_report_mode", "PAPER")).upper() == "REAL":
+                    return {
+                        "allowed": False,
+                        "reason_code": "holdings_snapshot_unavailable",
+                        "message": "보유 스냅샷 부재로 pullback 신규 BUY 차단",
+                    }
+            elif self._find_holding_row(holdings_snapshot.holdings, self.stock_code) is not None:
+                return {
+                    "allowed": False,
+                    "reason_code": "existing_position_snapshot",
+                    "message": "계좌 보유 확인 - pullback 신규 BUY 차단",
+                }
+
+            account_snapshot, account_source = self._resolve_account_snapshot_for_final_validation()
+            if account_snapshot is None:
+                if str(getattr(self, "_report_mode", "PAPER")).upper() == "REAL":
+                    return {
+                        "allowed": False,
+                        "reason_code": "account_snapshot_unavailable",
+                        "message": "계좌 스냅샷 부재로 pullback 신규 BUY 차단",
+                    }
+            else:
+                estimated_cost = float(getattr(signal, "price", 0.0) or 0.0) * max(int(self.order_quantity or 0), 1)
+                cash_balance = float(account_snapshot.cash_balance or 0.0)
+                if estimated_cost > 0 and cash_balance > 0 and estimated_cost > cash_balance:
+                    return {
+                        "allowed": False,
+                        "reason_code": "insufficient_cash_snapshot",
+                        "message": "예수금 부족 스냅샷으로 pullback 신규 BUY 차단",
+                    }
+
+            signal.meta = dict(getattr(signal, "meta", {}) or {})
+            signal.meta["risk_snapshot_account_source"] = account_source
+            signal.meta["risk_snapshot_holdings_source"] = holdings_source
+            return {"allowed": True, "mode": "light"}
+        finally:
+            setattr(
+                self,
+                "_order_final_validation_ms",
+                (time.perf_counter() - started) * 1000.0,
+            )
+
     # ════════════════════════════════════════════════════════════════
     # 주문 실행 (모드별)
     # ════════════════════════════════════════════════════════════════
@@ -2634,88 +2979,46 @@ class MultidayExecutor:
 
     def _get_account_holding(self, stock_code: str) -> Optional[Dict[str, Any]]:
         """API 계좌 기준 특정 종목 보유 스냅샷을 반환합니다."""
-        try:
-            if hasattr(self.api, "get_holdings"):
-                payload = self.api.get_holdings()
-            else:
-                balance = self.api.get_account_balance()
-                if not isinstance(balance, dict) or not balance.get("success"):
-                    return None
-                payload = balance.get("holdings", [])
-        except Exception as e:
-            logger.warning(
-                "[AUTO_RECOVER] 계좌 보유 상세 확인 실패: symbol=%s, err=%s",
-                stock_code,
-                e,
-            )
-            return None
+        holdings_snapshot, holdings_state = self.get_holdings_risk_snapshot_state()
+        if holdings_snapshot is not None and holdings_state == "fresh":
+            raw_holding = self._find_holding_row(holdings_snapshot.holdings, stock_code)
+            if raw_holding is not None:
+                return {
+                    "stock_code": str(stock_code).strip(),
+                    "qty": self._extract_holding_qty(raw_holding),
+                    "avg_price": self._extract_holding_avg_price(raw_holding),
+                    "current_price": float(raw_holding.get("current_price") or raw_holding.get("prpr") or 0.0),
+                }
 
-        holdings = payload if isinstance(payload, list) else []
-        for raw_holding in holdings:
-            if not isinstance(raw_holding, dict):
-                continue
-            symbol = str(
-                raw_holding.get("stock_code")
-                or raw_holding.get("pdno")
-                or raw_holding.get("symbol")
-                or ""
-            ).strip()
-            if symbol != stock_code:
-                continue
-            qty = self._extract_holding_qty(raw_holding)
-            if qty <= 0:
-                continue
-            avg_price = self._extract_holding_avg_price(raw_holding)
-            try:
-                current_price = float(
-                    raw_holding.get("current_price")
-                    or raw_holding.get("prpr")
-                    or 0.0
-                )
-            except (TypeError, ValueError):
-                current_price = 0.0
+        if holdings_snapshot is not None and holdings_state == "stale" and str(getattr(self, "_report_mode", "PAPER")).upper() == "DRY_RUN":
+            raw_holding = self._find_holding_row(holdings_snapshot.holdings, stock_code)
+            if raw_holding is not None:
+                return {
+                    "stock_code": str(stock_code).strip(),
+                    "qty": self._extract_holding_qty(raw_holding),
+                    "avg_price": self._extract_holding_avg_price(raw_holding),
+                    "current_price": float(raw_holding.get("current_price") or raw_holding.get("prpr") or 0.0),
+                }
+
+        snapshot = self.refresh_holdings_risk_snapshot_sync(source="sync_fallback")
+        if snapshot is None:
+            return None
+        raw_holding = self._find_holding_row(snapshot.holdings, stock_code)
+        if raw_holding is not None:
             return {
-                "stock_code": symbol,
-                "qty": qty,
-                "avg_price": avg_price,
-                "current_price": current_price,
+                "stock_code": str(stock_code).strip(),
+                "qty": self._extract_holding_qty(raw_holding),
+                "avg_price": self._extract_holding_avg_price(raw_holding),
+                "current_price": float(raw_holding.get("current_price") or raw_holding.get("prpr") or 0.0),
             }
         return None
 
     def _account_has_holding(self, stock_code: str) -> Optional[bool]:
         """API 계좌 기준으로 특정 종목 보유 여부를 확인합니다."""
-        try:
-            if hasattr(self.api, "get_holdings"):
-                payload = self.api.get_holdings()
-            else:
-                balance = self.api.get_account_balance()
-                if not isinstance(balance, dict) or not balance.get("success"):
-                    return None
-                payload = balance.get("holdings", [])
-        except Exception as e:
-            logger.warning(
-                "[AUTO_RECOVER] 계좌 보유 확인 실패(보수적 유지): symbol=%s, err=%s",
-                stock_code,
-                e,
-            )
+        holding = self._get_account_holding(stock_code)
+        if holding is None:
             return None
-
-        holdings = payload if isinstance(payload, list) else []
-        for raw_holding in holdings:
-            if not isinstance(raw_holding, dict):
-                continue
-            symbol = str(
-                raw_holding.get("stock_code")
-                or raw_holding.get("pdno")
-                or raw_holding.get("symbol")
-                or ""
-            ).strip()
-            if symbol != stock_code:
-                continue
-            if self._extract_holding_qty(raw_holding) > 0:
-                return True
-
-        return False
+        return int(holding.get("qty") or 0) > 0
 
     def _auto_reconcile_stale_position_after_sell_failure(self, error_message: str) -> bool:
         """
@@ -2978,6 +3281,14 @@ class MultidayExecutor:
                 "success": False,
                 "skipped": True,
                 "message": "미종결 주문 존재 - Pullback 신규 진입 차단",
+            }
+
+        final_validation = self._run_order_final_validation(signal)
+        if not final_validation.get("allowed", True):
+            return {
+                "success": False,
+                "skipped": True,
+                "message": final_validation.get("message") or "최종 주문 검증 실패",
             }
 
         # ★ 장 운영시간 체크 (감사 보고서 지적 해결)

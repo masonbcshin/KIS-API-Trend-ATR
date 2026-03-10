@@ -14,9 +14,24 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import strategy.multiday_trend_atr as multiday_trend_atr
-from engine.pullback_pipeline_models import DailyContext
-from engine.pullback_pipeline_stores import ArmedCandidateStore, DailyContextStore, DirtySymbolSet, EntryIntentQueue
-from engine.pullback_pipeline_workers import DailyRefreshThread, PullbackSetupWorker, PullbackTimingWorker
+from engine.pullback_pipeline_models import (
+    AccountRiskSnapshot,
+    DailyContext,
+    HoldingsRiskSnapshot,
+)
+from engine.pullback_pipeline_stores import (
+    AccountRiskStore,
+    ArmedCandidateStore,
+    DailyContextStore,
+    DirtySymbolSet,
+    EntryIntentQueue,
+)
+from engine.pullback_pipeline_workers import (
+    DailyRefreshThread,
+    PullbackSetupWorker,
+    PullbackTimingWorker,
+    RiskSnapshotThread,
+)
 from strategy.multiday_trend_atr import MultidayTrendATRStrategy, SignalType
 from strategy.pullback_rebreakout import PullbackDecision, PullbackRebreakoutStrategy
 from utils.market_hours import KST
@@ -207,6 +222,69 @@ class _DailyRefreshExecutorStub:
         if isinstance(value, datetime):
             return value.date().isoformat()
         return str(value)[:10]
+
+
+def _make_account_risk_snapshot(
+    *,
+    fetched_at: datetime,
+    cash_balance: float = 1_000_000.0,
+    total_eval: float = 11_000_000.0,
+    total_pnl: float = 125_000.0,
+    holdings: tuple[dict, ...] = (),
+    source: str = "unittest",
+) -> AccountRiskSnapshot:
+    return AccountRiskSnapshot(
+        fetched_at=fetched_at,
+        total_eval=total_eval,
+        cash_balance=cash_balance,
+        total_pnl=total_pnl,
+        holdings=holdings,
+        source=source,
+        success=True,
+        stale=False,
+        version=f"acct-{int(fetched_at.timestamp())}",
+    )
+
+
+def _make_holdings_risk_snapshot(
+    *,
+    fetched_at: datetime,
+    holdings: tuple[dict, ...] = (),
+    source: str = "unittest",
+) -> HoldingsRiskSnapshot:
+    return HoldingsRiskSnapshot(
+        fetched_at=fetched_at,
+        holdings=holdings,
+        source=source,
+        success=True,
+        stale=False,
+        version=f"hold-{int(fetched_at.timestamp())}",
+    )
+
+
+class _RiskSnapshotExecutorStub:
+    def __init__(self, *, account_results=None, holdings_results=None):
+        self._report_mode = "PAPER"
+        self._risk_snapshot_refresh_ms = 0.0
+        self._risk_snapshot_refresh_count = 0
+        self._holdings_snapshot_refresh_count = 0
+        self._risk_snapshot_stale = False
+        self._risk_snapshot_last_success_age_sec = -1.0
+        self._risk_snapshot_refresh_fail_count = 0
+        self._account_results = iter(account_results or [])
+        self._holdings_results = iter(holdings_results or [])
+
+    def refresh_account_risk_snapshot_sync(self, source="background_refresh"):
+        result = next(self._account_results)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def refresh_holdings_risk_snapshot_sync(self, source="background_refresh"):
+        result = next(self._holdings_results)
+        if isinstance(result, Exception):
+            raise result
+        return result
 
 
 def test_pullback_rebreakout_buy_signal_when_setup_is_valid():
@@ -666,6 +744,132 @@ def test_daily_context_store_overwrite_updates_context_version():
     store.upsert(replace(base, context_version="ctx-2"))
 
     assert store.get("005930").context_version == "ctx-2"
+
+
+def test_account_risk_store_validates_ttl_independently_for_account_and_holdings():
+    now = datetime.now(KST)
+    store = AccountRiskStore()
+    store.replace_account_snapshot(
+        _make_account_risk_snapshot(
+            fetched_at=now - timedelta(seconds=20),
+            source="background_refresh",
+        )
+    )
+    store.replace_holdings_snapshot(
+        _make_holdings_risk_snapshot(
+            fetched_at=now - timedelta(seconds=45),
+            holdings=({"stock_code": "005930", "qty": 1},),
+            source="background_refresh",
+        )
+    )
+
+    account_snapshot, account_state = store.get_account_state(ttl_sec=60, now=now)
+    holdings_snapshot, holdings_state = store.get_holdings_state(ttl_sec=30, now=now)
+
+    assert account_snapshot is not None
+    assert account_state == "fresh"
+    assert holdings_snapshot is not None
+    assert holdings_state == "stale"
+
+
+def test_risk_snapshot_thread_refreshes_store():
+    now = datetime.now(KST)
+    store = AccountRiskStore()
+    executor = _RiskSnapshotExecutorStub(
+        account_results=[
+            _make_account_risk_snapshot(
+                fetched_at=now,
+                cash_balance=2_000_000.0,
+                source="background_refresh",
+            )
+        ],
+        holdings_results=[
+            _make_holdings_risk_snapshot(
+                fetched_at=now,
+                holdings=({"stock_code": "005930", "qty": 3},),
+                source="background_refresh",
+            )
+        ],
+    )
+    worker = RiskSnapshotThread(
+        executor=executor,
+        account_risk_store=store,
+        stop_event=threading.Event(),
+        on_error=lambda *_args: None,
+    )
+
+    with _patch_pullback_enabled(), \
+         patch.object(multiday_trend_atr.settings, "ENABLE_RISK_SNAPSHOT_THREAD", True), \
+         patch.object(multiday_trend_atr.settings, "RISK_SNAPSHOT_TTL_SEC", 60), \
+         patch.object(multiday_trend_atr.settings, "HOLDINGS_SNAPSHOT_TTL_SEC", 30):
+        worker._run_cycle()
+
+    account_snapshot, account_state = store.get_account_state(ttl_sec=60, now=now)
+    holdings_snapshot, holdings_state = store.get_holdings_state(ttl_sec=30, now=now)
+
+    assert account_state == "fresh"
+    assert holdings_state == "fresh"
+    assert account_snapshot is not None and account_snapshot.cash_balance == 2_000_000.0
+    assert holdings_snapshot is not None and len(holdings_snapshot.holdings) == 1
+    assert executor._risk_snapshot_refresh_count == 1
+    assert executor._holdings_snapshot_refresh_count == 1
+
+
+def test_risk_snapshot_thread_keeps_last_known_good_on_refresh_failure():
+    now = datetime.now(KST)
+    store = AccountRiskStore()
+    original_account = _make_account_risk_snapshot(fetched_at=now - timedelta(seconds=90), source="background_refresh")
+    original_holdings = _make_holdings_risk_snapshot(
+        fetched_at=now - timedelta(seconds=90),
+        holdings=({"stock_code": "005930", "qty": 2},),
+        source="background_refresh",
+    )
+    store.replace_account_snapshot(original_account)
+    store.replace_holdings_snapshot(original_holdings)
+    executor = _RiskSnapshotExecutorStub(account_results=[None], holdings_results=[None])
+    worker = RiskSnapshotThread(
+        executor=executor,
+        account_risk_store=store,
+        stop_event=threading.Event(),
+        on_error=lambda *_args: None,
+    )
+
+    with _patch_pullback_enabled(), \
+         patch.object(multiday_trend_atr.settings, "ENABLE_RISK_SNAPSHOT_THREAD", True), \
+         patch.object(multiday_trend_atr.settings, "RISK_SNAPSHOT_TTL_SEC", 60), \
+         patch.object(multiday_trend_atr.settings, "HOLDINGS_SNAPSHOT_TTL_SEC", 30):
+        worker._run_cycle()
+
+    assert store.get_account_snapshot() == original_account
+    assert store.get_holdings_snapshot() == original_holdings
+    assert executor._risk_snapshot_refresh_fail_count == 2
+
+
+def test_risk_snapshot_thread_records_error_state_on_exception():
+    store = AccountRiskStore()
+    errors = []
+    executor = _RiskSnapshotExecutorStub(
+        account_results=[RuntimeError("account down")],
+        holdings_results=[],
+    )
+    stop_event = threading.Event()
+    worker = RiskSnapshotThread(
+        executor=executor,
+        account_risk_store=store,
+        stop_event=stop_event,
+        on_error=lambda worker_name, exc: errors.append((worker_name, str(exc))),
+    )
+
+    with _patch_pullback_enabled(), \
+         patch.object(multiday_trend_atr.settings, "ENABLE_RISK_SNAPSHOT_THREAD", True), \
+         patch.object(multiday_trend_atr.settings, "RISK_SNAPSHOT_REFRESH_SEC", 1), \
+         patch.object(multiday_trend_atr.settings, "RISK_SNAPSHOT_TTL_SEC", 60), \
+         patch.object(multiday_trend_atr.settings, "HOLDINGS_SNAPSHOT_TTL_SEC", 30):
+        worker.start()
+        worker.join(timeout=1.0)
+
+    assert worker.error_state == "account down"
+    assert errors == [("RiskSnapshotThread", "account down")]
 
 
 def test_daily_refresh_thread_populates_daily_context_store():
