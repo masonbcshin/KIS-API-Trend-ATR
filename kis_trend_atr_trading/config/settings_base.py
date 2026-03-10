@@ -491,12 +491,15 @@ PULLBACK_BLOCK_IF_PENDING_ORDER: bool = os.getenv(
 #   MARKET_REGIME_STALE_MAX_SEC=180
 #   MARKET_REGIME_FAIL_MODE=closed
 #   MARKET_REGIME_REFRESH_BUDGET_SEC=1.5
+#   MARKET_REGIME_BOOTSTRAP_BUDGET_SEC=3.0
 #   MARKET_REGIME_BAD_BLOCK_NEW_BUY=true
 #   MARKET_REGIME_NEUTRAL_ALLOW_BUY=true
 #   MARKET_REGIME_NEUTRAL_POSITION_SCALE=1.0
 # - 기본 TTL은 60초입니다.
 # - legacy main loop가 실제로 충분히 촘촘하게 돈다고 확인된 뒤에만
 #   MARKET_REGIME_OPENING_CACHE_TTL_SEC=30 으로 낮추는 것을 권장합니다.
+# - 일반 refresh budget과 first snapshot bootstrap budget은 다릅니다.
+# - bootstrap budget은 previous snapshot이 없을 때만 적용됩니다.
 ENABLE_MARKET_REGIME_FILTER: bool = os.getenv("ENABLE_MARKET_REGIME_FILTER", "false").lower() in (
     "true",
     "1",
@@ -519,6 +522,9 @@ MARKET_REGIME_FAIL_MODE: str = (
 )
 MARKET_REGIME_REFRESH_BUDGET_SEC: float = float(
     os.getenv("MARKET_REGIME_REFRESH_BUDGET_SEC", "1.5")
+)
+MARKET_REGIME_BOOTSTRAP_BUDGET_SEC: float = float(
+    os.getenv("MARKET_REGIME_BOOTSTRAP_BUDGET_SEC", "3.0")
 )
 MARKET_REGIME_BAD_BLOCK_NEW_BUY: bool = os.getenv("MARKET_REGIME_BAD_BLOCK_NEW_BUY", "true").lower() in (
     "true",

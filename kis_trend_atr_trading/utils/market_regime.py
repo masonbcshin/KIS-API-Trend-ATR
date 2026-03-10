@@ -73,9 +73,33 @@ class MarketRegimeSnapshot:
         return replace(self, is_stale=(now_kst >= self.stale_after))
 
 
+@dataclass(frozen=True)
+class MarketRegimeProbeLoadResult:
+    probe: MarketRegimeProbe
+    daily_fetch_elapsed_sec: float = 0.0
+    intraday_fetch_elapsed_sec: float = 0.0
+
+
+@dataclass(frozen=True)
+class MarketRegimeBuildResult:
+    snapshot: MarketRegimeSnapshot
+    daily_fetch_elapsed_sec: float = 0.0
+    intraday_fetch_elapsed_sec: float = 0.0
+    classify_elapsed_sec: float = 0.0
+    total_refresh_elapsed_sec: float = 0.0
+
+
 @dataclass
 class MarketRegimeLoopContext:
     refresh_attempted: bool = False
+
+
+@dataclass
+class MarketRegimeObservationState:
+    startup_monotonic: float
+    first_snapshot_logged: bool = False
+    session_first_snapshot_logged_date: Optional[str] = None
+    last_no_snapshot_warning_key: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -87,6 +111,18 @@ class MarketRegimeRefreshOutcome:
     budget_exceeded: bool = False
     error: Optional[str] = None
     refresh_skipped_reason: str = ""
+    daily_fetch_elapsed_sec: float = 0.0
+    intraday_fetch_elapsed_sec: float = 0.0
+    classify_elapsed_sec: float = 0.0
+    effective_budget_sec: float = 0.0
+    bootstrap_budget_sec: float = 0.0
+    used_bootstrap_budget: bool = False
+    previous_as_of: Optional[str] = None
+    using_previous_snapshot: bool = False
+
+    @property
+    def total_refresh_elapsed_sec(self) -> float:
+        return max(float(self.elapsed_sec or 0.0), 0.0)
 
 
 def ensure_kst(check_time: Optional[datetime]) -> datetime:
@@ -108,6 +144,10 @@ def get_market_regime_cache_ttl_sec(check_time: Optional[datetime] = None) -> in
 
 def get_market_regime_refresh_budget_sec() -> float:
     return max(float(getattr(settings, "MARKET_REGIME_REFRESH_BUDGET_SEC", 1.5) or 1.5), 0.0)
+
+
+def get_market_regime_bootstrap_budget_sec() -> float:
+    return max(float(getattr(settings, "MARKET_REGIME_BOOTSTRAP_BUDGET_SEC", 3.0) or 3.0), 0.0)
 
 
 def get_market_regime_fail_mode() -> str:
@@ -135,7 +175,7 @@ def is_market_regime_snapshot_expired(
 
 def refresh_shared_market_regime_snapshot(
     current_snapshot: Optional[MarketRegimeSnapshot],
-    refresh_fn: Callable[[datetime], MarketRegimeSnapshot],
+    refresh_fn: Callable[[datetime], Any],
     check_time: Optional[datetime] = None,
     loop_context: Optional[MarketRegimeLoopContext] = None,
     budget_sec: Optional[float] = None,
@@ -149,6 +189,7 @@ def refresh_shared_market_regime_snapshot(
             refreshed=False,
             refresh_attempted=False,
             refresh_skipped_reason="fresh_snapshot",
+            previous_as_of=(current_snapshot.as_of.isoformat() if current_snapshot is not None else None),
         )
 
     if loop_context is not None and loop_context.refresh_attempted:
@@ -157,6 +198,7 @@ def refresh_shared_market_regime_snapshot(
             refreshed=False,
             refresh_attempted=False,
             refresh_skipped_reason="loop_refresh_already_attempted",
+            previous_as_of=(current_snapshot.as_of.isoformat() if current_snapshot is not None else None),
         )
 
     if loop_context is not None:
@@ -164,7 +206,7 @@ def refresh_shared_market_regime_snapshot(
 
     started_at = monotonic()
     try:
-        refreshed_snapshot = refresh_fn(now_kst)
+        refreshed_result = refresh_fn(now_kst)
     except Exception as exc:
         return MarketRegimeRefreshOutcome(
             snapshot=current_snapshot,
@@ -172,28 +214,59 @@ def refresh_shared_market_regime_snapshot(
             refresh_attempted=True,
             elapsed_sec=(monotonic() - started_at),
             error=str(exc),
+            previous_as_of=(current_snapshot.as_of.isoformat() if current_snapshot is not None else None),
+            using_previous_snapshot=(current_snapshot is not None),
         )
 
     elapsed_sec = monotonic() - started_at
-    effective_budget_sec = (
+    build_result = coerce_market_regime_build_result(
+        refreshed_result,
+        fallback_total_elapsed_sec=elapsed_sec,
+    )
+    total_refresh_elapsed_sec = max(
+        elapsed_sec,
+        float(build_result.total_refresh_elapsed_sec or 0.0),
+    )
+    general_budget_sec = (
         get_market_regime_refresh_budget_sec()
         if budget_sec is None
         else max(float(budget_sec or 0.0), 0.0)
     )
-    if effective_budget_sec > 0 and elapsed_sec > effective_budget_sec:
+    bootstrap_budget_sec = get_market_regime_bootstrap_budget_sec()
+    used_bootstrap_budget = current_snapshot is None and bootstrap_budget_sec > 0
+    effective_budget_sec = bootstrap_budget_sec if used_bootstrap_budget else general_budget_sec
+    previous_as_of = current_snapshot.as_of.isoformat() if current_snapshot is not None else None
+    using_previous_snapshot = current_snapshot is not None
+    if effective_budget_sec > 0 and total_refresh_elapsed_sec > effective_budget_sec:
         return MarketRegimeRefreshOutcome(
             snapshot=current_snapshot,
             refreshed=False,
             refresh_attempted=True,
-            elapsed_sec=elapsed_sec,
+            elapsed_sec=total_refresh_elapsed_sec,
             budget_exceeded=True,
+            daily_fetch_elapsed_sec=build_result.daily_fetch_elapsed_sec,
+            intraday_fetch_elapsed_sec=build_result.intraday_fetch_elapsed_sec,
+            classify_elapsed_sec=build_result.classify_elapsed_sec,
+            effective_budget_sec=effective_budget_sec,
+            bootstrap_budget_sec=bootstrap_budget_sec,
+            used_bootstrap_budget=used_bootstrap_budget,
+            previous_as_of=previous_as_of,
+            using_previous_snapshot=using_previous_snapshot,
         )
 
     return MarketRegimeRefreshOutcome(
-        snapshot=materialize_market_regime_snapshot(refreshed_snapshot, now_kst),
+        snapshot=materialize_market_regime_snapshot(build_result.snapshot, now_kst),
         refreshed=True,
         refresh_attempted=True,
-        elapsed_sec=elapsed_sec,
+        elapsed_sec=total_refresh_elapsed_sec,
+        daily_fetch_elapsed_sec=build_result.daily_fetch_elapsed_sec,
+        intraday_fetch_elapsed_sec=build_result.intraday_fetch_elapsed_sec,
+        classify_elapsed_sec=build_result.classify_elapsed_sec,
+        effective_budget_sec=effective_budget_sec,
+        bootstrap_budget_sec=bootstrap_budget_sec,
+        used_bootstrap_budget=used_bootstrap_budget,
+        previous_as_of=previous_as_of,
+        using_previous_snapshot=using_previous_snapshot,
     )
 
 
@@ -203,7 +276,12 @@ class MarketRegimeService:
     def __init__(self, api: Any):
         self.api = api
 
-    def build_snapshot(self, check_time: Optional[datetime] = None) -> MarketRegimeSnapshot:
+    def build_snapshot(
+        self,
+        check_time: Optional[datetime] = None,
+        include_metrics: bool = False,
+    ) -> Any:
+        started_at = monotonic()
         now_kst = ensure_kst(check_time)
         ma_period = max(int(getattr(settings, "MARKET_REGIME_MA_PERIOD", 20) or 20), 1)
         lookback_days = max(int(getattr(settings, "MARKET_REGIME_LOOKBACK_DAYS", 3) or 3), 1)
@@ -212,21 +290,24 @@ class MarketRegimeService:
         )
         intraday_guard_active = is_opening_guard_window(now_kst)
 
-        kospi = self._load_probe(
+        kospi_result = self._load_probe(
             symbol=str(getattr(settings, "MARKET_REGIME_KOSPI_SYMBOL", "069500") or "069500"),
             ma_period=ma_period,
             lookback_days=lookback_days,
             as_of=now_kst,
             load_intraday=intraday_guard_active,
         )
-        kosdaq = self._load_probe(
+        kosdaq_result = self._load_probe(
             symbol=str(getattr(settings, "MARKET_REGIME_KOSDAQ_SYMBOL", "229200") or "229200"),
             ma_period=ma_period,
             lookback_days=lookback_days,
             as_of=now_kst,
             load_intraday=intraday_guard_active,
         )
+        kospi = kospi_result.probe
+        kosdaq = kosdaq_result.probe
 
+        classify_started_at = monotonic()
         regime, reason = self._classify_daily(
             kospi=kospi,
             kosdaq=kosdaq,
@@ -239,6 +320,7 @@ class MarketRegimeService:
             kosdaq=kosdaq,
             check_time=now_kst,
         )
+        classify_elapsed_sec = monotonic() - classify_started_at
 
         ttl_sec = get_market_regime_cache_ttl_sec(now_kst)
         stale_max_sec = max(
@@ -265,7 +347,19 @@ class MarketRegimeService:
             source="main_loop_cache",
         )
         self._log_snapshot(snapshot)
-        return snapshot
+        if not include_metrics:
+            return snapshot
+        return MarketRegimeBuildResult(
+            snapshot=snapshot,
+            daily_fetch_elapsed_sec=(
+                kospi_result.daily_fetch_elapsed_sec + kosdaq_result.daily_fetch_elapsed_sec
+            ),
+            intraday_fetch_elapsed_sec=(
+                kospi_result.intraday_fetch_elapsed_sec + kosdaq_result.intraday_fetch_elapsed_sec
+            ),
+            classify_elapsed_sec=classify_elapsed_sec,
+            total_refresh_elapsed_sec=(monotonic() - started_at),
+        )
 
     def _load_probe(
         self,
@@ -274,8 +368,10 @@ class MarketRegimeService:
         lookback_days: int,
         as_of: datetime,
         load_intraday: bool,
-    ) -> MarketRegimeProbe:
+    ) -> MarketRegimeProbeLoadResult:
+        daily_fetch_started_at = monotonic()
         bars = self.api.get_daily_ohlcv(stock_code=symbol, period_type="D")
+        daily_fetch_elapsed_sec = monotonic() - daily_fetch_started_at
         if not isinstance(bars, pd.DataFrame) or bars.empty:
             raise ValueError(f"market regime daily data missing: symbol={symbol}")
 
@@ -303,24 +399,30 @@ class MarketRegimeService:
         if prev_close <= 0:
             raise ValueError(f"market regime invalid previous close: symbol={symbol}")
 
-        intraday = (
-            self._load_intraday_probe(symbol)
-            if load_intraday
-            else {
+        intraday_fetch_elapsed_sec = 0.0
+        if load_intraday:
+            intraday_fetch_started_at = monotonic()
+            intraday = self._load_intraday_probe(symbol)
+            intraday_fetch_elapsed_sec = monotonic() - intraday_fetch_started_at
+        else:
+            intraday = {
                 "current_price": None,
                 "open_price": None,
                 "intraday_open_return_pct": None,
             }
-        )
-        return MarketRegimeProbe(
-            symbol=symbol,
-            close=close,
-            ma=ma,
-            return_pct=(close / prev_close) - 1.0,
-            above_ma=(close > ma),
-            current_price=intraday.get("current_price"),
-            open_price=intraday.get("open_price"),
-            intraday_open_return_pct=intraday.get("intraday_open_return_pct"),
+        return MarketRegimeProbeLoadResult(
+            probe=MarketRegimeProbe(
+                symbol=symbol,
+                close=close,
+                ma=ma,
+                return_pct=(close / prev_close) - 1.0,
+                above_ma=(close > ma),
+                current_price=intraday.get("current_price"),
+                open_price=intraday.get("open_price"),
+                intraday_open_return_pct=intraday.get("intraday_open_return_pct"),
+            ),
+            daily_fetch_elapsed_sec=daily_fetch_elapsed_sec,
+            intraday_fetch_elapsed_sec=intraday_fetch_elapsed_sec,
         )
 
     def _load_intraday_probe(self, symbol: str) -> dict[str, Optional[float]]:
@@ -430,3 +532,125 @@ def is_opening_guard_window(check_time: Optional[datetime] = None) -> bool:
     )
     elapsed_sec = (now_kst - market_open_dt).total_seconds()
     return 0 <= elapsed_sec <= (guard_minutes * 60)
+
+
+def coerce_market_regime_build_result(
+    raw_result: Any,
+    *,
+    fallback_total_elapsed_sec: float = 0.0,
+) -> MarketRegimeBuildResult:
+    if isinstance(raw_result, MarketRegimeBuildResult):
+        total_refresh_elapsed_sec = max(
+            float(raw_result.total_refresh_elapsed_sec or 0.0),
+            float(fallback_total_elapsed_sec or 0.0),
+        )
+        return replace(raw_result, total_refresh_elapsed_sec=total_refresh_elapsed_sec)
+    if isinstance(raw_result, MarketRegimeSnapshot):
+        return MarketRegimeBuildResult(
+            snapshot=raw_result,
+            total_refresh_elapsed_sec=max(float(fallback_total_elapsed_sec or 0.0), 0.0),
+        )
+    raise TypeError(
+        "refresh_fn must return MarketRegimeSnapshot or MarketRegimeBuildResult: "
+        f"type={type(raw_result).__name__}"
+    )
+
+
+def log_market_regime_refresh_outcome(
+    outcome: MarketRegimeRefreshOutcome,
+    snapshot: Optional[MarketRegimeSnapshot],
+) -> None:
+    if outcome.refreshed and snapshot is not None:
+        ttl_sec = max((snapshot.expires_at - snapshot.as_of).total_seconds(), 0.0)
+        logger.info(
+            "[MARKET_REGIME] snapshot_updated regime=%s reason=%s as_of=%s "
+            "expires_at=%s ttl_sec=%.1f source=%s kospi_symbol=%s kosdaq_symbol=%s "
+            "kospi_close=%.6f kospi_ma=%.6f kosdaq_close=%.6f kosdaq_ma=%.6f "
+            "total_refresh_elapsed_sec=%.3f daily_fetch_elapsed_sec=%.3f "
+            "intraday_fetch_elapsed_sec=%.3f classify_elapsed_sec=%.3f",
+            snapshot.regime.value,
+            snapshot.reason,
+            snapshot.as_of.isoformat(),
+            snapshot.expires_at.isoformat(),
+            ttl_sec,
+            snapshot.source,
+            snapshot.kospi_symbol,
+            snapshot.kosdaq_symbol,
+            snapshot.kospi_close,
+            snapshot.kospi_ma,
+            snapshot.kosdaq_close,
+            snapshot.kosdaq_ma,
+            outcome.total_refresh_elapsed_sec,
+            max(float(outcome.daily_fetch_elapsed_sec or 0.0), 0.0),
+            max(float(outcome.intraday_fetch_elapsed_sec or 0.0), 0.0),
+            max(float(outcome.classify_elapsed_sec or 0.0), 0.0),
+        )
+        return
+
+    if outcome.budget_exceeded:
+        logger.warning(
+            "[MARKET_REGIME] snapshot_refresh_budget_exceeded budget_sec=%.3f "
+            "total_refresh_elapsed_sec=%.3f daily_fetch_elapsed_sec=%.3f "
+            "intraday_fetch_elapsed_sec=%.3f classify_elapsed_sec=%.3f "
+            "using_previous_snapshot=%s previous_as_of=%s",
+            max(float(outcome.effective_budget_sec or 0.0), 0.0),
+            outcome.total_refresh_elapsed_sec,
+            max(float(outcome.daily_fetch_elapsed_sec or 0.0), 0.0),
+            max(float(outcome.intraday_fetch_elapsed_sec or 0.0), 0.0),
+            max(float(outcome.classify_elapsed_sec or 0.0), 0.0),
+            str(bool(outcome.using_previous_snapshot)).lower(),
+            outcome.previous_as_of or "none",
+        )
+
+
+def observe_market_regime_snapshot(
+    *,
+    observation_state: MarketRegimeObservationState,
+    snapshot: Optional[MarketRegimeSnapshot],
+    now_kst: Optional[datetime] = None,
+    in_session: bool = False,
+    filter_enabled: bool = False,
+) -> None:
+    now_kst = ensure_kst(now_kst)
+    if snapshot is not None and not observation_state.first_snapshot_logged:
+        logger.info(
+            "[MARKET_REGIME] first_snapshot_created as_of=%s startup_to_first_snapshot_sec=%.3f",
+            snapshot.as_of.isoformat(),
+            max(monotonic() - observation_state.startup_monotonic, 0.0),
+        )
+        observation_state.first_snapshot_logged = True
+
+    market_open_dt = now_kst.replace(
+        hour=MARKET_OPEN.hour,
+        minute=MARKET_OPEN.minute,
+        second=0,
+        microsecond=0,
+    )
+    session_key = market_open_dt.strftime("%Y-%m-%d")
+    if in_session and snapshot is not None and observation_state.session_first_snapshot_logged_date != session_key:
+        logger.info(
+            "[MARKET_REGIME] session_first_snapshot_created as_of=%s session_start_to_first_snapshot_sec=%.3f",
+            snapshot.as_of.isoformat(),
+            max((snapshot.as_of - market_open_dt).total_seconds(), 0.0),
+        )
+        observation_state.session_first_snapshot_logged_date = session_key
+
+    if snapshot is not None or not in_session:
+        observation_state.last_no_snapshot_warning_key = None
+
+    if not in_session or not filter_enabled or snapshot is not None:
+        return
+
+    elapsed_since_session_start_sec = max((now_kst - market_open_dt).total_seconds(), 0.0)
+    if elapsed_since_session_start_sec > 1800:
+        return
+
+    warning_key = f"{session_key}:{int(elapsed_since_session_start_sec // 60)}"
+    if observation_state.last_no_snapshot_warning_key == warning_key:
+        return
+    observation_state.last_no_snapshot_warning_key = warning_key
+    logger.warning(
+        "[MARKET_REGIME] no_snapshot_yet elapsed_since_session_start_sec=%.1f fail_mode=%s",
+        elapsed_since_session_start_sec,
+        get_market_regime_fail_mode(),
+    )

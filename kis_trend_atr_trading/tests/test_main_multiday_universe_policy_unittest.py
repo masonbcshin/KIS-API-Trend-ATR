@@ -205,6 +205,9 @@ class _DummyExecutor:
         self.__class__.restore_calls.append(self.stock_code)
         return self.strategy.has_position
 
+    def set_market_regime_snapshot(self, snapshot):
+        return None
+
     def run_once(self):
         self.__class__.run_once_calls.append(self.stock_code)
 

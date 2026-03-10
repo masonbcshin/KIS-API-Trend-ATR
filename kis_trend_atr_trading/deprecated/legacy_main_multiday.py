@@ -65,10 +65,13 @@ from kis_trend_atr_trading.utils.logger import setup_logger, get_logger
 from kis_trend_atr_trading.utils.market_hours import KST, MarketSessionState, get_market_session_state
 from kis_trend_atr_trading.utils.market_phase import TradingVenue, resolve_market_phase_context
 from kis_trend_atr_trading.utils.market_regime import (
+    MarketRegimeObservationState,
     MarketRegimeService,
     MarketRegimeLoopContext,
     get_market_regime_refresh_budget_sec,
+    log_market_regime_refresh_outcome,
     materialize_market_regime_snapshot,
+    observe_market_regime_snapshot,
     refresh_shared_market_regime_snapshot,
 )
 from kis_trend_atr_trading.utils.position_store import PositionStore
@@ -896,6 +899,60 @@ def run_trade(
                 return "ws"
             return "rest"
 
+        previous_loop_started_monotonic = None
+        market_regime_observation_state = MarketRegimeObservationState(
+            startup_monotonic=time.monotonic()
+        )
+
+        def _format_optional_elapsed_sec(value) -> str:
+            if value is None:
+                return "none"
+            return f"{max(float(value), 0.0):.3f}"
+
+        def _snapshot_as_of(snapshot) -> str:
+            if snapshot is None:
+                return "none"
+            return snapshot.as_of.isoformat()
+
+        def _snapshot_is_stale(snapshot) -> str:
+            return str(bool(snapshot is not None and getattr(snapshot, "is_stale", False))).lower()
+
+        def _log_market_regime_refresh_skipped(reason: str, elapsed_sec: float, snapshot) -> None:
+            logger.info(
+                "[MARKET_REGIME] snapshot_refresh_skipped reason=%s elapsed_sec=%.3f "
+                "snapshot_as_of=%s snapshot_stale=%s",
+                reason or "unknown",
+                max(float(elapsed_sec or 0.0), 0.0),
+                _snapshot_as_of(snapshot),
+                _snapshot_is_stale(snapshot),
+            )
+
+        def _log_loop_metric(
+            *,
+            iteration: int,
+            loop_started_monotonic: float,
+            since_prev_loop_start_sec,
+            symbols_count: int,
+            market_regime_refresh_state: str,
+            market_regime_refresh_elapsed_sec: float,
+            market_regime_snapshot,
+            market_regime_refresh_skip_reason: str,
+        ) -> None:
+            logger.info(
+                "[LOOP_METRIC] iteration=%s elapsed_sec=%.3f since_prev_loop_start_sec=%s "
+                "symbols=%s market_regime_refresh_state=%s "
+                "market_regime_refresh_elapsed_sec=%.3f market_regime_snapshot_stale=%s "
+                "market_regime_refresh_skip_reason=%s",
+                iteration,
+                max(time.monotonic() - loop_started_monotonic, 0.0),
+                _format_optional_elapsed_sec(since_prev_loop_start_sec),
+                symbols_count,
+                market_regime_refresh_state,
+                max(float(market_regime_refresh_elapsed_sec or 0.0), 0.0),
+                _snapshot_is_stale(market_regime_snapshot),
+                market_regime_refresh_skip_reason or "none",
+            )
+
         iteration = 0
         active_feed_name = "rest"
         last_status_log_at = None
@@ -903,6 +960,16 @@ def run_trade(
         last_prewarm_prepare_date = None
         while True:
             iteration += 1
+            loop_started_monotonic = time.monotonic()
+            since_prev_loop_start_sec = (
+                None
+                if previous_loop_started_monotonic is None
+                else max(loop_started_monotonic - previous_loop_started_monotonic, 0.0)
+            )
+            previous_loop_started_monotonic = loop_started_monotonic
+            market_regime_refresh_state = "skipped"
+            market_regime_refresh_elapsed_sec = 0.0
+            market_regime_refresh_skip_reason = "filter_disabled"
             market_regime_loop_context = MarketRegimeLoopContext()
             if hasattr(api, "prewarm_access_token_if_due"):
                 api.prewarm_access_token_if_due()
@@ -1186,70 +1253,94 @@ def run_trade(
                 shared_market_regime_snapshot,
                 now_kst,
             )
+            market_regime_filter_enabled = bool(
+                getattr(settings, "ENABLE_MARKET_REGIME_FILTER", False)
+            )
             should_refresh_market_regime = (
-                bool(getattr(settings, "ENABLE_MARKET_REGIME_FILTER", False))
+                market_regime_filter_enabled
                 and decision.policy.allow_new_entries
                 and decision.policy.run_strategy
                 and free_slots > 0
                 and bool(entry_candidates)
             )
+            if not market_regime_filter_enabled:
+                market_regime_refresh_skip_reason = "filter_disabled"
+            elif not decision.policy.allow_new_entries:
+                market_regime_refresh_skip_reason = "new_entries_not_allowed"
+            elif not decision.policy.run_strategy:
+                market_regime_refresh_skip_reason = "strategy_disabled"
+            elif free_slots <= 0:
+                market_regime_refresh_skip_reason = "no_free_slots"
+            elif not entry_candidates:
+                market_regime_refresh_skip_reason = "no_entry_candidates"
+            else:
+                market_regime_refresh_skip_reason = "refresh_required"
             if should_refresh_market_regime:
                 refresh_outcome = refresh_shared_market_regime_snapshot(
                     current_snapshot=shared_market_regime_snapshot,
                     refresh_fn=lambda refresh_now: market_regime_service.build_snapshot(
-                        check_time=refresh_now
+                        check_time=refresh_now,
+                        include_metrics=True,
                     ),
                     check_time=now_kst,
                     loop_context=market_regime_loop_context,
                     budget_sec=get_market_regime_refresh_budget_sec(),
                 )
                 shared_market_regime_snapshot = refresh_outcome.snapshot
+                market_regime_refresh_elapsed_sec = refresh_outcome.total_refresh_elapsed_sec
                 if refresh_outcome.refreshed and shared_market_regime_snapshot is not None:
-                    ttl_sec = max(
-                        (shared_market_regime_snapshot.expires_at - shared_market_regime_snapshot.as_of).total_seconds(),
-                        0.0,
-                    )
-                    logger.info(
-                        "[MARKET_REGIME] snapshot_updated regime=%s reason=%s as_of=%s "
-                        "expires_at=%s ttl_sec=%.1f source=%s kospi_symbol=%s kosdaq_symbol=%s "
-                        "kospi_close=%.6f kospi_ma=%.6f kosdaq_close=%.6f kosdaq_ma=%.6f",
-                        shared_market_regime_snapshot.regime.value,
-                        shared_market_regime_snapshot.reason,
-                        shared_market_regime_snapshot.as_of.isoformat(),
-                        shared_market_regime_snapshot.expires_at.isoformat(),
-                        ttl_sec,
-                        shared_market_regime_snapshot.source,
-                        shared_market_regime_snapshot.kospi_symbol,
-                        shared_market_regime_snapshot.kosdaq_symbol,
-                        shared_market_regime_snapshot.kospi_close,
-                        shared_market_regime_snapshot.kospi_ma,
-                        shared_market_regime_snapshot.kosdaq_close,
-                        shared_market_regime_snapshot.kosdaq_ma,
+                    market_regime_refresh_state = "refreshed"
+                    market_regime_refresh_skip_reason = "none"
+                    log_market_regime_refresh_outcome(
+                        refresh_outcome,
+                        shared_market_regime_snapshot,
                     )
                 elif refresh_outcome.budget_exceeded:
-                    previous_as_of = (
-                        shared_market_regime_snapshot.as_of.isoformat()
-                        if shared_market_regime_snapshot is not None
-                        else "none"
-                    )
-                    logger.warning(
-                        "[MARKET_REGIME] snapshot_refresh_budget_exceeded budget_sec=%.3f "
-                        "elapsed_sec=%.3f using_previous_snapshot=true previous_as_of=%s",
-                        get_market_regime_refresh_budget_sec(),
-                        refresh_outcome.elapsed_sec,
-                        previous_as_of,
+                    market_regime_refresh_state = "budget_exceeded"
+                    market_regime_refresh_skip_reason = "budget_exceeded"
+                    log_market_regime_refresh_outcome(
+                        refresh_outcome,
+                        shared_market_regime_snapshot,
                     )
                 elif refresh_outcome.error:
+                    market_regime_refresh_state = "failed"
+                    market_regime_refresh_skip_reason = "refresh_error"
                     last_success_at = (
                         shared_market_regime_snapshot.as_of.isoformat()
                         if shared_market_regime_snapshot is not None
                         else "none"
                     )
                     logger.warning(
-                        "[MARKET_REGIME] snapshot_update_failed error=%s last_success_at=%s",
+                        "[MARKET_REGIME] snapshot_update_failed error=%s elapsed_sec=%.3f "
+                        "last_success_at=%s",
                         refresh_outcome.error,
+                        refresh_outcome.total_refresh_elapsed_sec,
                         last_success_at,
                     )
+                else:
+                    market_regime_refresh_state = "skipped"
+                    market_regime_refresh_skip_reason = (
+                        refresh_outcome.refresh_skipped_reason or "unknown"
+                    )
+                    _log_market_regime_refresh_skipped(
+                        market_regime_refresh_skip_reason,
+                        refresh_outcome.total_refresh_elapsed_sec,
+                        shared_market_regime_snapshot,
+                    )
+            elif market_regime_filter_enabled:
+                _log_market_regime_refresh_skipped(
+                    market_regime_refresh_skip_reason,
+                    market_regime_refresh_elapsed_sec,
+                    shared_market_regime_snapshot,
+                )
+
+            observe_market_regime_snapshot(
+                observation_state=market_regime_observation_state,
+                snapshot=shared_market_regime_snapshot,
+                now_kst=now_kst,
+                in_session=_state_equals(decision.market_state, MarketSessionState.IN_SESSION),
+                filter_enabled=market_regime_filter_enabled,
+            )
 
             for executor in active_executors:
                 executor.set_market_regime_snapshot(shared_market_regime_snapshot)
@@ -1385,6 +1476,16 @@ def run_trade(
                     last_postclose_report_date = report_date
 
             if max_runs and iteration >= max_runs:
+                _log_loop_metric(
+                    iteration=iteration,
+                    loop_started_monotonic=loop_started_monotonic,
+                    since_prev_loop_start_sec=since_prev_loop_start_sec,
+                    symbols_count=len(active_executors),
+                    market_regime_refresh_state=market_regime_refresh_state,
+                    market_regime_refresh_elapsed_sec=market_regime_refresh_elapsed_sec,
+                    market_regime_snapshot=shared_market_regime_snapshot,
+                    market_regime_refresh_skip_reason=market_regime_refresh_skip_reason,
+                )
                 logger.info(f"[MULTI] 최대 반복 도달: {max_runs}")
                 break
 
@@ -1395,6 +1496,16 @@ def run_trade(
             else:
                 sleep_sec = max(int(decision.policy.sleep_sec), 5)
 
+            _log_loop_metric(
+                iteration=iteration,
+                loop_started_monotonic=loop_started_monotonic,
+                since_prev_loop_start_sec=since_prev_loop_start_sec,
+                symbols_count=len(active_executors),
+                market_regime_refresh_state=market_regime_refresh_state,
+                market_regime_refresh_elapsed_sec=market_regime_refresh_elapsed_sec,
+                market_regime_snapshot=shared_market_regime_snapshot,
+                market_regime_refresh_skip_reason=market_regime_refresh_skip_reason,
+            )
             logger.info(
                 "[MULTI] 다음 실행까지 %s초 대기 (market=%s overlay=%s feed=%s)",
                 sleep_sec,

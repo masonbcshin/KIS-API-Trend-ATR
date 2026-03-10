@@ -108,6 +108,7 @@ def _regime_settings(**overrides):
         "MARKET_REGIME_STALE_MAX_SEC": 180,
         "MARKET_REGIME_FAIL_MODE": "closed",
         "MARKET_REGIME_REFRESH_BUDGET_SEC": 1.5,
+        "MARKET_REGIME_BOOTSTRAP_BUDGET_SEC": 3.0,
         "MARKET_REGIME_BAD_BLOCK_NEW_BUY": True,
         "MARKET_REGIME_NEUTRAL_ALLOW_BUY": True,
         "MARKET_REGIME_NEUTRAL_POSITION_SCALE": 1.0,
@@ -440,6 +441,143 @@ def test_refresh_budget_exceeded_reuses_previous_snapshot():
     assert outcome.refreshed is False
     assert outcome.budget_exceeded is True
     assert outcome.snapshot.as_of == previous_snapshot.as_of
+    assert outcome.using_previous_snapshot is True
+    assert outcome.previous_as_of == previous_snapshot.as_of.isoformat()
+
+
+def test_first_snapshot_bootstrap_budget_allows_initial_snapshot_without_previous():
+    now_kst = _kst_dt(2026, 3, 2, 9, 1)
+
+    with patch.object(market_regime, "monotonic", side_effect=[0.0, 2.0]):
+        outcome = market_regime.refresh_shared_market_regime_snapshot(
+            current_snapshot=None,
+            refresh_fn=lambda refresh_now: _make_shared_snapshot(
+                market_regime.MarketRegime.GOOD,
+                "bootstrap_snapshot",
+                as_of=refresh_now,
+            ),
+            check_time=now_kst,
+            loop_context=market_regime.MarketRegimeLoopContext(),
+            budget_sec=1.5,
+        )
+
+    assert outcome.refreshed is True
+    assert outcome.budget_exceeded is False
+    assert outcome.snapshot is not None
+    assert outcome.used_bootstrap_budget is True
+    assert outcome.effective_budget_sec == 3.0
+
+
+def test_first_snapshot_bootstrap_budget_exceeded_keeps_snapshot_empty():
+    now_kst = _kst_dt(2026, 3, 2, 9, 1)
+
+    with patch.object(market_regime, "monotonic", side_effect=[0.0, 4.0]):
+        outcome = market_regime.refresh_shared_market_regime_snapshot(
+            current_snapshot=None,
+            refresh_fn=lambda refresh_now: _make_shared_snapshot(
+                market_regime.MarketRegime.GOOD,
+                "bootstrap_snapshot",
+                as_of=refresh_now,
+            ),
+            check_time=now_kst,
+            loop_context=market_regime.MarketRegimeLoopContext(),
+            budget_sec=1.5,
+        )
+
+    assert outcome.refreshed is False
+    assert outcome.budget_exceeded is True
+    assert outcome.snapshot is None
+    assert outcome.using_previous_snapshot is False
+    assert outcome.previous_as_of is None
+
+
+def test_observe_market_regime_snapshot_logs_first_snapshot_created(caplog):
+    now_kst = _kst_dt(2026, 3, 2, 9, 5)
+    observation_state = market_regime.MarketRegimeObservationState(startup_monotonic=0.0)
+    snapshot = _make_shared_snapshot(
+        market_regime.MarketRegime.GOOD,
+        "both_above_ma_and_stable_3d",
+        as_of=now_kst,
+    )
+
+    with patch.object(market_regime, "monotonic", return_value=1.25):
+        market_regime.observe_market_regime_snapshot(
+            observation_state=observation_state,
+            snapshot=snapshot,
+            now_kst=now_kst,
+            in_session=True,
+            filter_enabled=True,
+        )
+
+    assert "first_snapshot_created" in caplog.text
+    assert "startup_to_first_snapshot_sec=1.250" in caplog.text
+    assert "session_first_snapshot_created" in caplog.text
+
+
+def test_log_market_regime_refresh_outcome_includes_elapsed_breakdown_fields(caplog):
+    now_kst = _kst_dt(2026, 3, 2, 9, 5)
+    snapshot = _make_shared_snapshot(
+        market_regime.MarketRegime.GOOD,
+        "both_above_ma_and_stable_3d",
+        as_of=now_kst,
+    )
+    outcome = market_regime.MarketRegimeRefreshOutcome(
+        snapshot=snapshot,
+        refreshed=True,
+        refresh_attempted=True,
+        elapsed_sec=1.234,
+        daily_fetch_elapsed_sec=0.456,
+        intraday_fetch_elapsed_sec=0.321,
+        classify_elapsed_sec=0.111,
+    )
+
+    market_regime.log_market_regime_refresh_outcome(outcome, snapshot)
+
+    assert "total_refresh_elapsed_sec=1.234" in caplog.text
+    assert "daily_fetch_elapsed_sec=0.456" in caplog.text
+    assert "intraday_fetch_elapsed_sec=0.321" in caplog.text
+    assert "classify_elapsed_sec=0.111" in caplog.text
+
+
+def test_budget_exceeded_log_includes_elapsed_breakdown_fields(caplog):
+    outcome = market_regime.MarketRegimeRefreshOutcome(
+        snapshot=None,
+        refreshed=False,
+        refresh_attempted=True,
+        elapsed_sec=2.345,
+        budget_exceeded=True,
+        daily_fetch_elapsed_sec=1.100,
+        intraday_fetch_elapsed_sec=0.900,
+        classify_elapsed_sec=0.200,
+        effective_budget_sec=1.500,
+        previous_as_of=None,
+        using_previous_snapshot=False,
+    )
+
+    market_regime.log_market_regime_refresh_outcome(outcome, None)
+
+    assert "snapshot_refresh_budget_exceeded" in caplog.text
+    assert "budget_sec=1.500" in caplog.text
+    assert "total_refresh_elapsed_sec=2.345" in caplog.text
+    assert "daily_fetch_elapsed_sec=1.100" in caplog.text
+    assert "intraday_fetch_elapsed_sec=0.900" in caplog.text
+    assert "classify_elapsed_sec=0.200" in caplog.text
+
+
+def test_observe_market_regime_snapshot_logs_no_snapshot_yet_warning(caplog):
+    now_kst = _kst_dt(2026, 3, 2, 9, 10)
+    observation_state = market_regime.MarketRegimeObservationState(startup_monotonic=0.0)
+
+    market_regime.observe_market_regime_snapshot(
+        observation_state=observation_state,
+        snapshot=None,
+        now_kst=now_kst,
+        in_session=True,
+        filter_enabled=True,
+    )
+
+    assert "no_snapshot_yet" in caplog.text
+    assert "elapsed_since_session_start_sec=600.0" in caplog.text
 
 
 def test_execute_buy_blocks_when_market_regime_is_bad():

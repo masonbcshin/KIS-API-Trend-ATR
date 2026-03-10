@@ -123,6 +123,9 @@ class _DummyExecutor:
     def restore_position_on_start(self):
         return False
 
+    def set_market_regime_snapshot(self, snapshot):
+        return None
+
     def run_once(self):
         _DummyExecutor.run_once_calls.append(self.stock_code)
 
@@ -140,28 +143,30 @@ class TestMainMultidayMultiSymbols(unittest.TestCase):
         _DummyExecutor.risk_manager_ids = []
         selector = _DummySelector()
 
-        with patch.object(main_multiday, "KISApi", _DummyAPI), \
-             patch.object(main_multiday, "MultidayExecutor", _DummyExecutor), \
-             patch.object(main_multiday, "MultidayTrendATRStrategy", lambda: object()), \
-             patch.object(main_multiday.UniverseSelector, "from_yaml", return_value=selector), \
-             patch.object(main_multiday, "get_trading_mode", return_value="PAPER"), \
-             patch.object(
-                 main_multiday,
-                 "get_market_session_state",
-                 return_value=(main_multiday.MarketSessionState.IN_SESSION, "regular_session_open"),
-             ), \
-             patch.object(main_multiday, "get_instance_lock", return_value=_DummyLock()), \
-             patch.object(main_multiday.settings, "validate_settings", return_value=True), \
-             patch.object(main_multiday.settings, "get_settings_summary", return_value=""):
-            main_multiday.run_trade(
-                stock_code=main_multiday.settings.DEFAULT_STOCK_CODE,
-                interval=0,
-                max_runs=1,
-            )
+        with self.assertLogs("main", level="INFO") as captured:
+            with patch.object(main_multiday, "KISApi", _DummyAPI), \
+                 patch.object(main_multiday, "MultidayExecutor", _DummyExecutor), \
+                 patch.object(main_multiday, "MultidayTrendATRStrategy", lambda: object()), \
+                 patch.object(main_multiday.UniverseSelector, "from_yaml", return_value=selector), \
+                 patch.object(main_multiday, "get_trading_mode", return_value="PAPER"), \
+                 patch.object(
+                     main_multiday,
+                     "get_market_session_state",
+                     return_value=(main_multiday.MarketSessionState.IN_SESSION, "regular_session_open"),
+                 ), \
+                 patch.object(main_multiday, "get_instance_lock", return_value=_DummyLock()), \
+                 patch.object(main_multiday.settings, "validate_settings", return_value=True), \
+                 patch.object(main_multiday.settings, "get_settings_summary", return_value=""):
+                main_multiday.run_trade(
+                    stock_code=main_multiday.settings.DEFAULT_STOCK_CODE,
+                    interval=0,
+                    max_runs=1,
+                )
 
         self.assertEqual(_DummyExecutor.created_symbols, ["005930", "000660"])
         self.assertEqual(_DummyExecutor.run_once_calls, ["005930", "000660"])
         self.assertEqual(len(set(_DummyExecutor.risk_manager_ids)), 1)
+        self.assertTrue(any("[LOOP_METRIC]" in line for line in captured.output))
 
 
 if __name__ == "__main__":
