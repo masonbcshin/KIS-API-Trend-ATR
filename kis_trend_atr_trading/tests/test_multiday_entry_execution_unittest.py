@@ -1,15 +1,24 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
+import threading
 import sys
 from unittest.mock import patch
+
+import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import engine.multiday_executor as multiday_executor
+from engine.pullback_pipeline_models import PullbackEntryIntent, PullbackSetupCandidate
+from engine.pullback_pipeline_stores import ArmedCandidateStore, EntryIntentQueue
+from engine.pullback_pipeline_workers import OrderExecutionWorker
 from engine.multiday_executor import MultidayExecutor
 from strategy.multiday_trend_atr import TradingSignal, SignalType, TrendType
+from strategy.pullback_rebreakout import PullbackCandidate, PullbackDecision
+from utils.market_hours import KST
 
 
 def _make_executor() -> MultidayExecutor:
@@ -159,3 +168,131 @@ def test_executor_builds_protected_limit_plan_using_orb_reference_price_and_cap(
     assert plan["entry_reference_price"] == 50750.0
     assert plan["entry_reference_label"] == "opening_range_high"
     assert round(plan["extension_pct_at_order"], 6) == round((50900.0 / 50750.0) - 1.0, 6)
+
+
+class _OrderWorkerStrategyStub:
+    def __init__(self):
+        self.has_position = False
+        self.pullback_strategy = self
+
+    def evaluate(self, **_kwargs):
+        return PullbackCandidate(
+            decision=PullbackDecision.BUY,
+            reason="건강한 눌림 후 재돌파 진입",
+            atr=2.0,
+            trigger_price=174.5,
+            meta={"strategy_tag": "pullback_rebreakout", "adx": 32.0},
+        )
+
+    def build_pullback_buy_signal(self, **_kwargs):
+        return TradingSignal(
+            signal_type=SignalType.BUY,
+            price=175.2,
+            atr=2.0,
+            trend=TrendType.UPTREND,
+            reason="threaded pullback",
+            meta={"strategy_tag": "pullback_rebreakout"},
+        )
+
+    def add_indicators(self, df):
+        return df
+
+
+class _OrderWorkerExecutorStub:
+    def __init__(self):
+        self.stock_code = "005930"
+        self.strategy = _OrderWorkerStrategyStub()
+        self.market_phase_context = None
+        self.market_venue_context = "KRX"
+        self.market_regime_snapshot = None
+        self.execute_buy_calls = 0
+
+    def _has_active_pending_buy_order(self):
+        return False
+
+    def fetch_quote_snapshot(self):
+        return {
+            "stock_code": "005930",
+            "stock_name": "삼성전자",
+            "current_price": 175.2,
+            "open_price": 173.4,
+            "received_at": KST.localize(datetime(2026, 2, 20, 10, 30)),
+        }
+
+    def fetch_market_data(self):
+        return pd.DataFrame(
+            {
+                "date": [datetime(2026, 2, 19), datetime(2026, 2, 20)],
+                "open": [173.0, 174.0],
+                "high": [174.0, 175.0],
+                "low": [172.0, 173.0],
+                "close": [173.5, 174.5],
+                "atr": [2.0, 2.0],
+                "adx": [32.0, 32.0],
+                "ma": [160.0, 160.0],
+                "ma20": [171.0, 171.0],
+                "prev_close": [172.0, 173.5],
+            }
+        )
+
+    def execute_buy(self, signal):
+        self.execute_buy_calls += 1
+        return {"success": True, "signal_price": signal.price}
+
+
+def test_order_worker_single_dispatches_pullback_entry_intent_once():
+    executor = _OrderWorkerExecutorStub()
+    store = ArmedCandidateStore()
+    entry_queue = EntryIntentQueue(maxsize=8)
+    worker = OrderExecutionWorker(
+        executor=executor,
+        candidate_store=store,
+        entry_queue=entry_queue,
+        stop_event=threading.Event(),
+        on_error=lambda *_args: None,
+    )
+    candidate = PullbackSetupCandidate(
+        symbol="005930",
+        strategy_tag="pullback_rebreakout",
+        created_at=KST.localize(datetime(2026, 2, 20, 10, 0)),
+        expires_at=KST.localize(datetime(2026, 2, 20, 12, 0)),
+        context_version="ctx-1",
+        swing_high=180.5,
+        swing_low=170.0,
+        micro_high=174.5,
+        atr=2.0,
+        source="daily_setup",
+        extra_json={"market_phase": "KRX_CONTINUOUS"},
+    )
+    store.upsert(candidate)
+    first_intent = PullbackEntryIntent(
+        symbol="005930",
+        strategy_tag="pullback_rebreakout",
+        created_at=KST.localize(datetime(2026, 2, 20, 10, 30)),
+        candidate_created_at=candidate.created_at,
+        expires_at=candidate.expires_at,
+        context_version="ctx-1",
+        entry_reference_price=174.5,
+        source="fallback_daily",
+    )
+    duplicate_intent = PullbackEntryIntent(
+        symbol="005930",
+        strategy_tag="pullback_rebreakout",
+        created_at=KST.localize(datetime(2026, 2, 20, 10, 31)),
+        candidate_created_at=candidate.created_at,
+        expires_at=candidate.expires_at,
+        context_version="ctx-1",
+        entry_reference_price=174.5,
+        source="fallback_daily",
+    )
+
+    assert entry_queue.put_if_absent(first_intent) is True
+    assert entry_queue.put_if_absent(duplicate_intent) is False
+
+    intent = entry_queue.get(timeout=0.1)
+    try:
+        worker._process_intent(intent)
+    finally:
+        entry_queue.complete(intent)
+
+    assert executor.execute_buy_calls == 1

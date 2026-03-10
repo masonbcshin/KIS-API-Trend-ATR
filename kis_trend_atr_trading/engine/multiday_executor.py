@@ -21,6 +21,7 @@ import time
 import signal
 import sys
 import hashlib
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -62,6 +63,16 @@ try:
     from kis_trend_atr_trading.db.repository import get_trade_repository
     from kis_trend_atr_trading.db.mysql import get_db_manager, QueryError
     from kis_trend_atr_trading.core.market_data import MarketDataProvider
+    from kis_trend_atr_trading.engine.pullback_pipeline_stores import (
+        ArmedCandidateStore,
+        DirtySymbolSet,
+        EntryIntentQueue,
+    )
+    from kis_trend_atr_trading.engine.pullback_pipeline_workers import (
+        PullbackSetupWorker,
+        PullbackTimingWorker,
+        OrderExecutionWorker,
+    )
     from kis_trend_atr_trading.utils.avg_price import calc_weighted_avg, quantize_price, reduce_quantity_after_sell
     from kis_trend_atr_trading.utils.entry_utils import (
         ASSET_TYPE_ETF,
@@ -115,6 +126,12 @@ except ImportError:
     from db.repository import get_trade_repository
     from db.mysql import get_db_manager, QueryError
     from core.market_data import MarketDataProvider
+    from engine.pullback_pipeline_stores import ArmedCandidateStore, DirtySymbolSet, EntryIntentQueue
+    from engine.pullback_pipeline_workers import (
+        PullbackSetupWorker,
+        PullbackTimingWorker,
+        OrderExecutionWorker,
+    )
     from utils.avg_price import calc_weighted_avg, quantize_price, reduce_quantity_after_sell
     from utils.entry_utils import (
         ASSET_TYPE_ETF,
@@ -365,6 +382,21 @@ class MultidayExecutor:
         self._daily_signal_cache: Optional[DailySignalSnapshotCache] = None
         self._daily_fetch_count: int = 0
         self._last_fast_risk_sync_at: Optional[datetime] = None
+        self._pullback_pipeline_stop_event: Optional[threading.Event] = None
+        self._pullback_candidate_store: Optional[ArmedCandidateStore] = None
+        self._pullback_dirty_symbols: Optional[DirtySymbolSet] = None
+        self._pullback_entry_queue: Optional[EntryIntentQueue] = None
+        self._pullback_setup_worker: Optional[PullbackSetupWorker] = None
+        self._pullback_timing_worker: Optional[PullbackTimingWorker] = None
+        self._pullback_order_worker: Optional[OrderExecutionWorker] = None
+        self._pullback_quote_unsubscribe: Optional[Any] = None
+        self._pullback_threaded_context_version: str = ""
+        self._threaded_pullback_pipeline_disabled: bool = False
+        self._pullback_setup_eval_ms: float = 0.0
+        self._pullback_timing_eval_ms: float = 0.0
+        self._pullback_intent_queue_depth: int = 0
+        self._pullback_end_to_end_latency_ms: float = 0.0
+        self._pullback_timing_skip_reason: str = ""
         
         # 일별 거래 기록
         self._daily_trades = []
@@ -459,6 +491,169 @@ class MultidayExecutor:
 
     def get_entry_block_reason(self) -> str:
         return self._entry_block_reason or ""
+
+    def _is_threaded_pullback_pipeline_enabled(self) -> bool:
+        return (
+            bool(getattr(settings, "ENABLE_THREADED_PULLBACK_PIPELINE", False))
+            and bool(getattr(settings, "ENABLE_PULLBACK_REBREAKOUT_STRATEGY", False))
+            and not bool(getattr(self, "_threaded_pullback_pipeline_disabled", False))
+        )
+
+    def _is_threaded_pullback_pipeline_running(self) -> bool:
+        stop_event = getattr(self, "_pullback_pipeline_stop_event", None)
+        workers = (
+            getattr(self, "_pullback_setup_worker", None),
+            getattr(self, "_pullback_timing_worker", None),
+            getattr(self, "_pullback_order_worker", None),
+        )
+        return bool(
+            stop_event is not None
+            and not stop_event.is_set()
+            and any(worker is not None and worker.is_alive() for worker in workers)
+        )
+
+    def _handle_pullback_pipeline_worker_error(self, worker_name: str, exc: Exception) -> None:
+        logger.error("[PULLBACK_PIPELINE] worker=%s err=%s", worker_name, exc)
+        self._threaded_pullback_pipeline_disabled = True
+        stop_event = getattr(self, "_pullback_pipeline_stop_event", None)
+        if stop_event is not None:
+            stop_event.set()
+
+    def _ensure_threaded_pullback_pipeline_started(self) -> None:
+        if not self._is_threaded_pullback_pipeline_enabled():
+            return
+        if self._is_threaded_pullback_pipeline_running():
+            return
+        self._start_threaded_pullback_pipeline()
+
+    def _start_threaded_pullback_pipeline(self) -> None:
+        if not self._is_threaded_pullback_pipeline_enabled():
+            return
+        self._stop_threaded_pullback_pipeline()
+        self._pullback_pipeline_stop_event = threading.Event()
+        self._pullback_candidate_store = ArmedCandidateStore()
+        self._pullback_dirty_symbols = DirtySymbolSet()
+        self._pullback_entry_queue = EntryIntentQueue(
+            maxsize=max(int(getattr(settings, "PULLBACK_ENTRY_INTENT_QUEUE_MAXSIZE", 256) or 256), 1)
+        )
+        self._pullback_setup_worker = PullbackSetupWorker(
+            executor=self,
+            candidate_store=self._pullback_candidate_store,
+            dirty_symbols=self._pullback_dirty_symbols,
+            stop_event=self._pullback_pipeline_stop_event,
+            on_error=self._handle_pullback_pipeline_worker_error,
+        )
+        self._pullback_timing_worker = PullbackTimingWorker(
+            executor=self,
+            candidate_store=self._pullback_candidate_store,
+            dirty_symbols=self._pullback_dirty_symbols,
+            entry_queue=self._pullback_entry_queue,
+            stop_event=self._pullback_pipeline_stop_event,
+            on_error=self._handle_pullback_pipeline_worker_error,
+        )
+        self._pullback_order_worker = OrderExecutionWorker(
+            executor=self,
+            candidate_store=self._pullback_candidate_store,
+            entry_queue=self._pullback_entry_queue,
+            stop_event=self._pullback_pipeline_stop_event,
+            on_error=self._handle_pullback_pipeline_worker_error,
+        )
+        subscribe_quotes = getattr(self.market_data_provider, "subscribe_quotes", None)
+        if callable(subscribe_quotes):
+            try:
+                def _on_quote(symbol: str, _snapshot: dict) -> None:
+                    dirty_symbols = getattr(self, "_pullback_dirty_symbols", None)
+                    if dirty_symbols is None:
+                        return
+                    if str(symbol).zfill(6) != str(self.stock_code).zfill(6):
+                        return
+                    dirty_symbols.mark(symbol)
+
+                self._pullback_quote_unsubscribe = subscribe_quotes(_on_quote)
+            except Exception as exc:
+                logger.warning("[PULLBACK_PIPELINE] quote subscription unavailable: %s", exc)
+                self._pullback_quote_unsubscribe = None
+
+        self._pullback_setup_worker.start()
+        self._pullback_timing_worker.start()
+        self._pullback_order_worker.start()
+        logger.info("[PULLBACK_PIPELINE] started symbol=%s", self.stock_code)
+
+    def _stop_threaded_pullback_pipeline(self) -> None:
+        unsubscribe = getattr(self, "_pullback_quote_unsubscribe", None)
+        if callable(unsubscribe):
+            try:
+                unsubscribe()
+            except Exception:
+                pass
+        self._pullback_quote_unsubscribe = None
+
+        stop_event = getattr(self, "_pullback_pipeline_stop_event", None)
+        if stop_event is not None:
+            stop_event.set()
+
+        current_thread = threading.current_thread()
+        for attr_name in (
+            "_pullback_setup_worker",
+            "_pullback_timing_worker",
+            "_pullback_order_worker",
+        ):
+            worker = getattr(self, attr_name, None)
+            if worker is None:
+                continue
+            if worker.is_alive() and worker is not current_thread:
+                worker.join(timeout=2.0)
+            setattr(self, attr_name, None)
+
+        self._pullback_pipeline_stop_event = None
+        self._pullback_entry_queue = None
+        self._pullback_dirty_symbols = None
+        self._pullback_candidate_store = None
+        self._pullback_threaded_context_version = ""
+
+    def fetch_cached_intraday_bars_if_available(self, n: int = 120) -> list[dict]:
+        provider = getattr(self, "market_data_provider", None)
+        if provider is None:
+            return []
+        is_ws_connected = getattr(provider, "is_ws_connected", None)
+        if not callable(is_ws_connected):
+            return []
+        try:
+            if not bool(is_ws_connected()):
+                return []
+        except Exception:
+            return []
+        try:
+            bars = provider.get_recent_bars(
+                stock_code=self.stock_code,
+                n=max(int(n), 1),
+                timeframe="1m",
+            )
+        except Exception as exc:
+            logger.debug("[PULLBACK_PIPELINE] cached intraday unavailable: symbol=%s err=%s", self.stock_code, exc)
+            return []
+        normalized = [bar for bar in list(bars or []) if isinstance(bar, dict)]
+        if not normalized:
+            return []
+        if all(float(bar.get("volume", 0.0) or 0.0) <= 0.0 for bar in normalized):
+            return []
+        return normalized
+
+    def _pullback_pipeline_metrics(self) -> Dict[str, Any]:
+        return {
+            "pullback_setup_eval_ms": float(getattr(self, "_pullback_setup_eval_ms", 0.0) or 0.0),
+            "pullback_timing_eval_ms": float(getattr(self, "_pullback_timing_eval_ms", 0.0) or 0.0),
+            "pullback_intent_queue_depth": int(getattr(self, "_pullback_intent_queue_depth", 0) or 0),
+            "pullback_end_to_end_latency_ms": float(
+                getattr(self, "_pullback_end_to_end_latency_ms", 0.0) or 0.0
+            ),
+            "pullback_candidate_store_size": (
+                int(self._pullback_candidate_store.size())
+                if self._pullback_candidate_store is not None
+                else 0
+            ),
+            "pullback_timing_skip_reason": str(getattr(self, "_pullback_timing_skip_reason", "") or ""),
+        }
 
     def retry_entry_unblock_via_resync(self) -> bool:
         """재동기화 재시도로 sticky 차단 해제를 시도."""
@@ -1610,6 +1805,7 @@ class MultidayExecutor:
             has_pending_order=context.has_pending_order,
             market_regime_snapshot=getattr(self, "market_regime_snapshot", None),
             intraday_bars=context.intraday_bars,
+            defer_pullback_buy=self._is_threaded_pullback_pipeline_enabled(),
         )
         signal = self._apply_stale_quote_guard(signal, context.quote_snapshot)
         signal.meta = dict(getattr(signal, "meta", {}) or {})
@@ -3546,6 +3742,7 @@ class MultidayExecutor:
         """
         logger.info("=" * 50)
         logger.info(f"[{self.trading_mode}] 전략 실행")
+        self._ensure_threaded_pullback_pipeline_started()
 
         metrics_before = self._capture_execution_metrics()
 
@@ -3659,6 +3856,7 @@ class MultidayExecutor:
                 notifier.notify_error("전략 실행 오류", str(e))
 
         result["metrics"] = self._metrics_delta(metrics_before, self._capture_execution_metrics())
+        result["metrics"].update(self._pullback_pipeline_metrics())
         logger.info("=" * 50)
         return result
 
@@ -3666,6 +3864,7 @@ class MultidayExecutor:
         """WS quote-event fast path. Legacy strategy/order semantics are preserved."""
         logger.info("=" * 50)
         logger.info(f"[{self.trading_mode}] 전략 실행 (FAST_EVAL)")
+        self._ensure_threaded_pullback_pipeline_started()
 
         metrics_before = self._capture_execution_metrics()
         self.sync_account_and_risk_if_due(
@@ -3730,6 +3929,7 @@ class MultidayExecutor:
                 notifier.notify_error("FAST_EVAL 전략 실행 오류", str(e))
 
         result["metrics"] = self._metrics_delta(metrics_before, self._capture_execution_metrics())
+        result["metrics"].update(self._pullback_pipeline_metrics())
         logger.info("=" * 50)
         return result
     
@@ -3794,6 +3994,7 @@ class MultidayExecutor:
         self._current_interval = interval_seconds
         self.is_running = True
         iteration = 0
+        self._ensure_threaded_pullback_pipeline_started()
         
         logger.info(f"멀티데이 거래 시작 (모드: {self.trading_mode}, 기본 간격: {interval_seconds}초)")
         
@@ -3850,6 +4051,7 @@ class MultidayExecutor:
             self.telegram.notify_error("시스템 오류", str(e))
         finally:
             self.is_running = False
+            self._stop_threaded_pullback_pipeline()
             
             # 포지션 저장
             self._save_position_on_exit()
@@ -3876,6 +4078,7 @@ class MultidayExecutor:
         """거래 중지"""
         logger.info("거래 중지 요청")
         self.is_running = False
+        self._stop_threaded_pullback_pipeline()
     
     def get_daily_summary(self) -> Dict[str, Any]:
         """일별 거래 요약"""

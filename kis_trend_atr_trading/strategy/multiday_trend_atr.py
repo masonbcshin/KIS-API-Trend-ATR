@@ -47,7 +47,11 @@ from utils.entry_utils import (
     detect_asset_type,
 )
 from strategy.opening_range_breakout import ORBDecision, OpeningRangeBreakoutStrategy
-from strategy.pullback_rebreakout import PullbackDecision, PullbackRebreakoutStrategy
+from strategy.pullback_rebreakout import (
+    PullbackCandidate,
+    PullbackDecision,
+    PullbackRebreakoutStrategy,
+)
 
 logger = get_logger("multiday_strategy")
 trade_logger = TradeLogger("multiday_strategy")
@@ -942,6 +946,73 @@ class MultidayTrendATRStrategy:
             return False, f"ATR 급등 ({atr_ratio:.1f}x > {settings.ATR_SPIKE_THRESHOLD}x)"
         
         return True, ""
+
+    def build_pullback_buy_signal(
+        self,
+        *,
+        pullback_candidate: PullbackCandidate,
+        df_with_indicators: pd.DataFrame,
+        current_price: float,
+        open_price: Optional[float],
+        stock_code: str,
+        stock_name: str,
+        check_time: Optional[datetime],
+    ) -> TradingSignal:
+        latest = df_with_indicators.iloc[-1]
+        current_atr = latest.get("atr", 0) if not pd.isna(latest.get("atr", 0)) else 0
+        trend = self.get_trend(df_with_indicators)
+        latest_prev_close = latest.get("prev_close", 0.0)
+        if pd.isna(latest_prev_close):
+            latest_prev_close = 0.0
+        guards_ok, guard_reason, pullback_meta = self._apply_shared_entry_guards(
+            stock_code=stock_code,
+            stock_name=stock_name,
+            current_price=current_price,
+            open_price=open_price,
+            trigger_price=float(pullback_candidate.trigger_price or 0.0),
+            prev_close=float(latest_prev_close or 0.0),
+            check_time=check_time,
+            atr=float(pullback_candidate.atr or 0.0),
+            base_meta=dict(pullback_candidate.meta or {}),
+        )
+        pullback_meta.update(
+            {
+                "strategy_tag": pullback_candidate.meta.get("strategy_tag", "pullback_rebreakout"),
+                "adx": float(pullback_candidate.meta.get("adx", latest.get("adx", 0.0)) or 0.0),
+            }
+        )
+        if not guards_ok:
+            return TradingSignal(
+                signal_type=SignalType.HOLD,
+                price=current_price,
+                reason=guard_reason,
+                atr=current_atr,
+                trend=trend,
+                reason_code=str(pullback_meta.get("reason_code") or ""),
+                meta=pullback_meta,
+            )
+
+        stop_loss = self.calculate_stop_loss(current_price, pullback_candidate.atr)
+        take_profit = self.calculate_take_profit(current_price, pullback_candidate.atr)
+
+        trade_logger.log_signal(
+            signal_type="BUY",
+            stock_code=stock_code,
+            price=current_price,
+            reason=pullback_candidate.reason,
+        )
+
+        return TradingSignal(
+            signal_type=SignalType.BUY,
+            price=current_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            trailing_stop=stop_loss,
+            reason=pullback_candidate.reason,
+            atr=pullback_candidate.atr,
+            trend=trend,
+            meta=pullback_meta,
+        )
     
     # ════════════════════════════════════════════════════════════════
     # 시그널 생성 (메인 로직)
@@ -960,6 +1031,7 @@ class MultidayTrendATRStrategy:
         has_pending_order: bool = False,
         market_regime_snapshot: Optional[object] = None,
         intraday_bars: Optional[list[dict]] = None,
+        defer_pullback_buy: bool = False,
     ) -> TradingSignal:
         """
         매매 시그널 생성
@@ -1113,58 +1185,33 @@ class MultidayTrendATRStrategy:
             )
 
         if pullback_candidate.decision == PullbackDecision.BUY:
-            latest_prev_close = latest.get("prev_close", 0.0)
-            if pd.isna(latest_prev_close):
-                latest_prev_close = 0.0
-            guards_ok, guard_reason, pullback_meta = self._apply_shared_entry_guards(
-                stock_code=stock_code,
-                stock_name=stock_name,
-                current_price=current_price,
-                open_price=open_price,
-                trigger_price=float(pullback_candidate.trigger_price or 0.0),
-                prev_close=float(latest_prev_close or 0.0),
-                check_time=check_time,
-                atr=float(pullback_candidate.atr or 0.0),
-                base_meta=dict(pullback_candidate.meta or {}),
-            )
-            pullback_meta.update(
-                {
-                    "strategy_tag": pullback_candidate.meta.get("strategy_tag", "pullback_rebreakout"),
-                    "adx": float(pullback_candidate.meta.get("adx", latest.get("adx", 0.0)) or 0.0),
-                }
-            )
-            if not guards_ok:
+            if defer_pullback_buy:
+                pullback_meta = dict(pullback_candidate.meta or {})
+                pullback_meta.update(
+                    {
+                        "strategy_tag": pullback_candidate.meta.get("strategy_tag", "pullback_rebreakout"),
+                        "threaded_pipeline_deferred": True,
+                    }
+                )
                 return TradingSignal(
                     signal_type=SignalType.HOLD,
                     price=current_price,
-                    reason=guard_reason,
+                    reason="Pullback 신규 진입은 threaded pipeline에서 처리",
                     atr=current_atr,
                     trend=trend,
-                    reason_code=str(pullback_meta.get("reason_code") or ""),
+                    reason_code="pullback_threaded_deferred",
                     meta=pullback_meta,
                 )
 
-            stop_loss = self.calculate_stop_loss(current_price, pullback_candidate.atr)
-            take_profit = self.calculate_take_profit(current_price, pullback_candidate.atr)
-
-            trade_logger.log_signal(
-                signal_type="BUY",
+            return self.build_pullback_buy_signal(
+                pullback_candidate=pullback_candidate,
+                df_with_indicators=df_with_indicators,
+                current_price=current_price,
+                open_price=open_price,
                 stock_code=stock_code,
-                price=current_price,
-                reason=pullback_candidate.reason,
+                stock_name=stock_name,
+                check_time=check_time,
             )
-
-            return TradingSignal(
-                signal_type=SignalType.BUY,
-                price=current_price,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                trailing_stop=stop_loss,
-                reason=pullback_candidate.reason,
-                atr=pullback_candidate.atr,
-                trend=trend,
-                    meta=pullback_meta,
-                )
 
         orb_candidate = self.orb_strategy.evaluate(
             df=df_with_indicators,
