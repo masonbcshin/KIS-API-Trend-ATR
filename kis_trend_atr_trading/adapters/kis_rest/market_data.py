@@ -22,6 +22,10 @@ class KISRestMarketDataProvider(MarketDataProvider):
     def __init__(self, api: Optional[KISApi] = None, period_type: str = "D"):
         self._api = api or KISApi(is_paper_trading=True)
         self._period_type = period_type
+        self._daily_fetch_calls = 0
+        self._quote_snapshot_calls = 0
+        self._latest_price_calls = 0
+        self._latest_price_with_open_calls = 0
 
     @staticmethod
     def _completed_minute_bar_ts() -> datetime:
@@ -64,6 +68,7 @@ class KISRestMarketDataProvider(MarketDataProvider):
         if tf not in ("D", "1D", "DAY", "DAILY"):
             raise ValueError(f"REST provider currently supports daily bars only: timeframe={timeframe}")
 
+        self._daily_fetch_calls += 1
         df = self._api.get_daily_ohlcv(stock_code=stock_code, period_type=self._period_type)
         if df is None or df.empty:
             return []
@@ -91,10 +96,12 @@ class KISRestMarketDataProvider(MarketDataProvider):
         return bars
 
     def get_latest_price(self, stock_code: str) -> float:
+        self._latest_price_calls += 1
         data = self._api.get_current_price(stock_code=stock_code)
         return float(data.get("current_price", 0.0) or 0.0)
 
     def get_quote_snapshot(self, stock_code: str) -> dict:
+        self._quote_snapshot_calls += 1
         data = self._api.get_current_price(stock_code=stock_code)
         now_kst = datetime.now(KST)
         return {
@@ -113,10 +120,24 @@ class KISRestMarketDataProvider(MarketDataProvider):
 
     def get_latest_price_with_open(self, stock_code: str) -> Tuple[float, float]:
         """Return `(current_price, open_price)` from a single quote API call."""
+        self._latest_price_with_open_calls += 1
         data = self._api.get_current_price(stock_code=stock_code)
         current_price = float(data.get("current_price", 0.0) or 0.0)
         open_price = float(data.get("open_price", 0.0) or 0.0)
         return current_price, open_price
+
+    def metrics(self) -> dict:
+        return {
+            "daily_fetch_calls": int(self._daily_fetch_calls),
+            "quote_snapshot_calls": int(self._quote_snapshot_calls),
+            "latest_price_calls": int(self._latest_price_calls),
+            "latest_price_with_open_calls": int(self._latest_price_with_open_calls),
+            "rest_quote_calls": int(
+                self._quote_snapshot_calls
+                + self._latest_price_calls
+                + self._latest_price_with_open_calls
+            ),
+        }
 
     def subscribe_bars(
         self,

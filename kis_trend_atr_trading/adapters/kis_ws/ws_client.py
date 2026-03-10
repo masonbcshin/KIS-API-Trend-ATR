@@ -29,6 +29,7 @@ class WSRunResult:
     success: bool
     failure_policy: str
     reason: str = ""
+    reconnect_attempts: int = 0
 
 
 class KISWSClient:
@@ -255,7 +256,12 @@ class KISWSClient:
             try:
                 ok = await self._listen_once(stock_codes, on_tick)
                 if ok:
-                    return WSRunResult(success=True, failure_policy=self.failure_policy, reason="stopped")
+                    return WSRunResult(
+                        success=True,
+                        failure_policy=self.failure_policy,
+                        reason="stopped",
+                        reconnect_attempts=attempt,
+                    )
             except Exception as err:
                 attempt += 1
                 if attempt > self.max_reconnect_attempts:
@@ -266,6 +272,7 @@ class KISWSClient:
                         success=False,
                         failure_policy=self.failure_policy,
                         reason=reason,
+                        reconnect_attempts=attempt,
                     )
                 delay = min(self.reconnect_base_delay * (2 ** (attempt - 1)), 30.0)
                 logger.warning(
@@ -277,4 +284,9 @@ class KISWSClient:
                 )
                 await asyncio.sleep(delay)
 
-        return WSRunResult(success=True, failure_policy=self.failure_policy, reason="stopped")
+        return WSRunResult(
+            success=True,
+            failure_policy=self.failure_policy,
+            reason="stopped",
+            reconnect_attempts=attempt,
+        )

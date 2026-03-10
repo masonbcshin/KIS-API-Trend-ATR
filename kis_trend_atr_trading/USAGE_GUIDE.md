@@ -129,6 +129,14 @@ TRADING_MODE=PAPER python3 -m kis_trend_atr_trading.main_multiday --mode trade -
 - 멀티종목 호환 경로(`main_multiday`) 기본 경로: `kis_trend_atr_trading/data/positions_{mode}_{symbol}.json`
 - 따라서 멀티종목 실행 중에는 `positions.json`이 비어 있어도 `positions_{mode}_*.json`이 갱신되면 정상입니다.
 
+### 4-7. Fast-eval replay harness
+```bash
+cd /home/deploy/KIS-API-Trend-ATR
+.venv/bin/python tools/fast_eval_replay.py --input /path/to/quote_replay.jsonl --pretty
+```
+
+상세 사용법은 `kis_trend_atr_trading/FAST_EVAL_REPLAY_GUIDE.md`를 기준으로 확인합니다.
+
 도움말:
 ```bash
 python3 -m kis_trend_atr_trading.apps.kr_trade --help

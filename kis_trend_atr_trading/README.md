@@ -41,7 +41,16 @@
   - 실제 경로 파싱 실패일 때만 WARNING 출력
 - 종목명 해석:
   - `holdings -> quote(stock_name) -> universe_cache 선조회` 순으로 보강
-  - 실패 시 최종적으로 `UNKNOWN(코드)` 표기
+- 실패 시 최종적으로 `UNKNOWN(코드)` 표기
+
+## Fast Eval Replay Harness
+
+- 검증 전용 replay guide: `FAST_EVAL_REPLAY_GUIDE.md`
+- 실행:
+  - `.venv/bin/python tools/fast_eval_replay.py --input /path/to/quote_replay.jsonl --pretty`
+- 목적:
+  - live 주문 없이 legacy cadence와 fast-eval cadence를 같은 입력으로 비교
+  - `entry/exit cadence`, `quote age`, `fallback/reconnect` 지표를 재현 검증
 
 ## 배포/재시작 기준
 

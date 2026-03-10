@@ -5,6 +5,7 @@ KIS Trend-ATR 자동매매 프로젝트 문서 인덱스입니다.
 ## 문서 바로가기
 - 운영 기준: `kis_trend_atr_trading/README.md`
 - 사용 가이드: `kis_trend_atr_trading/USAGE_GUIDE.md`
+- fast-eval replay 가이드: `kis_trend_atr_trading/FAST_EVAL_REPLAY_GUIDE.md`
 - 초보자 가이드: `kis_trend_atr_trading/BEGINNER_GUIDE.md`
 - 구현/감사 이력: `kis_trend_atr_trading/IMPLEMENTATION_GUIDE.md`
 - 레거시 엔트리포인트 안내: `kis_trend_atr_trading/deprecated/README.md`

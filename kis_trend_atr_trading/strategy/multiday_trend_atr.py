@@ -978,8 +978,19 @@ class MultidayTrendATRStrategy:
         Returns:
             TradingSignal: 매매 시그널
         """
-        # 지표 계산
-        df_with_indicators = self.add_indicators(df)
+        required_indicator_columns = {
+            "atr",
+            "ma",
+            "ma20",
+            "adx",
+            "trend",
+            "prev_high",
+            "prev_close",
+        }
+        if required_indicator_columns.issubset(set(df.columns)):
+            df_with_indicators = df.copy()
+        else:
+            df_with_indicators = self.add_indicators(df)
         
         if df_with_indicators.empty:
             return TradingSignal(

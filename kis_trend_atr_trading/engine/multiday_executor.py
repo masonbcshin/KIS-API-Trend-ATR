@@ -21,9 +21,10 @@ import time
 import signal
 import sys
 import hashlib
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, List
 import pandas as pd
 
 try:
@@ -147,6 +148,32 @@ _KIS_API_ERROR_TYPES = tuple(
 )
 
 
+@dataclass
+class DailySignalSnapshotCache:
+    trade_date: str
+    source_frame: pd.DataFrame
+    last_refreshed_at: datetime
+    stock_name: str = ""
+    open_price: float = 0.0
+    prev_high: float = 0.0
+    prev_close: float = 0.0
+    atr: float = 0.0
+    adx: float = 0.0
+    trend: str = "SIDEWAYS"
+
+
+@dataclass
+class PreparedEvaluationContext:
+    decision_time: datetime
+    df: pd.DataFrame
+    quote_snapshot: Dict[str, Any]
+    current_price: float
+    open_price: float
+    intraday_bars: List[dict] = field(default_factory=list)
+    has_pending_order: bool = False
+    used_cached_daily: bool = False
+
+
 class MultidayExecutor:
     """
     멀티데이 거래 실행 엔진
@@ -160,6 +187,7 @@ class MultidayExecutor:
     """
     _shared_account_snapshot: Optional[Dict[str, Any]] = None
     _shared_account_snapshot_ts: Optional[datetime] = None
+    _shared_account_snapshot_fetch_count: int = 0
     _pending_recovery_done: bool = False
     _pending_recovery_count: int = 0
     _startup_resync_summary_notified: bool = False
@@ -334,6 +362,9 @@ class MultidayExecutor:
         self._last_near_tp_alert = None
         self._last_trailing_update = None
         self._last_market_closed_skip_log_at: Optional[datetime] = None
+        self._daily_signal_cache: Optional[DailySignalSnapshotCache] = None
+        self._daily_fetch_count: int = 0
+        self._last_fast_risk_sync_at: Optional[datetime] = None
         
         # 일별 거래 기록
         self._daily_trades = []
@@ -628,9 +659,11 @@ class MultidayExecutor:
 
         if report_mode == "DRY_RUN":
             snapshot = self._build_dry_run_virtual_snapshot()
+            self.__class__._shared_account_snapshot_fetch_count += 1
         else:
             try:
                 snapshot = self.api.get_account_balance()
+                self.__class__._shared_account_snapshot_fetch_count += 1
             except Exception as e:
                 logger.warning(f"[RISK] 계좌 스냅샷 조회 실패: {e}")
                 return
@@ -1294,6 +1327,7 @@ class MultidayExecutor:
                     df = df.sort_values("date").reset_index(drop=True)
                 return df
 
+            self._daily_fetch_count += 1
             df = self.api.get_daily_ohlcv(
                 stock_code=self.stock_code,
                 period_type="D"
@@ -1307,6 +1341,292 @@ class MultidayExecutor:
         except _KIS_API_ERROR_TYPES as e:
             logger.error(f"시장 데이터 조회 실패: {e}")
             return pd.DataFrame()
+
+    @staticmethod
+    def _normalize_market_data_frame(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or getattr(df, "empty", True):
+            return pd.DataFrame()
+        normalized = df.copy()
+        if "date" in normalized.columns:
+            normalized = normalized.sort_values("date").reset_index(drop=True)
+        for column in ("open", "high", "low", "close", "volume"):
+            if column in normalized.columns:
+                normalized[column] = pd.to_numeric(normalized[column], errors="coerce").fillna(0.0)
+        return normalized
+
+    @staticmethod
+    def _trade_date_key(check_time: Optional[datetime] = None) -> str:
+        return (check_time or datetime.now(KST)).astimezone(KST).date().isoformat()
+
+    @staticmethod
+    def _extract_market_data_trade_date(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.date().isoformat()
+        try:
+            return datetime.fromisoformat(str(value)).date().isoformat()
+        except Exception:
+            raw = str(value).strip()
+            if not raw:
+                return None
+            return raw[:10]
+
+    def _capture_execution_metrics(self) -> Dict[str, int]:
+        provider = getattr(self, "market_data_provider", None)
+        provider_metrics: Dict[str, Any] = {}
+        metrics_fn = getattr(provider, "metrics", None) if provider is not None else None
+        if callable(metrics_fn):
+            try:
+                provider_metrics = dict(metrics_fn() or {})
+            except Exception:
+                provider_metrics = {}
+        return {
+            "daily_fetch_calls": int(
+                provider_metrics.get("daily_fetch_calls", 0)
+                or provider_metrics.get("rest_daily_fetch_calls", 0)
+                or 0
+            ) + int(getattr(self, "_daily_fetch_count", 0) or 0),
+            "rest_quote_calls": int(provider_metrics.get("rest_quote_calls", 0) or 0),
+            "account_snapshot_calls": int(self.__class__._shared_account_snapshot_fetch_count),
+            "ws_reconnect_count": int(provider_metrics.get("ws_reconnect_count", 0) or 0),
+            "ws_fallback_count": int(provider_metrics.get("ws_fallback_count", 0) or 0),
+        }
+
+    @staticmethod
+    def _metrics_delta(before: Dict[str, int], after: Dict[str, int]) -> Dict[str, int]:
+        delta: Dict[str, int] = {}
+        for key in set(before) | set(after):
+            delta[key] = max(int(after.get(key, 0)) - int(before.get(key, 0)), 0)
+        return delta
+
+    def metrics(self) -> Dict[str, int]:
+        return self._capture_execution_metrics()
+
+    def sync_account_and_risk_if_due(
+        self,
+        *,
+        force: bool = False,
+        min_interval_sec: Optional[float] = None,
+    ) -> bool:
+        now = datetime.now(KST)
+        if not force and min_interval_sec is not None and self._last_fast_risk_sync_at is not None:
+            if (now - self._last_fast_risk_sync_at).total_seconds() < float(min_interval_sec):
+                return False
+        self._sync_risk_account_snapshot()
+        self._last_fast_risk_sync_at = now
+        return True
+
+    def _build_live_daily_frame_from_cache(
+        self,
+        *,
+        quote_snapshot: Dict[str, Any],
+        check_time: datetime,
+        force_refresh: bool = False,
+    ) -> pd.DataFrame:
+        trade_date = self._trade_date_key(check_time)
+        cache = self._daily_signal_cache
+        refresh_interval_sec = max(
+            float(getattr(settings, "FAST_EVAL_DAILY_REFRESH_INTERVAL_SEC", 300.0) or 300.0),
+            0.0,
+        )
+        refresh_required = (
+            force_refresh
+            or cache is None
+            or cache.trade_date != trade_date
+            or (
+                refresh_interval_sec > 0
+                and cache is not None
+                and (check_time - cache.last_refreshed_at).total_seconds() >= refresh_interval_sec
+            )
+        )
+        if refresh_required:
+            frame = self.fetch_market_data()
+            normalized = self._normalize_market_data_frame(frame)
+            if normalized.empty:
+                return normalized
+            cache = DailySignalSnapshotCache(
+                trade_date=trade_date,
+                source_frame=normalized,
+                last_refreshed_at=check_time,
+                stock_name=str(quote_snapshot.get("stock_name") or ""),
+                open_price=float(quote_snapshot.get("open_price", 0.0) or 0.0),
+            )
+            self._daily_signal_cache = cache
+
+        cache = self._daily_signal_cache
+        if cache is None or cache.source_frame.empty:
+            return pd.DataFrame()
+
+        live_df = cache.source_frame.copy()
+        current_price = float(quote_snapshot.get("current_price", 0.0) or 0.0)
+        open_price = float(quote_snapshot.get("open_price", cache.open_price) or cache.open_price or 0.0)
+        session_high = float(quote_snapshot.get("session_high", 0.0) or 0.0)
+        session_low = float(quote_snapshot.get("session_low", 0.0) or 0.0)
+
+        if current_price > 0 and session_high <= 0:
+            session_high = current_price
+        if current_price > 0 and session_low <= 0:
+            session_low = current_price
+        if open_price > 0 and session_high <= 0:
+            session_high = open_price
+        if open_price > 0 and session_low <= 0:
+            session_low = open_price
+
+        last_trade_date = self._extract_market_data_trade_date(
+            live_df.iloc[-1].get("date") if len(live_df) > 0 else None
+        )
+        if last_trade_date == trade_date:
+            row_idx = live_df.index[-1]
+            existing_high = float(live_df.at[row_idx, "high"] or 0.0)
+            existing_low = float(live_df.at[row_idx, "low"] or 0.0)
+            existing_open = float(live_df.at[row_idx, "open"] or 0.0)
+            if open_price > 0:
+                live_df.at[row_idx, "open"] = open_price
+            elif existing_open > 0:
+                open_price = existing_open
+            if session_high > 0:
+                live_df.at[row_idx, "high"] = max(existing_high, session_high)
+            if session_low > 0:
+                live_df.at[row_idx, "low"] = (
+                    min(existing_low, session_low)
+                    if existing_low > 0
+                    else session_low
+                )
+            if current_price > 0:
+                live_df.at[row_idx, "close"] = current_price
+        else:
+            seed_price = float(current_price or open_price or 0.0)
+            live_df = pd.concat(
+                [
+                    live_df,
+                    pd.DataFrame(
+                        [
+                            {
+                                "date": check_time,
+                                "open": float(open_price or seed_price),
+                                "high": float(session_high or seed_price),
+                                "low": float(session_low or seed_price),
+                                "close": float(seed_price),
+                                "volume": 0.0,
+                            }
+                        ]
+                    ),
+                ],
+                ignore_index=True,
+            )
+
+        live_df = self._normalize_market_data_frame(live_df)
+        indicator_df = self.strategy.add_indicators(live_df)
+        if indicator_df.empty:
+            return indicator_df
+
+        latest = indicator_df.iloc[-1]
+        cache.stock_name = str(quote_snapshot.get("stock_name") or cache.stock_name or "")
+        cache.open_price = open_price
+        cache.prev_high = float(latest.get("prev_high", 0.0) or 0.0)
+        cache.prev_close = float(latest.get("prev_close", 0.0) or 0.0)
+        cache.atr = float(latest.get("atr", 0.0) or 0.0)
+        cache.adx = float(latest.get("adx", 0.0) or 0.0)
+        cache.trend = str(self.strategy.get_trend(indicator_df).value)
+        return indicator_df
+
+    def prepare_market_context(
+        self,
+        *,
+        use_cached_daily: bool = False,
+        force_daily_refresh: bool = False,
+    ) -> Optional[PreparedEvaluationContext]:
+        decision_time = datetime.now(KST)
+        quote_snapshot = self.fetch_quote_snapshot()
+        current_price = float(quote_snapshot.get("current_price", 0.0) or 0.0)
+        open_price = float(quote_snapshot.get("open_price", 0.0) or 0.0)
+        if current_price <= 0:
+            fallback_current, fallback_open = self.fetch_current_price()
+            current_price = float(fallback_current or 0.0)
+            open_price = float(fallback_open or 0.0)
+            quote_snapshot = dict(quote_snapshot)
+            quote_snapshot["current_price"] = current_price
+            quote_snapshot["open_price"] = open_price
+        if current_price <= 0:
+            return None
+
+        if hasattr(self.api, "is_network_disconnected_for") and self.api.is_network_disconnected_for(60):
+            return None
+
+        if use_cached_daily:
+            indicator_df = self._build_live_daily_frame_from_cache(
+                quote_snapshot=quote_snapshot,
+                check_time=decision_time,
+                force_refresh=force_daily_refresh,
+            )
+            df = indicator_df if not indicator_df.empty else pd.DataFrame()
+        else:
+            df = self.fetch_market_data()
+        if df.empty:
+            return None
+
+        intraday_bars: List[dict] = []
+        if bool(getattr(settings, "ENABLE_OPENING_RANGE_BREAKOUT_STRATEGY", False)):
+            intraday_lookback = max(
+                int(getattr(settings, "ORB_ENTRY_CUTOFF_MINUTES", 90) or 90)
+                + int(getattr(settings, "ORB_OPENING_RANGE_MINUTES", 5) or 5)
+                + 5,
+                30,
+            )
+            intraday_bars = self.fetch_intraday_bars(n=intraday_lookback)
+
+        has_pending_order = (
+            self._has_active_pending_buy_order()
+            if (
+                bool(getattr(settings, "ENABLE_PULLBACK_REBREAKOUT_STRATEGY", False))
+                or bool(getattr(settings, "ENABLE_OPENING_RANGE_BREAKOUT_STRATEGY", False))
+            )
+            and not self.strategy.has_position
+            else False
+        )
+
+        return PreparedEvaluationContext(
+            decision_time=decision_time,
+            df=df,
+            quote_snapshot=quote_snapshot,
+            current_price=current_price,
+            open_price=open_price,
+            intraday_bars=intraday_bars,
+            has_pending_order=has_pending_order,
+            used_cached_daily=bool(use_cached_daily),
+        )
+
+    def evaluate_signal_from_context(self, context: PreparedEvaluationContext) -> TradingSignal:
+        signal = self.strategy.generate_signal(
+            df=context.df,
+            current_price=context.current_price,
+            open_price=context.open_price,
+            stock_code=self.stock_code,
+            stock_name=str(context.quote_snapshot.get("stock_name") or ""),
+            check_time=context.decision_time,
+            market_phase=getattr(self, "market_phase_context", None),
+            market_venue=getattr(self, "market_venue_context", "KRX"),
+            has_pending_order=context.has_pending_order,
+            market_regime_snapshot=getattr(self, "market_regime_snapshot", None),
+            intraday_bars=context.intraday_bars,
+        )
+        signal = self._apply_stale_quote_guard(signal, context.quote_snapshot)
+        signal.meta = dict(getattr(signal, "meta", {}) or {})
+        signal.meta.setdefault(
+            "signal_time",
+            (
+                context.quote_snapshot.get("received_at").isoformat()
+                if isinstance(context.quote_snapshot.get("received_at"), datetime)
+                else context.decision_time.isoformat()
+            ),
+        )
+        signal.meta.setdefault("decision_time", context.decision_time.isoformat())
+        signal.meta.setdefault("current_price_at_signal", context.current_price)
+        signal.meta.setdefault("quote_age_sec", context.quote_snapshot.get("quote_age_sec"))
+        signal.meta.setdefault("data_feed_source", context.quote_snapshot.get("source"))
+        signal.meta.setdefault("order_style", self._resolve_entry_order_style())
+        return signal
 
     def fetch_intraday_bars(self, n: int = 120) -> list[dict]:
         """장중 1분봉 조회. 실시간 분봉이 없거나 synthetic bar만 있으면 빈 리스트를 반환합니다."""
@@ -1825,6 +2145,97 @@ class MultidayExecutor:
             "insufficient holding",
         ]
         return any(k in lower for k in keywords)
+
+    def _finalize_evaluation_result(
+        self,
+        *,
+        signal: TradingSignal,
+        context: PreparedEvaluationContext,
+        result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        signal_type_value = self._signal_type_value(signal.signal_type)
+        if signal_type_value == SignalType.BUY.value:
+            self._log_entry_trace(
+                "signal",
+                signal,
+                {
+                    "current_price_at_order": None,
+                    "extension_pct_at_order": None,
+                    "quote_age_sec": context.quote_snapshot.get("quote_age_sec"),
+                    "data_feed_source": context.quote_snapshot.get("source"),
+                    "order_style": self._resolve_entry_order_style(),
+                    "best_ask": context.quote_snapshot.get("best_ask"),
+                    "limit_price": None,
+                },
+            )
+
+        result["signal"] = {
+            "type": signal_type_value,
+            "strategy_tag": self._strategy_tag(signal),
+            "price": signal.price,
+            "stop_loss": signal.stop_loss,
+            "take_profit": signal.take_profit,
+            "trailing_stop": signal.trailing_stop,
+            "exit_reason": signal.exit_reason.value if signal.exit_reason else None,
+            "reason": signal.reason,
+            "reason_code": getattr(signal, "reason_code", ""),
+            "atr": signal.atr,
+            "trend": signal.trend.value,
+            "quote_age_sec": context.quote_snapshot.get("quote_age_sec"),
+            "data_feed_source": context.quote_snapshot.get("source"),
+        }
+
+        logger.info(
+            f"시그널: {signal_type_value} | "
+            f"전략: {self._strategy_tag(signal)} | "
+            f"가격: {context.current_price:,.0f}원 | "
+            f"추세: {signal.trend.value} | "
+            f"사유: {signal.reason}"
+        )
+
+        if signal_type_value == SignalType.BUY.value:
+            if not self._entry_allowed:
+                block_msg = self._entry_block_reason or f"[ENTRY] blocked: symbol={self.stock_code}"
+                logger.info(block_msg)
+                result["order_result"] = {
+                    "success": False,
+                    "skipped": True,
+                    "message": block_msg,
+                }
+            else:
+                result["order_result"] = self.execute_buy(signal)
+        elif signal_type_value == SignalType.SELL.value:
+            result["order_result"] = self._execute_exit_with_pending_control(signal)
+        elif signal_type_value == SignalType.HOLD.value:
+            self._check_and_send_alerts(signal, context.current_price)
+
+        if self.strategy.has_position:
+            pos = self.strategy.position
+            pnl, pnl_pct = pos.get_pnl(context.current_price)
+            result["position"] = {
+                "symbol": pos.symbol,
+                "entry_price": pos.entry_price,
+                "quantity": pos.quantity,
+                "stop_loss": pos.stop_loss,
+                "take_profit": pos.take_profit,
+                "trailing_stop": pos.trailing_stop,
+                "highest_price": pos.highest_price,
+                "atr_at_entry": pos.atr_at_entry,
+                "current_price": context.current_price,
+                "pnl": pnl,
+                "pnl_pct": pnl_pct,
+                "entry_date": pos.entry_date,
+            }
+            logger.info(
+                f"포지션: {pos.symbol} | "
+                f"진입: {pos.entry_price:,.0f}원 | "
+                f"현재: {context.current_price:,.0f}원 | "
+                f"손익: {pnl:+,.0f}원 ({pnl_pct:+.2f}%)"
+            )
+        else:
+            logger.info("포지션: 없음")
+
+        return result
 
     @staticmethod
     def _extract_holding_qty(holding: Dict[str, Any]) -> int:
@@ -3136,8 +3547,10 @@ class MultidayExecutor:
         logger.info("=" * 50)
         logger.info(f"[{self.trading_mode}] 전략 실행")
 
+        metrics_before = self._capture_execution_metrics()
+
         # 리스크 패널 및 당일 시작 자본금 기준 동기화
-        self._sync_risk_account_snapshot()
+        self.sync_account_and_risk_if_due(force=True)
         
         # 킬 스위치 체크
         kill_check = self.risk_manager.check_kill_switch()
@@ -3221,125 +3634,22 @@ class MultidayExecutor:
                 and not self.strategy.has_position
                 else False
             )
-            
-            # 3. 시그널 생성
-            signal = self.strategy.generate_signal(
+
+            context = PreparedEvaluationContext(
+                decision_time=decision_time,
                 df=df,
+                quote_snapshot=quote_snapshot,
                 current_price=current_price,
                 open_price=open_price,
-                stock_code=self.stock_code,
-                stock_name=str(quote_snapshot.get("stock_name") or ""),
-                check_time=decision_time,
-                market_phase=getattr(self, "market_phase_context", None),
-                market_venue=getattr(self, "market_venue_context", "KRX"),
-                has_pending_order=has_pending_order,
-                market_regime_snapshot=getattr(self, "market_regime_snapshot", None),
                 intraday_bars=intraday_bars,
+                has_pending_order=has_pending_order,
             )
-            signal = self._apply_stale_quote_guard(signal, quote_snapshot)
-            signal.meta = dict(getattr(signal, "meta", {}) or {})
-            signal.meta.setdefault(
-                "signal_time",
-                (
-                    quote_snapshot.get("received_at").isoformat()
-                    if isinstance(quote_snapshot.get("received_at"), datetime)
-                    else decision_time.isoformat()
-                ),
+            signal = self.evaluate_signal_from_context(context)
+            result = self._finalize_evaluation_result(
+                signal=signal,
+                context=context,
+                result=result,
             )
-            signal.meta.setdefault("decision_time", decision_time.isoformat())
-            signal.meta.setdefault("current_price_at_signal", current_price)
-            signal.meta.setdefault("quote_age_sec", quote_snapshot.get("quote_age_sec"))
-            signal.meta.setdefault("data_feed_source", quote_snapshot.get("source"))
-            signal.meta.setdefault("order_style", self._resolve_entry_order_style())
-            
-            signal_type_value = self._signal_type_value(signal.signal_type)
-            if signal_type_value == SignalType.BUY.value:
-                self._log_entry_trace(
-                    "signal",
-                    signal,
-                    {
-                        "current_price_at_order": None,
-                        "extension_pct_at_order": None,
-                        "quote_age_sec": quote_snapshot.get("quote_age_sec"),
-                        "data_feed_source": quote_snapshot.get("source"),
-                        "order_style": self._resolve_entry_order_style(),
-                        "best_ask": quote_snapshot.get("best_ask"),
-                        "limit_price": None,
-                    },
-                )
-
-            result["signal"] = {
-                "type": signal_type_value,
-                "strategy_tag": self._strategy_tag(signal),
-                "price": signal.price,
-                "stop_loss": signal.stop_loss,
-                "take_profit": signal.take_profit,
-                "trailing_stop": signal.trailing_stop,
-                "exit_reason": signal.exit_reason.value if signal.exit_reason else None,
-                "reason": signal.reason,
-                "reason_code": getattr(signal, "reason_code", ""),
-                "atr": signal.atr,
-                "trend": signal.trend.value,
-            }
-            
-            logger.info(
-                f"시그널: {signal_type_value} | "
-                f"전략: {self._strategy_tag(signal)} | "
-                f"가격: {current_price:,.0f}원 | "
-                f"추세: {signal.trend.value} | "
-                f"사유: {signal.reason}"
-            )
-            
-            # 4. 시그널에 따른 주문 실행
-            if signal_type_value == SignalType.BUY.value:
-                if not self._entry_allowed:
-                    block_msg = self._entry_block_reason or f"[ENTRY] blocked: symbol={self.stock_code}"
-                    logger.info(block_msg)
-                    result["order_result"] = {
-                        "success": False,
-                        "skipped": True,
-                        "message": block_msg,
-                    }
-                else:
-                    order_result = self.execute_buy(signal)
-                    result["order_result"] = order_result
-                
-            elif signal_type_value == SignalType.SELL.value:
-                order_result = self._execute_exit_with_pending_control(signal)
-                result["order_result"] = order_result
-                
-            elif signal_type_value == SignalType.HOLD.value:
-                # 근접 알림 체크
-                self._check_and_send_alerts(signal, current_price)
-            
-            # 5. 현재 포지션 정보
-            if self.strategy.has_position:
-                pos = self.strategy.position
-                pnl, pnl_pct = pos.get_pnl(current_price)
-                
-                result["position"] = {
-                    "symbol": pos.symbol,
-                    "entry_price": pos.entry_price,
-                    "quantity": pos.quantity,
-                    "stop_loss": pos.stop_loss,
-                    "take_profit": pos.take_profit,
-                    "trailing_stop": pos.trailing_stop,
-                    "highest_price": pos.highest_price,
-                    "atr_at_entry": pos.atr_at_entry,
-                    "current_price": current_price,
-                    "pnl": pnl,
-                    "pnl_pct": pnl_pct,
-                    "entry_date": pos.entry_date
-                }
-                
-                logger.info(
-                    f"포지션: {pos.symbol} | "
-                    f"진입: {pos.entry_price:,.0f}원 | "
-                    f"현재: {current_price:,.0f}원 | "
-                    f"손익: {pnl:+,.0f}원 ({pnl_pct:+.2f}%)"
-                )
-            else:
-                logger.info("포지션: 없음")
             
         except Exception as e:
             result["error"] = str(e)
@@ -3347,7 +3657,79 @@ class MultidayExecutor:
             notifier = getattr(self, "telegram", None)
             if notifier is not None and hasattr(notifier, "notify_error"):
                 notifier.notify_error("전략 실행 오류", str(e))
-        
+
+        result["metrics"] = self._metrics_delta(metrics_before, self._capture_execution_metrics())
+        logger.info("=" * 50)
+        return result
+
+    def run_fast_cycle(self) -> Dict[str, Any]:
+        """WS quote-event fast path. Legacy strategy/order semantics are preserved."""
+        logger.info("=" * 50)
+        logger.info(f"[{self.trading_mode}] 전략 실행 (FAST_EVAL)")
+
+        metrics_before = self._capture_execution_metrics()
+        self.sync_account_and_risk_if_due(
+            force=False,
+            min_interval_sec=float(getattr(settings, "FAST_EVAL_RISK_SYNC_INTERVAL_SEC", 30.0) or 30.0),
+        )
+
+        kill_check = self.risk_manager.check_kill_switch()
+        if not kill_check.passed:
+            logger.error(kill_check.reason)
+            if kill_check.should_exit:
+                self._save_position_on_exit()
+                safe_exit_with_message(kill_check.reason)
+
+        result = {
+            "timestamp": datetime.now(KST).isoformat(),
+            "mode": self.trading_mode,
+            "stock_code": self.stock_code,
+            "signal": None,
+            "order_result": None,
+            "position": None,
+            "error": None,
+            "fast_path": True,
+        }
+
+        self._persist_account_snapshot(force=False)
+
+        try:
+            tradeable_now, market_reason = self.market_checker.is_tradeable()
+            if not self.strategy.has_position and not tradeable_now:
+                now = datetime.now(KST)
+                if (
+                    self._last_market_closed_skip_log_at is None
+                    or (now - self._last_market_closed_skip_log_at).total_seconds() >= 300
+                ):
+                    logger.info(
+                        f"[{self.stock_code}] 장외로 신규 시그널 계산 스킵: {market_reason}"
+                    )
+                    self._last_market_closed_skip_log_at = now
+                result["error"] = f"market_closed_skip:{market_reason}"
+                return result
+
+            context = self.prepare_market_context(
+                use_cached_daily=True,
+                force_daily_refresh=False,
+            )
+            if context is None:
+                result["error"] = "fast_eval_prepare_failed"
+                return result
+
+            signal = self.evaluate_signal_from_context(context)
+            result = self._finalize_evaluation_result(
+                signal=signal,
+                context=context,
+                result=result,
+            )
+        except Exception as e:
+            result["error"] = str(e)
+            logger.error(f"FAST_EVAL 전략 실행 오류: {e}")
+            notifier = getattr(self, "telegram", None)
+            if notifier is not None and hasattr(notifier, "notify_error"):
+                notifier.notify_error("FAST_EVAL 전략 실행 오류", str(e))
+
+        result["metrics"] = self._metrics_delta(metrics_before, self._capture_execution_metrics())
         logger.info("=" * 50)
         return result
     

@@ -58,6 +58,11 @@ from kis_trend_atr_trading.engine.runtime_state_machine import (
     TransitionCooldown,
     completed_bar_ts_1m,
 )
+from kis_trend_atr_trading.engine.evaluation_scheduler import (
+    EvaluationCadenceTracker,
+    EvaluationSchedulerConfig,
+    SymbolEvaluationScheduler,
+)
 from kis_trend_atr_trading.backtest.backtester import Backtester
 from kis_trend_atr_trading.universe import UniverseSelector
 from kis_trend_atr_trading.universe.universe_service import UniverseService
@@ -344,6 +349,7 @@ def run_trade(
     print(settings.get_settings_summary())
     executors = []
     ws_stop = None
+    ws_quote_stop = None
 
     try:
         # REAL 첫날 종목수 제한 (세이프가드)
@@ -376,10 +382,39 @@ def run_trade(
             runtime_config.ws_stale_sec,
             runtime_config.offsession_sleep_sec,
         )
+        fast_eval_enabled = bool(getattr(settings, "ENABLE_FAST_EVAL_SCHEDULER", False))
+        logger.info(
+            "[FAST_EVAL] enabled=%s entry_cooldown=%.1fs exit_cooldown=%.1fs loop_sleep=%.1fs",
+            fast_eval_enabled,
+            float(getattr(settings, "FAST_EVAL_ENTRY_COOLDOWN_SEC", 12.0) or 12.0),
+            float(getattr(settings, "FAST_EVAL_EXIT_COOLDOWN_SEC", 5.0) or 5.0),
+            float(getattr(settings, "FAST_EVAL_LOOP_SLEEP_SEC", 1.0) or 1.0),
+        )
         runtime_machine = RuntimeStateMachine(runtime_config, start_ts=datetime.now(KST))
         bar_gate = SymbolBarGate()
         transition_cooldown = TransitionCooldown(runtime_config.telegram_transition_cooldown_sec)
         runtime_status_telegram = bool(getattr(settings, "RUNTIME_STATUS_TELEGRAM", False))
+        fast_eval_scheduler = SymbolEvaluationScheduler(
+            EvaluationSchedulerConfig(
+                entry_cooldown_sec=float(
+                    getattr(settings, "FAST_EVAL_ENTRY_COOLDOWN_SEC", 12.0) or 12.0
+                ),
+                entry_debounce_sec=float(
+                    getattr(settings, "FAST_EVAL_ENTRY_DEBOUNCE_SEC", 2.0) or 2.0
+                ),
+                exit_cooldown_sec=float(
+                    getattr(settings, "FAST_EVAL_EXIT_COOLDOWN_SEC", 5.0) or 5.0
+                ),
+                exit_debounce_sec=float(
+                    getattr(settings, "FAST_EVAL_EXIT_DEBOUNCE_SEC", 1.0) or 1.0
+                ),
+                rest_fallback_cooldown_sec=float(
+                    getattr(settings, "FAST_EVAL_REST_FALLBACK_COOLDOWN_SEC", 30.0) or 30.0
+                ),
+                loop_sleep_sec=float(getattr(settings, "FAST_EVAL_LOOP_SLEEP_SEC", 1.0) or 1.0),
+            )
+        )
+        cadence_tracker = EvaluationCadenceTracker()
 
         rest_provider = KISRestMarketDataProvider(api=api)
         ws_provider = None
@@ -406,6 +441,9 @@ def run_trade(
                     rest_fallback_provider=rest_provider,
                     max_reconnect_attempts=runtime_config.ws_reconnect_max_attempts,
                     reconnect_base_delay=float(runtime_config.ws_reconnect_backoff_base_sec),
+                    quote_static_cache_ttl_sec=float(
+                        getattr(settings, "WS_QUOTE_STATIC_CACHE_TTL_SEC", 900.0) or 900.0
+                    ),
                 )
         
         # Universe 서비스 (일자별 1회 생성 + 재사용, 보유종목/신규진입 분리)
@@ -804,6 +842,7 @@ def run_trade(
             print(f"  - {symbol}: {state_msg} (저장파일: {symbol_store.file_path})")
             executors.append(executor)
             executors_by_symbol[symbol] = executor
+            fast_eval_scheduler.mark_force(symbol, reason="startup")
         print("")
 
         # 거래 시작
@@ -867,23 +906,48 @@ def run_trade(
             except Exception:
                 pass
 
+        def _on_ws_quote(symbol: str, snapshot: dict) -> None:
+            if not fast_eval_enabled:
+                return
+            received_at = snapshot.get("received_at")
+            fast_eval_scheduler.mark_quote_event(
+                symbol,
+                event_monotonic=time.monotonic(),
+                received_at=received_at if isinstance(received_at, datetime) else None,
+            )
+
         def _ensure_ws_subscription(symbols) -> None:
-            nonlocal ws_stop
+            nonlocal ws_stop, ws_quote_stop
             if ws_provider is None:
                 return
             if ws_stop is not None:
                 return
+            if fast_eval_enabled:
+                prewarm_quotes = getattr(ws_provider, "prewarm_quotes", None)
+                if callable(prewarm_quotes):
+                    prewarm_quotes(symbols)
+                subscribe_quotes = getattr(ws_provider, "subscribe_quotes", None)
+                if callable(subscribe_quotes) and ws_quote_stop is None:
+                    ws_quote_stop = subscribe_quotes(_on_ws_quote)
             ws_stop = ws_provider.subscribe_bars(symbols, runtime_config.timeframe, lambda _bar: None)
 
         def _stop_ws_subscription() -> None:
-            nonlocal ws_stop
+            nonlocal ws_stop, ws_quote_stop
             if ws_stop is None:
-                return
-            try:
-                ws_stop()
-            except Exception:
-                pass
-            ws_stop = None
+                if ws_quote_stop is None:
+                    return
+            if ws_stop is not None:
+                try:
+                    ws_stop()
+                except Exception:
+                    pass
+                ws_stop = None
+            if ws_quote_stop is not None:
+                try:
+                    ws_quote_stop()
+                except Exception:
+                    pass
+                ws_quote_stop = None
 
         def _resolve_effective_feed_mode(decision) -> str:
             if ws_provider is None:
@@ -903,6 +967,7 @@ def run_trade(
         market_regime_observation_state = MarketRegimeObservationState(
             startup_monotonic=time.monotonic()
         )
+        last_fast_metric_log_monotonic = None
 
         def _format_optional_elapsed_sec(value) -> str:
             if value is None:
@@ -952,6 +1017,71 @@ def run_trade(
                 _snapshot_is_stale(market_regime_snapshot),
                 market_regime_refresh_skip_reason or "none",
             )
+
+        def _record_cadence_metric(symbol: str, executor_result: dict, has_position: bool, path: str, reason: str) -> None:
+            metrics_delta = dict((executor_result or {}).get("metrics") or {})
+            signal_payload = dict((executor_result or {}).get("signal") or {})
+            quote_age_sec = float(signal_payload.get("quote_age_sec", 0.0) or 0.0)
+            cadence_tracker.record(
+                symbol=symbol,
+                evaluated_at=datetime.now(KST),
+                interval_sec=executor_result.get("evaluation_interval_sec"),
+                quote_age_sec=quote_age_sec,
+                path=path,
+                reason=reason,
+                has_position=has_position,
+                daily_fetch_calls=int(metrics_delta.get("daily_fetch_calls", 0) or 0),
+                rest_quote_calls=int(metrics_delta.get("rest_quote_calls", 0) or 0),
+                account_snapshot_calls=int(metrics_delta.get("account_snapshot_calls", 0) or 0),
+                ws_reconnect_count=int(metrics_delta.get("ws_reconnect_count", 0) or 0),
+                ws_fallback_count=int(metrics_delta.get("ws_fallback_count", 0) or 0),
+            )
+            logger.info(
+                "[EVAL_METRIC] symbol=%s path=%s reason=%s interval_sec=%s quote_age_sec=%.3f "
+                "daily_fetch_calls=%s rest_quote_calls=%s account_snapshot_calls=%s "
+                "ws_reconnect_count=%s ws_fallback_count=%s",
+                symbol,
+                path,
+                reason,
+                _format_optional_elapsed_sec(executor_result.get("evaluation_interval_sec")),
+                max(float(quote_age_sec or 0.0), 0.0),
+                int(metrics_delta.get("daily_fetch_calls", 0) or 0),
+                int(metrics_delta.get("rest_quote_calls", 0) or 0),
+                int(metrics_delta.get("account_snapshot_calls", 0) or 0),
+                int(metrics_delta.get("ws_reconnect_count", 0) or 0),
+                int(metrics_delta.get("ws_fallback_count", 0) or 0),
+            )
+
+        def _log_cadence_summary_if_due(now_monotonic: float) -> None:
+            nonlocal last_fast_metric_log_monotonic
+            metric_interval = max(
+                float(getattr(settings, "FAST_EVAL_METRIC_LOG_INTERVAL_SEC", 60.0) or 60.0),
+                5.0,
+            )
+            if (
+                last_fast_metric_log_monotonic is not None
+                and (now_monotonic - last_fast_metric_log_monotonic) < metric_interval
+            ):
+                return
+            summary = cadence_tracker.summary()
+            global_summary = dict(summary.get("global") or {})
+            logger.info(
+                "[EVAL_SUMMARY] p50_interval_sec=%.3f p90_interval_sec=%.3f "
+                "quote_age_p50_sec=%.3f quote_age_p90_sec=%.3f daily_fetch_calls=%s "
+                "rest_quote_calls=%s account_snapshot_calls=%s ws_reconnect_count=%s "
+                "ws_fallback_count=%s evaluations=%s",
+                float(global_summary.get("p50_interval_sec", 0.0) or 0.0),
+                float(global_summary.get("p90_interval_sec", 0.0) or 0.0),
+                float(global_summary.get("quote_age_p50_sec", 0.0) or 0.0),
+                float(global_summary.get("quote_age_p90_sec", 0.0) or 0.0),
+                int(global_summary.get("daily_fetch_calls", 0) or 0),
+                int(global_summary.get("rest_quote_calls", 0) or 0),
+                int(global_summary.get("account_snapshot_calls", 0) or 0),
+                int(global_summary.get("ws_reconnect_count", 0) or 0),
+                int(global_summary.get("ws_fallback_count", 0) or 0),
+                int(global_summary.get("evaluations", 0) or 0),
+            )
+            last_fast_metric_log_monotonic = now_monotonic
 
         iteration = 0
         active_feed_name = "rest"
@@ -1007,6 +1137,7 @@ def run_trade(
                     print(f"  - {symbol}: {state_msg}")
                     executors_by_symbol[symbol] = executor
                     executors.append(executor)
+                    fast_eval_scheduler.mark_force(symbol, reason="universe_refresh")
                 logger.info(
                     f"[UNIVERSE] runtime executor_symbols={run_symbols}, "
                     f"selection_method={universe_service.policy.selection_method}, "
@@ -1163,6 +1294,10 @@ def run_trade(
                         try:
                             rest_provider.get_recent_bars(stock_code=symbol, n=5, timeframe="D")
                             rest_provider.get_latest_price(stock_code=symbol)
+                            if ws_provider is not None:
+                                prewarm_quotes = getattr(ws_provider, "prewarm_quotes", None)
+                                if callable(prewarm_quotes):
+                                    prewarm_quotes([symbol])
                         except Exception as preload_err:
                             logger.warning(
                                 "[RUNTIME] preopen preload failed symbol=%s err=%s",
@@ -1196,6 +1331,9 @@ def run_trade(
                     active_feed_name,
                     target_feed,
                 )
+                if target_feed == "ws" and fast_eval_enabled:
+                    for executor in active_executors:
+                        fast_eval_scheduler.mark_force(executor.stock_code, reason="feed_switch")
                 active_feed_name = target_feed
 
             # 런타임 holdings/entry_candidates 재계산 (보유는 항상 관리, 진입은 후보만)
@@ -1345,6 +1483,32 @@ def run_trade(
             for executor in active_executors:
                 executor.set_market_regime_snapshot(shared_market_regime_snapshot)
 
+            fast_eval_active = (
+                fast_eval_enabled
+                and active_feed_name == "ws"
+                and ws_provider is not None
+                and ws_provider.is_ws_connected()
+                and _state_in(
+                    decision.market_state,
+                    (
+                        MarketSessionState.IN_SESSION,
+                        MarketSessionState.AUCTION_GUARD,
+                    ),
+                )
+            )
+            due_fast_by_symbol = {}
+            if fast_eval_active:
+                due_fast = fast_eval_scheduler.due_evaluations(
+                    symbols=[executor.stock_code for executor in active_executors],
+                    has_position_by_symbol={
+                        executor.stock_code: bool(executor.strategy.has_position)
+                        for executor in active_executors
+                    },
+                    now_monotonic=time.monotonic(),
+                    ws_connected=True,
+                )
+                due_fast_by_symbol = {item.symbol: item for item in due_fast}
+
             for executor in active_executors:
                 symbol = executor.stock_code
                 sticky_blocked = False
@@ -1401,6 +1565,48 @@ def run_trade(
                 if not decision.policy.run_strategy:
                     continue
 
+                if fast_eval_active:
+                    due_item = due_fast_by_symbol.get(str(symbol).zfill(6))
+                    if due_item is None:
+                        continue
+                    executor_result = executor.run_fast_cycle() or {}
+                    evaluated_at = datetime.now(KST)
+                    evaluation_interval_sec = fast_eval_scheduler.mark_evaluated(
+                        symbol,
+                        evaluated_at=evaluated_at,
+                        evaluated_monotonic=time.monotonic(),
+                        reason=due_item.reason,
+                    )
+                    executor_result["evaluation_interval_sec"] = evaluation_interval_sec
+                    _record_cadence_metric(
+                        symbol=str(symbol).zfill(6),
+                        executor_result=executor_result,
+                        has_position=bool(executor.strategy.has_position),
+                        path="fast_ws",
+                        reason=due_item.reason,
+                    )
+                    runtime_holdings = [e.stock_code for e in active_executors if e.strategy.has_position]
+                    holdings_count = len(runtime_holdings)
+                    compute_capacity = getattr(universe_service, "compute_entry_capacity", None)
+                    if callable(compute_capacity):
+                        free_slots = int(compute_capacity(runtime_holdings, max_positions))
+                    else:
+                        free_slots = max(max_positions - len(set(runtime_holdings)), 0)
+                    free_slots = max(free_slots, 0)
+                    if stock_code == settings.DEFAULT_STOCK_CODE:
+                        ranked_entry_candidates = universe_service.compute_entry_candidates(
+                            runtime_holdings,
+                            todays_universe,
+                        )
+                    else:
+                        ranked_entry_candidates = [stock_code] if stock_code not in runtime_holdings else []
+                    limit_candidates = getattr(universe_service, "limit_entry_candidates", None)
+                    if callable(limit_candidates):
+                        entry_candidates = list(limit_candidates(ranked_entry_candidates, free_slots))
+                    else:
+                        entry_candidates = list(ranked_entry_candidates[:free_slots])
+                    continue
+
                 if active_feed_name == "ws" and ws_provider is not None:
                     symbol_bar_ts = _normalize_bar_ts(ws_provider.get_last_completed_bar_ts(symbol))
                     prev_bar_ts = bar_gate.last_processed(symbol)
@@ -1438,7 +1644,22 @@ def run_trade(
                 if not bar_gate.should_run(symbol, _normalize_bar_ts(symbol_bar_ts)):
                     continue
 
-                executor.run_once()
+                executor_result = executor.run_once() or {}
+                evaluated_at = datetime.now(KST)
+                evaluation_interval_sec = fast_eval_scheduler.mark_evaluated(
+                    symbol,
+                    evaluated_at=evaluated_at,
+                    evaluated_monotonic=time.monotonic(),
+                    reason="legacy_bar",
+                )
+                executor_result["evaluation_interval_sec"] = evaluation_interval_sec
+                _record_cadence_metric(
+                    symbol=str(symbol).zfill(6),
+                    executor_result=executor_result,
+                    has_position=bool(executor.strategy.has_position),
+                    path="legacy_bar",
+                    reason="legacy_bar",
+                )
                 normalized_symbol_bar_ts = _normalize_bar_ts(symbol_bar_ts)
                 if normalized_symbol_bar_ts is not None:
                     bar_gate.mark_processed(symbol, normalized_symbol_bar_ts)
@@ -1475,6 +1696,8 @@ def run_trade(
                                 pass
                     last_postclose_report_date = report_date
 
+            _log_cadence_summary_if_due(time.monotonic())
+
             if max_runs and iteration >= max_runs:
                 _log_loop_metric(
                     iteration=iteration,
@@ -1490,7 +1713,13 @@ def run_trade(
                 break
 
             if _state_equals(decision.market_state, MarketSessionState.IN_SESSION):
-                sleep_sec = max(15, min(int(interval), 60))
+                if fast_eval_active:
+                    sleep_sec = max(
+                        float(getattr(settings, "FAST_EVAL_LOOP_SLEEP_SEC", 1.0) or 1.0),
+                        0.5,
+                    )
+                else:
+                    sleep_sec = max(15, min(int(interval), 60))
             elif _state_equals(decision.market_state, MarketSessionState.OFF_SESSION):
                 sleep_sec = runtime_config.offsession_sleep_sec
             else:

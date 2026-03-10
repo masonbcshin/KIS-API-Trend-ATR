@@ -42,7 +42,7 @@ class DummyRestAPI:
         )
 
     def get_current_price(self, stock_code: str):
-        return {"current_price": 111.0}
+        return {"current_price": 111.0, "open_price": 108.0, "stock_name": "Dummy"}
 
 
 def test_rest_provider_returns_expected_bar_count_and_format():
@@ -96,6 +96,35 @@ def test_ws_provider_does_not_emit_callback_before_bar_completion():
     assert len(emitted) == 1
     bars = provider.get_recent_bars("005930", n=10, timeframe="1m")
     assert len(bars) == 1
+
+
+def test_ws_provider_quote_snapshot_reuses_static_cache_without_repeated_rest_calls():
+    rest_provider = KISRestMarketDataProvider(api=DummyRestAPI())
+    provider = KISWSMarketDataProvider(
+        rest_fallback_provider=rest_provider,
+        quote_static_cache_ttl_sec=900,
+    )
+
+    first = provider.get_quote_snapshot("005930")
+    second = provider.get_quote_snapshot("005930")
+
+    assert first["open_price"] == 108.0
+    assert second["stock_name"] == "Dummy"
+    assert rest_provider.metrics()["quote_snapshot_calls"] == 1
+    assert provider.metrics()["quote_cache_hits"] >= 1
+
+
+def test_ws_provider_quote_callback_receives_tick_events():
+    provider = KISWSMarketDataProvider()
+    emitted = []
+    stop = provider.subscribe_quotes(lambda symbol, snapshot: emitted.append((symbol, snapshot["current_price"])))
+
+    provider._handle_tick(
+        MarketTick("005930", price=100.0, volume=1, timestamp=datetime(2026, 2, 16, 9, 0, 5))
+    )
+    stop()
+
+    assert emitted == [("005930", 100.0)]
 
 
 class AlwaysFailWSClient(KISWSClient):

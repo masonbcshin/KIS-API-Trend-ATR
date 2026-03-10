@@ -16,6 +16,7 @@ from core.market_data import BarCallback, MarketDataProvider, OHLCVBar
 from utils.logger import get_logger
 
 logger = get_logger("kis_ws_market_data")
+QuoteCallback = Callable[[str, Dict[str, object]], None]
 
 
 class KISWSMarketDataProvider(MarketDataProvider):
@@ -38,6 +39,7 @@ class KISWSMarketDataProvider(MarketDataProvider):
         reconnect_base_delay: float = 1.0,
         missing_gap_required: int = 2,
         backfill_cooldown_sec: int = 30,
+        quote_static_cache_ttl_sec: float = 900.0,
     ):
         self._ws_client = ws_client or KISWSClient(
             max_reconnect_attempts=max_reconnect_attempts,
@@ -52,6 +54,9 @@ class KISWSMarketDataProvider(MarketDataProvider):
         )
         self._latest_price: Dict[str, float] = {}
         self._quote_snapshot: Dict[str, Dict[str, object]] = {}
+        self._quote_static_cache: Dict[str, Dict[str, object]] = {}
+        self._quote_static_cache_ts: Dict[str, datetime] = {}
+        self._quote_callbacks: List[QuoteCallback] = []
         self._on_bar_callback: Optional[BarCallback] = None
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
@@ -63,7 +68,13 @@ class KISWSMarketDataProvider(MarketDataProvider):
         self._missing_gap_required = max(int(missing_gap_required), 2)
         self._missing_gap_detected: bool = False
         self._backfill_cooldown_sec = max(int(backfill_cooldown_sec), 0)
+        self._quote_static_cache_ttl_sec = max(float(quote_static_cache_ttl_sec or 0.0), 0.0)
         self._last_backfill_attempt_ts: Dict[str, datetime] = {}
+        self._quote_event_count: int = 0
+        self._quote_cache_hit_count: int = 0
+        self._rest_quote_refresh_count: int = 0
+        self._ws_reconnect_count: int = 0
+        self._ws_fallback_count: int = 0
 
     def get_recent_bars(self, stock_code: str, n: int, timeframe: str) -> List[dict]:
         code = str(stock_code).zfill(6)
@@ -92,25 +103,40 @@ class KISWSMarketDataProvider(MarketDataProvider):
             snapshot = dict(self._quote_snapshot.get(code) or {})
             running = self._ws_running
             failed = self._ws_failed
+            static_snapshot = dict(self._quote_static_cache.get(code) or {})
+            static_cached_at = self._quote_static_cache_ts.get(code)
 
-        rest_snapshot = self._rest_fallback.get_quote_snapshot(code)
-        received_at = snapshot.get("received_at")
-        if received_at is None:
-            received_at = rest_snapshot.get("received_at")
+        now = datetime.now()
+        static_cache_valid = (
+            static_snapshot
+            and static_cached_at is not None
+            and (
+                self._quote_static_cache_ttl_sec <= 0
+                or (now - static_cached_at).total_seconds() < self._quote_static_cache_ttl_sec
+            )
+            and static_cached_at.date() == now.date()
+        )
+        if not static_cache_valid:
+            static_snapshot = self._refresh_static_quote_cache(code)
+        else:
+            with self._lock:
+                self._quote_cache_hit_count += 1
+
+        received_at = snapshot.get("received_at") or static_snapshot.get("received_at")
         quote_age_sec = float("inf")
         if isinstance(received_at, datetime):
-            now = datetime.now(received_at.tzinfo) if received_at.tzinfo else datetime.now()
-            quote_age_sec = max((now - received_at).total_seconds(), 0.0)
+            current_now = datetime.now(received_at.tzinfo) if received_at.tzinfo else datetime.now()
+            quote_age_sec = max((current_now - received_at).total_seconds(), 0.0)
 
         current_price = snapshot.get("current_price")
         if current_price in (None, 0, 0.0):
-            current_price = rest_snapshot.get("current_price", 0.0)
+            current_price = static_snapshot.get("current_price", 0.0)
 
         return {
             "stock_code": code,
-            "stock_name": rest_snapshot.get("stock_name"),
+            "stock_name": static_snapshot.get("stock_name"),
             "current_price": float(current_price or 0.0),
-            "open_price": float(rest_snapshot.get("open_price", 0.0) or 0.0),
+            "open_price": float(static_snapshot.get("open_price", 0.0) or 0.0),
             "best_ask": (
                 float(snapshot.get("best_ask"))
                 if snapshot.get("best_ask") not in (None, "", 0, 0.0)
@@ -123,6 +149,8 @@ class KISWSMarketDataProvider(MarketDataProvider):
             ),
             "received_at": received_at,
             "quote_age_sec": quote_age_sec,
+            "session_high": float(snapshot.get("session_high", 0.0) or 0.0),
+            "session_low": float(snapshot.get("session_low", 0.0) or 0.0),
             "source": "ws_tick" if snapshot else "rest_quote_fallback",
             "data_feed": "ws",
             "ws_connected": bool(running) and not bool(failed),
@@ -138,16 +166,97 @@ class KISWSMarketDataProvider(MarketDataProvider):
         code = str(stock_code).zfill(6)
         with self._lock:
             latest = self._latest_price.get(code)
+            static_snapshot = dict(self._quote_static_cache.get(code) or {})
+            static_cached_at = self._quote_static_cache_ts.get(code)
 
-        rest_current, open_price = self._rest_fallback.get_latest_price_with_open(code)
+        now = datetime.now()
+        static_cache_valid = (
+            static_snapshot
+            and static_cached_at is not None
+            and (
+                self._quote_static_cache_ttl_sec <= 0
+                or (now - static_cached_at).total_seconds() < self._quote_static_cache_ttl_sec
+            )
+            and static_cached_at.date() == now.date()
+        )
+        if not static_cache_valid:
+            static_snapshot = self._refresh_static_quote_cache(code)
+
         if latest is None:
-            latest = rest_current
-        return float(latest or 0.0), float(open_price or 0.0)
+            latest = float(static_snapshot.get("current_price", 0.0) or 0.0)
+        open_price = float(static_snapshot.get("open_price", 0.0) or 0.0)
+        return float(latest or 0.0), open_price
+
+    def _refresh_static_quote_cache(self, stock_code: str, force: bool = False) -> Dict[str, object]:
+        code = str(stock_code).zfill(6)
+        with self._lock:
+            cached = dict(self._quote_static_cache.get(code) or {})
+            cached_at = self._quote_static_cache_ts.get(code)
+
+        now = datetime.now()
+        if (
+            not force
+            and cached
+            and cached_at is not None
+            and (
+                self._quote_static_cache_ttl_sec <= 0
+                or (now - cached_at).total_seconds() < self._quote_static_cache_ttl_sec
+            )
+            and cached_at.date() == now.date()
+        ):
+            with self._lock:
+                self._quote_cache_hit_count += 1
+            return cached
+
+        rest_snapshot = self._rest_fallback.get_quote_snapshot(code)
+        with self._lock:
+            self._rest_quote_refresh_count += 1
+            self._quote_static_cache[code] = {
+                "stock_code": code,
+                "stock_name": rest_snapshot.get("stock_name"),
+                "current_price": float(rest_snapshot.get("current_price", 0.0) or 0.0),
+                "open_price": float(rest_snapshot.get("open_price", 0.0) or 0.0),
+                "received_at": rest_snapshot.get("received_at"),
+            }
+            self._quote_static_cache_ts[code] = now
+            updated = dict(self._quote_static_cache[code])
+        return updated
+
+    def prewarm_quotes(self, stock_codes: List[str], force: bool = False) -> None:
+        for stock_code in stock_codes or []:
+            try:
+                self._refresh_static_quote_cache(stock_code, force=force)
+            except Exception as exc:
+                logger.warning("[WS] quote prewarm failed stock=%s err=%s", stock_code, exc)
+
+    def subscribe_quotes(
+        self,
+        on_quote_callback: QuoteCallback,
+    ) -> Callable[[], None]:
+        with self._lock:
+            self._quote_callbacks.append(on_quote_callback)
+
+        def _unsubscribe() -> None:
+            with self._lock:
+                if on_quote_callback in self._quote_callbacks:
+                    self._quote_callbacks.remove(on_quote_callback)
+
+        return _unsubscribe
 
     def _handle_tick(self, tick: MarketTick) -> None:
         code = str(tick.stock_code).zfill(6)
         received_at = tick.received_at or datetime.now()
+        callbacks: List[QuoteCallback]
         with self._lock:
+            previous = dict(self._quote_snapshot.get(code) or {})
+            current_session_date = received_at.date().isoformat()
+            previous_session_date = str(previous.get("session_date") or "")
+            if previous_session_date != current_session_date:
+                session_high = float(tick.price)
+                session_low = float(tick.price)
+            else:
+                session_high = max(float(previous.get("session_high", tick.price) or tick.price), float(tick.price))
+                session_low = min(float(previous.get("session_low", tick.price) or tick.price), float(tick.price))
             self._latest_price[code] = float(tick.price)
             self._quote_snapshot[code] = {
                 "current_price": float(tick.price),
@@ -155,8 +264,21 @@ class KISWSMarketDataProvider(MarketDataProvider):
                 "best_bid": float(tick.best_bid or 0.0),
                 "received_at": received_at,
                 "trade_timestamp": tick.timestamp,
+                "session_date": current_session_date,
+                "session_high": session_high,
+                "session_low": session_low,
             }
             self._last_message_ts = received_at
+            self._quote_event_count += 1
+            callbacks = list(self._quote_callbacks)
+            quote_snapshot = dict(self._quote_snapshot[code])
+
+        if callbacks:
+            for callback in callbacks:
+                try:
+                    callback(code, dict(quote_snapshot))
+                except Exception as exc:
+                    logger.debug("[WS] quote callback failed stock=%s err=%s", code, exc)
 
         completed = self._aggregator.add_tick(tick)
         if completed is None:
@@ -195,12 +317,17 @@ class KISWSMarketDataProvider(MarketDataProvider):
         self._ws_failed = False
         try:
             result = asyncio.run(self._ws_client.run(stock_codes, self._handle_tick))
+            with self._lock:
+                self._ws_reconnect_count += max(int(getattr(result, "reconnect_attempts", 0) or 0), 0)
             if not result.success:
                 self._ws_failed = True
+                with self._lock:
+                    self._ws_fallback_count += 1
                 logger.error(
-                    "[WS] feed ended with failure policy=%s reason=%s",
+                    "[WS] feed ended with failure policy=%s reason=%s reconnect_attempts=%s",
                     result.failure_policy,
                     result.reason,
+                    getattr(result, "reconnect_attempts", 0),
                 )
         finally:
             self._ws_running = False
@@ -298,6 +425,22 @@ class KISWSMarketDataProvider(MarketDataProvider):
             "last_message_age_sec": float(self.last_message_age_sec()),
             "subscribed_count": len(self._subscribed_codes),
             "missing_gap_detected": bool(self._missing_gap_detected),
+        }
+
+    def metrics(self) -> Dict[str, object]:
+        rest_metrics = {}
+        metrics_fn = getattr(self._rest_fallback, "metrics", None)
+        if callable(metrics_fn):
+            rest_metrics = dict(metrics_fn() or {})
+
+        return {
+            "ws_quote_events": int(self._quote_event_count),
+            "quote_cache_hits": int(self._quote_cache_hit_count),
+            "rest_quote_refresh_calls": int(self._rest_quote_refresh_count),
+            "ws_reconnect_count": int(self._ws_reconnect_count),
+            "ws_fallback_count": int(self._ws_fallback_count),
+            "rest_daily_fetch_calls": int(rest_metrics.get("daily_fetch_calls", 0) or 0),
+            "rest_quote_calls": int(rest_metrics.get("rest_quote_calls", 0) or 0),
         }
 
     @property

@@ -608,6 +608,43 @@ RUNTIME_OFFSESSION_SLEEP_SEC: int = int(os.getenv("RUNTIME_OFFSESSION_SLEEP_SEC"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Fast Evaluation Scheduler (default OFF, rollback-safe)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# 목적:
+#   - WS 정상 연결 시 quote event 기반으로 미보유 종목 평가 cadence를 낮춥니다.
+#   - 기존 legacy completed-bar gate 경로는 유지되며, 아래 플래그가 OFF면 사용되지 않습니다.
+#
+# 원칙:
+#   - 전략 임계값은 바꾸지 않고 평가 스케줄링/캐시 구조만 개선합니다.
+#   - entry/exit cadence는 다르게 가져가되 주문/리스크 의미는 유지합니다.
+
+ENABLE_FAST_EVAL_SCHEDULER: bool = os.getenv("ENABLE_FAST_EVAL_SCHEDULER", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+FAST_EVAL_LOOP_SLEEP_SEC: float = float(os.getenv("FAST_EVAL_LOOP_SLEEP_SEC", "1"))
+FAST_EVAL_ENTRY_COOLDOWN_SEC: float = float(os.getenv("FAST_EVAL_ENTRY_COOLDOWN_SEC", "12"))
+FAST_EVAL_ENTRY_DEBOUNCE_SEC: float = float(os.getenv("FAST_EVAL_ENTRY_DEBOUNCE_SEC", "2"))
+FAST_EVAL_EXIT_COOLDOWN_SEC: float = float(os.getenv("FAST_EVAL_EXIT_COOLDOWN_SEC", "5"))
+FAST_EVAL_EXIT_DEBOUNCE_SEC: float = float(os.getenv("FAST_EVAL_EXIT_DEBOUNCE_SEC", "1"))
+FAST_EVAL_REST_FALLBACK_COOLDOWN_SEC: float = float(
+    os.getenv("FAST_EVAL_REST_FALLBACK_COOLDOWN_SEC", "30")
+)
+FAST_EVAL_RISK_SYNC_INTERVAL_SEC: float = float(
+    os.getenv("FAST_EVAL_RISK_SYNC_INTERVAL_SEC", "30")
+)
+FAST_EVAL_METRIC_LOG_INTERVAL_SEC: float = float(
+    os.getenv("FAST_EVAL_METRIC_LOG_INTERVAL_SEC", "60")
+)
+FAST_EVAL_DAILY_REFRESH_INTERVAL_SEC: float = float(
+    os.getenv("FAST_EVAL_DAILY_REFRESH_INTERVAL_SEC", "300")
+)
+WS_QUOTE_STATIC_CACHE_TTL_SEC: float = float(os.getenv("WS_QUOTE_STATIC_CACHE_TTL_SEC", "900"))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # 이벤트 리스크 관리
 # ═══════════════════════════════════════════════════════════════════════════════
 
