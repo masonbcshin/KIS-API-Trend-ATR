@@ -401,7 +401,8 @@ class UniverseService:
             logger.info("[UNIVERSE] reuse cached universe for today")
             logger.info(
                 f"[UNIVERSE] today={trade_date} method={self.policy.selection_method} "
-                f"universe_size={self.policy.universe_size} -> symbols={symbols}"
+                f"universe_size={self.policy.universe_size} selected_count={len(symbols)} "
+                f"-> symbols={symbols}"
             )
             return symbols
 
@@ -429,7 +430,8 @@ class UniverseService:
             )
             logger.info(
                 f"[UNIVERSE] today={trade_date} method={self.policy.selection_method} "
-                f"universe_size={self.policy.universe_size} -> symbols={symbols}"
+                f"universe_size={self.policy.universe_size} selected_count={len(symbols)} "
+                f"-> symbols={symbols}"
             )
             return symbols
         except Exception as e:
