@@ -81,6 +81,7 @@ try:
         PullbackTimingWorker,
         OrderExecutionWorker,
     )
+    from kis_trend_atr_trading.engine.strategy_pipeline_registry import build_default_strategy_registry
     from kis_trend_atr_trading.utils.avg_price import calc_weighted_avg, quantize_price, reduce_quantity_after_sell
     from kis_trend_atr_trading.utils.entry_utils import (
         ASSET_TYPE_ETF,
@@ -152,6 +153,7 @@ except ImportError:
         PullbackTimingWorker,
         OrderExecutionWorker,
     )
+    from engine.strategy_pipeline_registry import build_default_strategy_registry
     from utils.avg_price import calc_weighted_avg, quantize_price, reduce_quantity_after_sell
     from utils.entry_utils import (
         ASSET_TYPE_ETF,
@@ -414,6 +416,8 @@ class MultidayExecutor:
         self._pullback_timing_worker: Optional[PullbackTimingWorker] = None
         self._pullback_order_worker: Optional[OrderExecutionWorker] = None
         self._pullback_quote_unsubscribe: Optional[Any] = None
+        self._strategy_pipeline_registry: Optional[Any] = None
+        self._strategy_pipeline_enabled_tags: tuple[str, ...] = ()
         self._pullback_threaded_context_version: str = ""
         self._pullback_daily_context_version: str = ""
         self._pullback_latest_quote_snapshot: Dict[str, Any] = {}
@@ -427,6 +431,12 @@ class MultidayExecutor:
         self._pullback_intent_queue_depth: int = 0
         self._pullback_end_to_end_latency_ms: float = 0.0
         self._pullback_timing_skip_reason: str = ""
+        self._strategy_setup_eval_ms: float = 0.0
+        self._strategy_timing_eval_ms: float = 0.0
+        self._candidate_store_size_by_strategy: Dict[str, int] = {}
+        self._intent_queue_depth_by_strategy: Dict[str, int] = {}
+        self._strategy_end_to_end_latency_ms: float = 0.0
+        self._strategy_regime_snapshot_state_used: str = "absent"
         self._risk_snapshot_refresh_ms: float = 0.0
         self._risk_snapshot_refresh_count: int = 0
         self._holdings_snapshot_refresh_count: int = 0
@@ -529,20 +539,51 @@ class MultidayExecutor:
     def get_entry_block_reason(self) -> str:
         return self._entry_block_reason or ""
 
+    def _threaded_pipeline_enabled_strategy_tags(self) -> tuple[str, ...]:
+        raw_value = str(getattr(settings, "THREADED_PIPELINE_ENABLED_STRATEGIES", "") or "")
+        tags = []
+        for token in raw_value.split(","):
+            normalized = str(token or "").strip()
+            if normalized and normalized not in tags:
+                tags.append(normalized)
+        return tuple(tags)
+
+    def _is_multi_strategy_threaded_pipeline_enabled(self) -> bool:
+        if not bool(getattr(settings, "ENABLE_MULTI_STRATEGY_THREADED_PIPELINE", False)):
+            return False
+        if not bool(getattr(settings, "ENABLE_PULLBACK_REBREAKOUT_STRATEGY", False)):
+            return False
+        if bool(getattr(self, "_threaded_pullback_pipeline_disabled", False)):
+            return False
+        return "pullback_rebreakout" in self._threaded_pipeline_enabled_strategy_tags()
+
     def _is_threaded_pullback_pipeline_enabled(self) -> bool:
+        if self._is_multi_strategy_threaded_pipeline_enabled():
+            return False
         return (
             bool(getattr(settings, "ENABLE_THREADED_PULLBACK_PIPELINE", False))
             and bool(getattr(settings, "ENABLE_PULLBACK_REBREAKOUT_STRATEGY", False))
             and not bool(getattr(self, "_threaded_pullback_pipeline_disabled", False))
         )
 
+    def _is_any_threaded_pullback_pipeline_enabled(self) -> bool:
+        return (
+            self._is_multi_strategy_threaded_pipeline_enabled()
+            or self._is_threaded_pullback_pipeline_enabled()
+        )
+
+    def _should_defer_pullback_buy_to_threaded_pipeline(self) -> bool:
+        if self._is_multi_strategy_threaded_pipeline_enabled():
+            return "pullback_rebreakout" in self._threaded_pipeline_enabled_strategy_tags()
+        return self._is_threaded_pullback_pipeline_enabled()
+
     def _is_pullback_daily_refresh_enabled(self) -> bool:
-        return self._is_threaded_pullback_pipeline_enabled() and bool(
+        return self._is_any_threaded_pullback_pipeline_enabled() and bool(
             getattr(settings, "ENABLE_PULLBACK_DAILY_REFRESH_THREAD", False)
         )
 
     def _is_pullback_risk_snapshot_enabled(self) -> bool:
-        return self._is_threaded_pullback_pipeline_enabled() and bool(
+        return self._is_any_threaded_pullback_pipeline_enabled() and bool(
             getattr(settings, "ENABLE_RISK_SNAPSHOT_THREAD", False)
         )
 
@@ -568,14 +609,14 @@ class MultidayExecutor:
             stop_event.set()
 
     def _ensure_threaded_pullback_pipeline_started(self) -> None:
-        if not self._is_threaded_pullback_pipeline_enabled():
+        if not self._is_any_threaded_pullback_pipeline_enabled():
             return
         if self._is_threaded_pullback_pipeline_running():
             return
         self._start_threaded_pullback_pipeline()
 
     def _start_threaded_pullback_pipeline(self) -> None:
-        if not self._is_threaded_pullback_pipeline_enabled():
+        if not self._is_any_threaded_pullback_pipeline_enabled():
             return
         self._stop_threaded_pullback_pipeline()
         self._pullback_pipeline_stop_event = threading.Event()
@@ -588,6 +629,12 @@ class MultidayExecutor:
         self._pullback_entry_queue = EntryIntentQueue(
             maxsize=max(int(getattr(settings, "PULLBACK_ENTRY_INTENT_QUEUE_MAXSIZE", 256) or 256), 1)
         )
+        self._strategy_pipeline_enabled_tags = self._threaded_pipeline_enabled_strategy_tags()
+        self._strategy_pipeline_registry = None
+        if self._is_multi_strategy_threaded_pipeline_enabled():
+            self._strategy_pipeline_registry = build_default_strategy_registry(
+                pullback_strategy=self.strategy.pullback_strategy
+            )
         if self._is_pullback_daily_refresh_enabled():
             self._pullback_daily_refresh_worker = DailyRefreshThread(
                 executor=self,
@@ -607,6 +654,8 @@ class MultidayExecutor:
             candidate_store=self._pullback_candidate_store,
             daily_context_store=self._pullback_daily_context_store,
             dirty_symbols=self._pullback_dirty_symbols,
+            strategy_registry=self._strategy_pipeline_registry,
+            enabled_strategy_tags=self._strategy_pipeline_enabled_tags,
             stop_event=self._pullback_pipeline_stop_event,
             on_error=self._handle_pullback_pipeline_worker_error,
         )
@@ -615,6 +664,8 @@ class MultidayExecutor:
             candidate_store=self._pullback_candidate_store,
             dirty_symbols=self._pullback_dirty_symbols,
             entry_queue=self._pullback_entry_queue,
+            strategy_registry=self._strategy_pipeline_registry,
+            enabled_strategy_tags=self._strategy_pipeline_enabled_tags,
             stop_event=self._pullback_pipeline_stop_event,
             on_error=self._handle_pullback_pipeline_worker_error,
         )
@@ -698,6 +749,10 @@ class MultidayExecutor:
         self._pullback_candidate_store = None
         self._pullback_daily_context_store = None
         self._pullback_account_risk_store = None
+        self._strategy_pipeline_registry = None
+        self._strategy_pipeline_enabled_tags = ()
+        self._candidate_store_size_by_strategy = {}
+        self._intent_queue_depth_by_strategy = {}
         self._pullback_threaded_context_version = ""
         self._pullback_daily_context_version = ""
 
@@ -747,6 +802,20 @@ class MultidayExecutor:
                 else 0
             ),
             "pullback_timing_skip_reason": str(getattr(self, "_pullback_timing_skip_reason", "") or ""),
+            "strategy_setup_eval_ms": float(getattr(self, "_strategy_setup_eval_ms", 0.0) or 0.0),
+            "strategy_timing_eval_ms": float(getattr(self, "_strategy_timing_eval_ms", 0.0) or 0.0),
+            "candidate_store_size_by_strategy": dict(
+                getattr(self, "_candidate_store_size_by_strategy", {}) or {}
+            ),
+            "intent_queue_depth_by_strategy": dict(
+                getattr(self, "_intent_queue_depth_by_strategy", {}) or {}
+            ),
+            "strategy_end_to_end_latency_ms": float(
+                getattr(self, "_strategy_end_to_end_latency_ms", 0.0) or 0.0
+            ),
+            "strategy_regime_snapshot_state_used": str(
+                getattr(self, "_strategy_regime_snapshot_state_used", "absent") or "absent"
+            ),
             "risk_snapshot_refresh_ms": float(getattr(self, "_risk_snapshot_refresh_ms", 0.0) or 0.0),
             "risk_snapshot_refresh_count": int(getattr(self, "_risk_snapshot_refresh_count", 0) or 0),
             "holdings_snapshot_refresh_count": int(getattr(self, "_holdings_snapshot_refresh_count", 0) or 0),
@@ -2165,7 +2234,7 @@ class MultidayExecutor:
             has_pending_order=context.has_pending_order,
             market_regime_snapshot=getattr(self, "market_regime_snapshot", None),
             intraday_bars=context.intraday_bars,
-            defer_pullback_buy=self._is_threaded_pullback_pipeline_enabled(),
+            defer_pullback_buy=self._should_defer_pullback_buy_to_threaded_pipeline(),
         )
         signal = self._apply_stale_quote_guard(signal, context.quote_snapshot)
         signal.meta = dict(getattr(signal, "meta", {}) or {})

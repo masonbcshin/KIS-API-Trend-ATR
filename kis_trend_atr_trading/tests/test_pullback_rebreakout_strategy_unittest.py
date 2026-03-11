@@ -18,6 +18,11 @@ from engine.pullback_pipeline_models import (
     AccountRiskSnapshot,
     DailyContext,
     HoldingsRiskSnapshot,
+    PullbackEntryIntent,
+    pullback_entry_intent_from_strategy,
+    pullback_setup_candidate_from_strategy,
+    strategy_entry_intent_from_pullback,
+    strategy_setup_candidate_from_pullback,
 )
 from engine.pullback_pipeline_stores import (
     AccountRiskStore,
@@ -32,6 +37,7 @@ from engine.pullback_pipeline_workers import (
     PullbackTimingWorker,
     RiskSnapshotThread,
 )
+from engine.strategy_pipeline_registry import build_default_strategy_registry
 from strategy.multiday_trend_atr import MultidayTrendATRStrategy, SignalType
 from strategy.pullback_rebreakout import PullbackDecision, PullbackRebreakoutStrategy
 from utils.market_hours import KST
@@ -628,6 +634,8 @@ def test_timing_worker_skips_symbol_without_armed_candidate():
         candidate_store=ArmedCandidateStore(),
         dirty_symbols=DirtySymbolSet(),
         entry_queue=EntryIntentQueue(maxsize=8),
+        strategy_registry=None,
+        enabled_strategy_tags=(),
         stop_event=threading.Event(),
         on_error=lambda *_args: None,
     )
@@ -647,6 +655,8 @@ def test_duplicate_dirty_events_do_not_create_duplicate_pullback_intents():
         candidate_store=store,
         dirty_symbols=dirty,
         entry_queue=entry_queue,
+        strategy_registry=None,
+        enabled_strategy_tags=(),
         stop_event=threading.Event(),
         on_error=lambda *_args: None,
     )
@@ -906,6 +916,8 @@ def test_setup_worker_reads_daily_context_store_only_when_enabled():
         candidate_store=ArmedCandidateStore(),
         daily_context_store=context_store,
         dirty_symbols=DirtySymbolSet(),
+        strategy_registry=None,
+        enabled_strategy_tags=(),
         stop_event=threading.Event(),
         on_error=lambda *_args: None,
     )
@@ -946,6 +958,8 @@ def test_setup_worker_skips_stale_daily_context():
         candidate_store=ArmedCandidateStore(),
         daily_context_store=context_store,
         dirty_symbols=DirtySymbolSet(),
+        strategy_registry=None,
+        enabled_strategy_tags=(),
         stop_event=threading.Event(),
         on_error=lambda *_args: None,
     )
@@ -981,3 +995,176 @@ def test_daily_refresh_thread_force_refreshes_on_trade_date_change():
 
     assert executor.fetch_market_data_for_symbol_calls == 2
     assert store.get("005930").trade_date == "2026-02-21"
+
+
+def test_pullback_registry_lookup_returns_evaluators():
+    registry = build_default_strategy_registry(
+        pullback_strategy=PullbackRebreakoutStrategy()
+    )
+
+    entry = registry.get("pullback_rebreakout")
+
+    assert entry is not None
+    assert entry.strategy_tag == "pullback_rebreakout"
+    assert entry.capabilities.market_regime_mode == "read_only"
+    assert registry.strategy_tags() == ("pullback_rebreakout",)
+
+
+def test_generic_pullback_contract_roundtrip_preserves_native_fields():
+    _, _, candidate = _make_setup_candidate()
+    native_intent = PullbackEntryIntent(
+        symbol="005930",
+        strategy_tag="pullback_rebreakout",
+        created_at=_kst_dt(2026, 2, 20, 10, 31),
+        candidate_created_at=candidate.created_at,
+        expires_at=candidate.expires_at,
+        context_version=candidate.context_version,
+        entry_reference_price=175.2,
+        source="intraday",
+        current_price=175.2,
+        meta={"adx": 32.0},
+    )
+
+    generic_candidate = strategy_setup_candidate_from_pullback(candidate)
+    generic_intent = strategy_entry_intent_from_pullback(native_intent)
+
+    roundtrip_candidate = pullback_setup_candidate_from_strategy(generic_candidate)
+    roundtrip_intent = pullback_entry_intent_from_strategy(generic_intent)
+
+    assert roundtrip_candidate.context_version == candidate.context_version
+    assert roundtrip_candidate.micro_high == candidate.micro_high
+    assert roundtrip_candidate.source == candidate.source
+    assert roundtrip_intent.context_version == native_intent.context_version
+    assert roundtrip_intent.source == native_intent.source
+    assert roundtrip_intent.current_price == native_intent.current_price
+
+
+def test_pullback_registry_setup_parity_matches_native_candidate_and_skip_semantics():
+    sleeve = PullbackRebreakoutStrategy()
+    prepared_df = _make_pullback_indicator_df()
+    registry = build_default_strategy_registry(pullback_strategy=sleeve)
+    entry = registry.get("pullback_rebreakout")
+
+    with _patch_pullback_enabled():
+        native_candidate, native_terminal = sleeve.evaluate_setup_candidate(
+            df=prepared_df,
+            current_price=175.2,
+            stock_code="005930",
+            stock_name="삼성전자",
+            check_time=_kst_dt(2026, 2, 20, 10, 30),
+            market_phase=VenueMarketPhase.KRX_CONTINUOUS,
+            market_regime_snapshot=None,
+        )
+        registry_evaluation = entry.setup_evaluator.evaluate_setup(
+            daily_df=prepared_df,
+            daily_context=None,
+            current_price=175.2,
+            stock_code="005930",
+            stock_name="삼성전자",
+            check_time=_kst_dt(2026, 2, 20, 10, 30),
+            market_phase=VenueMarketPhase.KRX_CONTINUOUS,
+            market_venue="KRX",
+            has_existing_position=False,
+            has_pending_order=False,
+            market_regime_snapshot=None,
+        )
+        native_blocked, native_terminal_blocked = sleeve.evaluate_setup_candidate(
+            df=prepared_df,
+            current_price=170.0,
+            stock_code="005930",
+            stock_name="삼성전자",
+            check_time=_kst_dt(2026, 2, 20, 10, 30),
+            market_phase=VenueMarketPhase.KRX_CONTINUOUS,
+            market_regime_snapshot=None,
+        )
+        registry_blocked = entry.setup_evaluator.evaluate_setup(
+            daily_df=prepared_df,
+            daily_context=None,
+            current_price=170.0,
+            stock_code="005930",
+            stock_name="삼성전자",
+            check_time=_kst_dt(2026, 2, 20, 10, 30),
+            market_phase=VenueMarketPhase.KRX_CONTINUOUS,
+            market_venue="KRX",
+            has_existing_position=False,
+            has_pending_order=False,
+            market_regime_snapshot=None,
+        )
+
+    assert native_terminal is None
+    assert native_candidate is not None
+    assert registry_evaluation.native_candidate == native_candidate
+    assert registry_evaluation.candidate is not None
+    assert registry_evaluation.candidate.entry_reference_price == native_candidate.micro_high
+    assert native_blocked is None
+    assert registry_blocked.candidate is None
+    assert registry_blocked.skip_code == native_terminal_blocked.reason_code
+
+
+def test_pullback_registry_timing_parity_matches_native_decision():
+    sleeve, _, candidate = _make_setup_candidate()
+    registry = build_default_strategy_registry(pullback_strategy=sleeve)
+    entry = registry.get("pullback_rebreakout")
+
+    with _patch_pullback_enabled():
+        native_decision = sleeve.confirm_timing(
+            candidate=candidate,
+            current_price=175.2,
+            stock_code="005930",
+            check_time=_kst_dt(2026, 2, 20, 10, 30),
+            market_phase=VenueMarketPhase.KRX_CONTINUOUS,
+            current_context_version=candidate.context_version,
+        )
+        generic_decision = entry.timing_evaluator.evaluate_timing(
+            candidate=strategy_setup_candidate_from_pullback(candidate),
+            native_candidate=candidate,
+            current_price=175.2,
+            stock_code="005930",
+            check_time=_kst_dt(2026, 2, 20, 10, 30),
+            market_phase=VenueMarketPhase.KRX_CONTINUOUS,
+            market_venue="KRX",
+            intraday_bars=[],
+            has_existing_position=False,
+            has_pending_order=False,
+            current_context_version=candidate.context_version,
+        )
+
+    assert generic_decision.should_emit_intent == native_decision.should_emit_intent
+    assert generic_decision.reason_code == native_decision.reason_code
+    assert generic_decision.entry_reference_price == native_decision.entry_reference_price
+
+
+def test_registry_path_uses_market_regime_read_only_without_sync_refresh():
+    executor = _DailyRefreshExecutorStub()
+    context_store = DailyContextStore(max_symbols=8)
+    refresh_worker = DailyRefreshThread(
+        executor=executor,
+        daily_context_store=context_store,
+        stop_event=threading.Event(),
+        on_error=lambda *_args: None,
+    )
+    registry = build_default_strategy_registry(
+        pullback_strategy=executor.strategy.pullback_strategy
+    )
+    setup_worker = PullbackSetupWorker(
+        executor=executor,
+        candidate_store=ArmedCandidateStore(),
+        daily_context_store=context_store,
+        dirty_symbols=DirtySymbolSet(),
+        strategy_registry=registry,
+        enabled_strategy_tags=("pullback_rebreakout",),
+        stop_event=threading.Event(),
+        on_error=lambda *_args: None,
+    )
+    executor.refresh_shared_market_regime_snapshot = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("registry path must not sync refresh market regime")
+    )
+    executor.market_regime_snapshot = object()
+
+    with _patch_pullback_enabled(), \
+         patch.object(multiday_trend_atr.settings, "ENABLE_PULLBACK_DAILY_REFRESH_THREAD", True):
+        refresh_worker._run_cycle()
+        setup_worker._run_cycle()
+
+    assert setup_worker._candidate_store.get("005930") is not None
+    assert executor.fetch_market_data_called == 0

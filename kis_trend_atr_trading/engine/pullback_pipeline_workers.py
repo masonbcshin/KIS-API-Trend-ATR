@@ -15,6 +15,8 @@ try:
         DailyContext,
         PullbackEntryIntent,
         PullbackSetupCandidate,
+        pullback_timing_decision_from_strategy,
+        strategy_setup_candidate_from_pullback,
     )
     from engine.pullback_pipeline_stores import (
         AccountRiskStore,
@@ -23,6 +25,7 @@ try:
         DirtySymbolSet,
         EntryIntentQueue,
     )
+    from engine.strategy_pipeline_registry import StrategyRegistry
     from strategy.multiday_trend_atr import SignalType
     from strategy.pullback_rebreakout import PullbackDecision
     from utils.logger import get_logger
@@ -33,6 +36,8 @@ except ImportError:
         DailyContext,
         PullbackEntryIntent,
         PullbackSetupCandidate,
+        pullback_timing_decision_from_strategy,
+        strategy_setup_candidate_from_pullback,
     )
     from kis_trend_atr_trading.engine.pullback_pipeline_stores import (
         AccountRiskStore,
@@ -41,6 +46,7 @@ except ImportError:
         DirtySymbolSet,
         EntryIntentQueue,
     )
+    from kis_trend_atr_trading.engine.strategy_pipeline_registry import StrategyRegistry
     from kis_trend_atr_trading.strategy.pullback_rebreakout import PullbackDecision
     from kis_trend_atr_trading.strategy.multiday_trend_atr import SignalType
     from kis_trend_atr_trading.utils.logger import get_logger
@@ -327,6 +333,8 @@ class PullbackSetupWorker(threading.Thread):
         candidate_store: ArmedCandidateStore,
         daily_context_store: Optional[DailyContextStore],
         dirty_symbols: DirtySymbolSet,
+        strategy_registry: Optional[StrategyRegistry],
+        enabled_strategy_tags: tuple[str, ...],
         stop_event: threading.Event,
         on_error: Callable[[str, Exception], None],
     ) -> None:
@@ -335,8 +343,31 @@ class PullbackSetupWorker(threading.Thread):
         self._candidate_store = candidate_store
         self._daily_context_store = daily_context_store
         self._dirty_symbols = dirty_symbols
+        self._strategy_registry = strategy_registry
+        self._enabled_strategy_tags = tuple(enabled_strategy_tags or ())
         self._stop_event = stop_event
         self._on_error = on_error
+
+    def _resolve_regime_snapshot_state(self) -> str:
+        snapshot = getattr(self._executor, "market_regime_snapshot", None)
+        error_state = str(getattr(self._executor, "_market_regime_worker_error_state", "") or "").strip()
+        if error_state:
+            return "error_state"
+        if snapshot is None:
+            return "absent"
+        return "stale" if bool(getattr(snapshot, "is_stale", False)) else "fresh"
+
+    def _registry_entry(self):
+        if self._strategy_registry is None:
+            return None
+        if "pullback_rebreakout" not in self._enabled_strategy_tags:
+            return None
+        return self._strategy_registry.get("pullback_rebreakout")
+
+    def _record_setup_metrics(self, elapsed_ms: float) -> None:
+        setattr(self._executor, "_strategy_setup_eval_ms", elapsed_ms)
+        setattr(self._executor, "_candidate_store_size_by_strategy", {"pullback_rebreakout": self._candidate_store.size()})
+        setattr(self._executor, "_strategy_regime_snapshot_state_used", self._resolve_regime_snapshot_state())
 
     def run(self) -> None:
         interval_sec = max(float(getattr(settings, "PULLBACK_SETUP_REFRESH_SEC", 60) or 60.0), 1.0)
@@ -349,6 +380,7 @@ class PullbackSetupWorker(threading.Thread):
                 return
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             setattr(self._executor, "_pullback_setup_eval_ms", elapsed_ms)
+            self._record_setup_metrics(elapsed_ms)
             logger.debug(
                 "[PULLBACK_PIPELINE] pullback_setup_eval_ms=%.2f pullback_candidate_store_size=%s",
                 elapsed_ms,
@@ -378,18 +410,42 @@ class PullbackSetupWorker(threading.Thread):
             if not self._executor.strategy.has_position
             else False
         )
-        candidate, terminal = self._executor.strategy.pullback_strategy.evaluate_setup_candidate(
-            df=df,
-            current_price=current_price,
-            stock_code=self._executor.stock_code,
-            stock_name=str(quote_snapshot.get("stock_name") or ""),
-            check_time=datetime.now(KST),
-            market_phase=getattr(self._executor, "market_phase_context", None),
-            market_venue=getattr(self._executor, "market_venue_context", "KRX"),
-            has_existing_position=self._executor.strategy.has_position,
-            has_pending_order=has_pending_order,
-            market_regime_snapshot=getattr(self._executor, "market_regime_snapshot", None),
-        )
+        registry_entry = self._registry_entry()
+        if registry_entry is not None:
+            evaluation = registry_entry.setup_evaluator.evaluate_setup(
+                daily_df=df,
+                daily_context=None,
+                current_price=current_price,
+                stock_code=self._executor.stock_code,
+                stock_name=str(quote_snapshot.get("stock_name") or ""),
+                check_time=datetime.now(KST),
+                market_phase=getattr(self._executor, "market_phase_context", None),
+                market_venue=getattr(self._executor, "market_venue_context", "KRX"),
+                has_existing_position=self._executor.strategy.has_position,
+                has_pending_order=has_pending_order,
+                market_regime_snapshot=getattr(self._executor, "market_regime_snapshot", None),
+            )
+            candidate = evaluation.native_candidate
+            terminal = evaluation
+            if candidate is None:
+                setattr(
+                    self._executor,
+                    "_pullback_setup_skip_reason",
+                    str(evaluation.skip_code or evaluation.skip_reason or ""),
+                )
+        else:
+            candidate, terminal = self._executor.strategy.pullback_strategy.evaluate_setup_candidate(
+                df=df,
+                current_price=current_price,
+                stock_code=self._executor.stock_code,
+                stock_name=str(quote_snapshot.get("stock_name") or ""),
+                check_time=datetime.now(KST),
+                market_phase=getattr(self._executor, "market_phase_context", None),
+                market_venue=getattr(self._executor, "market_venue_context", "KRX"),
+                has_existing_position=self._executor.strategy.has_position,
+                has_pending_order=has_pending_order,
+                market_regime_snapshot=getattr(self._executor, "market_regime_snapshot", None),
+            )
         if candidate is None:
             self._candidate_store.remove(self._executor.stock_code)
             if terminal is not None:
@@ -440,18 +496,42 @@ class PullbackSetupWorker(threading.Thread):
             if not self._executor.strategy.has_position
             else False
         )
-        candidate, terminal = self._executor.strategy.pullback_strategy.evaluate_setup_candidate_from_daily_context(
-            daily_context=context,
-            current_price=current_price,
-            stock_code=self._executor.stock_code,
-            stock_name=str(quote_snapshot.get("stock_name") or ""),
-            check_time=decision_time,
-            market_phase=getattr(self._executor, "market_phase_context", None),
-            market_venue=getattr(self._executor, "market_venue_context", "KRX"),
-            has_existing_position=self._executor.strategy.has_position,
-            has_pending_order=has_pending_order,
-            market_regime_snapshot=getattr(self._executor, "market_regime_snapshot", None),
-        )
+        registry_entry = self._registry_entry()
+        if registry_entry is not None:
+            evaluation = registry_entry.setup_evaluator.evaluate_setup(
+                daily_df=None,
+                daily_context=context,
+                current_price=current_price,
+                stock_code=self._executor.stock_code,
+                stock_name=str(quote_snapshot.get("stock_name") or ""),
+                check_time=decision_time,
+                market_phase=getattr(self._executor, "market_phase_context", None),
+                market_venue=getattr(self._executor, "market_venue_context", "KRX"),
+                has_existing_position=self._executor.strategy.has_position,
+                has_pending_order=has_pending_order,
+                market_regime_snapshot=getattr(self._executor, "market_regime_snapshot", None),
+            )
+            candidate = evaluation.native_candidate
+            terminal = evaluation
+            if candidate is None:
+                setattr(
+                    self._executor,
+                    "_pullback_setup_skip_reason",
+                    str(evaluation.skip_code or evaluation.skip_reason or ""),
+                )
+        else:
+            candidate, terminal = self._executor.strategy.pullback_strategy.evaluate_setup_candidate_from_daily_context(
+                daily_context=context,
+                current_price=current_price,
+                stock_code=self._executor.stock_code,
+                stock_name=str(quote_snapshot.get("stock_name") or ""),
+                check_time=decision_time,
+                market_phase=getattr(self._executor, "market_phase_context", None),
+                market_venue=getattr(self._executor, "market_venue_context", "KRX"),
+                has_existing_position=self._executor.strategy.has_position,
+                has_pending_order=has_pending_order,
+                market_regime_snapshot=getattr(self._executor, "market_regime_snapshot", None),
+            )
         if candidate is None:
             self._candidate_store.remove(self._executor.stock_code)
             if terminal is not None:
@@ -472,6 +552,8 @@ class PullbackTimingWorker(threading.Thread):
         candidate_store: ArmedCandidateStore,
         dirty_symbols: DirtySymbolSet,
         entry_queue: EntryIntentQueue,
+        strategy_registry: Optional[StrategyRegistry],
+        enabled_strategy_tags: tuple[str, ...],
         stop_event: threading.Event,
         on_error: Callable[[str, Exception], None],
     ) -> None:
@@ -480,6 +562,8 @@ class PullbackTimingWorker(threading.Thread):
         self._candidate_store = candidate_store
         self._dirty_symbols = dirty_symbols
         self._entry_queue = entry_queue
+        self._strategy_registry = strategy_registry
+        self._enabled_strategy_tags = tuple(enabled_strategy_tags or ())
         self._stop_event = stop_event
         self._on_error = on_error
 
@@ -498,9 +582,17 @@ class PullbackTimingWorker(threading.Thread):
                     self._process_symbol(symbol)
                     elapsed_ms = (time.perf_counter() - started) * 1000.0
                     setattr(self._executor, "_pullback_timing_eval_ms", elapsed_ms)
+                    setattr(self._executor, "_strategy_timing_eval_ms", elapsed_ms)
             except Exception as exc:
                 self._on_error(self.name, exc)
                 return
+
+    def _registry_entry(self):
+        if self._strategy_registry is None:
+            return None
+        if "pullback_rebreakout" not in self._enabled_strategy_tags:
+            return None
+        return self._strategy_registry.get("pullback_rebreakout")
 
     def _process_symbol(self, symbol: str) -> None:
         candidate = self._candidate_store.get(symbol)
@@ -529,18 +621,35 @@ class PullbackTimingWorker(threading.Thread):
         intraday_bars = self._executor.fetch_cached_intraday_bars_if_available(
             n=max(int(getattr(settings, "PULLBACK_REBREAKOUT_LOOKBACK_BARS", 3) or 3) + 2, 5)
         )
-        decision = self._executor.strategy.pullback_strategy.confirm_timing(
-            candidate=candidate,
-            current_price=current_price,
-            stock_code=symbol,
-            check_time=quote_snapshot.get("received_at") if isinstance(quote_snapshot.get("received_at"), datetime) else datetime.now(KST),
-            market_phase=getattr(self._executor, "market_phase_context", None),
-            market_venue=getattr(self._executor, "market_venue_context", "KRX"),
-            intraday_bars=intraday_bars,
-            has_existing_position=False,
-            has_pending_order=has_pending_order,
-            current_context_version=str(getattr(self._executor, "_pullback_threaded_context_version", "") or ""),
-        )
+        registry_entry = self._registry_entry()
+        if registry_entry is not None:
+            strategy_decision = registry_entry.timing_evaluator.evaluate_timing(
+                candidate=strategy_setup_candidate_from_pullback(candidate),
+                native_candidate=candidate,
+                current_price=current_price,
+                stock_code=symbol,
+                check_time=quote_snapshot.get("received_at") if isinstance(quote_snapshot.get("received_at"), datetime) else datetime.now(KST),
+                market_phase=getattr(self._executor, "market_phase_context", None),
+                market_venue=getattr(self._executor, "market_venue_context", "KRX"),
+                intraday_bars=intraday_bars,
+                has_existing_position=False,
+                has_pending_order=has_pending_order,
+                current_context_version=str(getattr(self._executor, "_pullback_threaded_context_version", "") or ""),
+            )
+            decision = pullback_timing_decision_from_strategy(strategy_decision)
+        else:
+            decision = self._executor.strategy.pullback_strategy.confirm_timing(
+                candidate=candidate,
+                current_price=current_price,
+                stock_code=symbol,
+                check_time=quote_snapshot.get("received_at") if isinstance(quote_snapshot.get("received_at"), datetime) else datetime.now(KST),
+                market_phase=getattr(self._executor, "market_phase_context", None),
+                market_venue=getattr(self._executor, "market_venue_context", "KRX"),
+                intraday_bars=intraday_bars,
+                has_existing_position=False,
+                has_pending_order=has_pending_order,
+                current_context_version=str(getattr(self._executor, "_pullback_threaded_context_version", "") or ""),
+            )
         if decision.invalidate_candidate:
             self._candidate_store.remove(symbol)
         if not decision.should_emit_intent:
@@ -569,6 +678,7 @@ class PullbackTimingWorker(threading.Thread):
         )
         queued = self._entry_queue.put_if_absent(intent)
         setattr(self._executor, "_pullback_intent_queue_depth", self._entry_queue.qsize())
+        setattr(self._executor, "_intent_queue_depth_by_strategy", {"pullback_rebreakout": self._entry_queue.qsize()})
         if not queued:
             setattr(self._executor, "_pullback_timing_skip_reason", "duplicate_or_queue_full")
             return
@@ -679,6 +789,11 @@ class OrderExecutionWorker(threading.Thread):
             self._executor,
             "_pullback_end_to_end_latency_ms",
             max((datetime.now(KST) - intent.candidate_created_at).total_seconds() * 1000.0, elapsed_ms),
+        )
+        setattr(
+            self._executor,
+            "_strategy_end_to_end_latency_ms",
+            float(getattr(self._executor, "_pullback_end_to_end_latency_ms", 0.0) or 0.0),
         )
         if order_result.get("success") or order_result.get("skipped"):
             self._candidate_store.remove(intent.symbol)

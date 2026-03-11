@@ -227,6 +227,31 @@ def test_pullback_daily_refresh_symbols_filter_blank_and_placeholder_codes():
     assert executor.get_pullback_daily_refresh_symbols() == ["005930"]
 
 
+def test_threaded_pipeline_flag_precedence_prefers_multi_strategy_registry_path():
+    executor = _make_executor()
+    executor._threaded_pullback_pipeline_disabled = False
+
+    with patch.object(multiday_executor.settings, "ENABLE_PULLBACK_REBREAKOUT_STRATEGY", True), \
+         patch.object(multiday_executor.settings, "ENABLE_MULTI_STRATEGY_THREADED_PIPELINE", True), \
+         patch.object(multiday_executor.settings, "THREADED_PIPELINE_ENABLED_STRATEGIES", "pullback_rebreakout"), \
+         patch.object(multiday_executor.settings, "ENABLE_THREADED_PULLBACK_PIPELINE", True):
+        assert executor._is_multi_strategy_threaded_pipeline_enabled() is True
+        assert executor._is_threaded_pullback_pipeline_enabled() is False
+        assert executor._should_defer_pullback_buy_to_threaded_pipeline() is True
+
+
+def test_threaded_pipeline_flag_precedence_falls_back_to_legacy_pullback_flag():
+    executor = _make_executor()
+    executor._threaded_pullback_pipeline_disabled = False
+
+    with patch.object(multiday_executor.settings, "ENABLE_PULLBACK_REBREAKOUT_STRATEGY", True), \
+         patch.object(multiday_executor.settings, "ENABLE_MULTI_STRATEGY_THREADED_PIPELINE", False), \
+         patch.object(multiday_executor.settings, "ENABLE_THREADED_PULLBACK_PIPELINE", True):
+        assert executor._is_multi_strategy_threaded_pipeline_enabled() is False
+        assert executor._is_threaded_pullback_pipeline_enabled() is True
+        assert executor._should_defer_pullback_buy_to_threaded_pipeline() is True
+
+
 class _OrderWorkerStrategyStub:
     def __init__(self):
         self.has_position = False
