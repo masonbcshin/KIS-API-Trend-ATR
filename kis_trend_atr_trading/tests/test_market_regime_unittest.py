@@ -496,6 +496,84 @@ def test_market_regime_refresh_thread_forces_daily_refresh_on_trade_date_change(
     assert should_force is True
 
 
+def test_market_regime_refresh_thread_refreshes_stale_daily_context():
+    now_kst = _kst_dt(2026, 3, 2, 9, 10)
+    service = market_regime.MarketRegimeService(api=SimpleNamespace())
+    worker = market_regime_worker.MarketRegimeRefreshThread(service=service)
+    stale_context = market_regime.DailyRegimeContext(
+        trade_date="2026-03-02",
+        refreshed_at=now_kst - timedelta(seconds=601),
+        context_version="fresh-prefix:old",
+        source="background_refresh",
+        success=True,
+        stale=False,
+        kospi_probe=market_regime.MarketRegimeProbe(
+            symbol="069500",
+            close=100.0,
+            ma=99.0,
+            return_pct=0.01,
+            above_ma=True,
+        ),
+        kosdaq_probe=market_regime.MarketRegimeProbe(
+            symbol="229200",
+            close=200.0,
+            ma=199.0,
+            return_pct=0.01,
+            above_ma=True,
+        ),
+        regime=market_regime.MarketRegime.GOOD,
+        reason="stale_context",
+    )
+    worker._daily_context = stale_context
+    fresh_context = market_regime.DailyRegimeContext(
+        trade_date="2026-03-02",
+        refreshed_at=now_kst,
+        context_version="fresh-prefix:new",
+        source="background_refresh",
+        success=True,
+        stale=False,
+        kospi_probe=stale_context.kospi_probe,
+        kosdaq_probe=stale_context.kosdaq_probe,
+        regime=market_regime.MarketRegime.GOOD,
+        reason="fresh_context",
+    )
+    refreshed_snapshot = _make_shared_snapshot(
+        market_regime.MarketRegime.GOOD,
+        "fresh_context",
+        as_of=now_kst,
+    )
+
+    with _regime_settings(MARKET_REGIME_DAILY_CONTEXT_REFRESH_SEC=600.0):
+        with patch.object(
+            service,
+            "daily_context_version_prefix",
+            return_value="fresh-prefix",
+        ), patch.object(
+            service,
+            "build_daily_context",
+            return_value=market_regime.DailyRegimeContextBuildResult(
+                context=fresh_context,
+                total_refresh_elapsed_sec=0.05,
+            ),
+        ) as build_daily_context, patch.object(
+            service,
+            "apply_intraday_guard",
+            return_value=market_regime.MarketRegimeBuildResult(
+                snapshot=refreshed_snapshot,
+                total_refresh_elapsed_sec=0.01,
+                quote_source="skip",
+                quote_state="absent",
+                daily_context_state="fresh",
+            ),
+        ):
+            worker._run_cycle(now_kst=now_kst)
+
+    build_daily_context.assert_called_once()
+    status = worker.get_status(now=now_kst)
+    assert status["daily_context"].context_version == "fresh-prefix:new"
+    assert status["snapshot"].as_of == now_kst
+
+
 def test_market_regime_refresh_thread_keeps_absent_snapshot_on_daily_context_failure():
     service = market_regime.MarketRegimeService(_DummyAPI({}))
     stop_event = threading.Event()

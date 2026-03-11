@@ -184,7 +184,13 @@ class MarketRegimeRefreshThread(threading.Thread):
         )
 
         daily_context_refresh_ms = 0.0
-        if force_daily or current_context is None:
+        needs_daily_refresh = force_daily or current_context is None or current_context_state in {
+            "absent",
+            "stale",
+            "trade_date_mismatch",
+            "version_mismatch",
+        }
+        if needs_daily_refresh:
             try:
                 daily_started_at = time.perf_counter()
                 daily_result = self._service.build_daily_context(
