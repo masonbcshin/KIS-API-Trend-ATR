@@ -81,6 +81,11 @@ try:
         PullbackTimingWorker,
         OrderExecutionWorker,
     )
+    from kis_trend_atr_trading.engine.strategy_pipeline_health import (
+        DegradedModeController,
+        PipelineHealthMonitorThread,
+        WorkerHealthStore,
+    )
     from kis_trend_atr_trading.engine.strategy_pipeline_registry import build_default_strategy_registry
     from kis_trend_atr_trading.utils.avg_price import calc_weighted_avg, quantize_price, reduce_quantity_after_sell
     from kis_trend_atr_trading.utils.entry_utils import (
@@ -152,6 +157,11 @@ except ImportError:
         PullbackSetupWorker,
         PullbackTimingWorker,
         OrderExecutionWorker,
+    )
+    from engine.strategy_pipeline_health import (
+        DegradedModeController,
+        PipelineHealthMonitorThread,
+        WorkerHealthStore,
     )
     from engine.strategy_pipeline_registry import build_default_strategy_registry
     from utils.avg_price import calc_weighted_avg, quantize_price, reduce_quantity_after_sell
@@ -415,8 +425,11 @@ class MultidayExecutor:
         self._pullback_setup_worker: Optional[PullbackSetupWorker] = None
         self._pullback_timing_worker: Optional[PullbackTimingWorker] = None
         self._pullback_order_worker: Optional[OrderExecutionWorker] = None
+        self._pipeline_health_monitor_worker: Optional[PipelineHealthMonitorThread] = None
         self._pullback_quote_unsubscribe: Optional[Any] = None
         self._strategy_pipeline_registry: Optional[Any] = None
+        self._strategy_pipeline_health_store: Optional[WorkerHealthStore] = None
+        self._strategy_pipeline_degraded_controller: Optional[DegradedModeController] = None
         self._strategy_pipeline_enabled_tags: tuple[str, ...] = ()
         self._strategy_shadow_state_lock = threading.Lock()
         self._strategy_shadow_candidates: Dict[str, Any] = {}
@@ -457,6 +470,30 @@ class MultidayExecutor:
         self._order_final_validation_ms: float = 0.0
         self._risk_snapshot_last_success_age_sec: float = -1.0
         self._risk_snapshot_refresh_fail_count: int = 0
+        self._pipeline_worker_heartbeat_sec: float = max(
+            float(getattr(settings, "PIPELINE_WORKER_HEARTBEAT_SEC", 5) or 5.0),
+            1.0,
+        )
+        self._pipeline_worker_stall_sec: float = max(
+            float(getattr(settings, "PIPELINE_WORKER_STALL_SEC", 20) or 20.0),
+            1.0,
+        )
+        self._candidate_cleanup_interval_sec: float = max(
+            float(getattr(settings, "CANDIDATE_CLEANUP_INTERVAL_SEC", 30) or 30.0),
+            1.0,
+        )
+        self._worker_health_state: Dict[str, str] = {}
+        self._worker_state_reason: Dict[str, str] = {}
+        self._worker_lag_sec: Dict[str, float] = {}
+        self._dirty_symbol_count: int = 0
+        self._candidate_store_size: int = 0
+        self._dropped_intent_count: int = 0
+        self._degraded_mode_transitions: int = 0
+        self._degraded_mode_current: bool = False
+        self._degraded_mode_reason: str = ""
+        self._degraded_ingress_reject_count_by_strategy: Dict[str, int] = {}
+        self._authoritative_queue_reject_reason: str = ""
+        self._candidate_cleanup_stats: Dict[str, int] = {}
         
         # 일별 거래 기록
         self._daily_trades = []
@@ -653,9 +690,67 @@ class MultidayExecutor:
             getattr(settings, "ENABLE_RISK_SNAPSHOT_THREAD", False)
         )
 
+    def _is_pipeline_health_monitoring_enabled(self) -> bool:
+        return self._is_any_threaded_pullback_pipeline_enabled() and bool(
+            getattr(settings, "ENABLE_PIPELINE_HEALTH_MONITORING", False)
+        )
+
+    def _is_pipeline_degraded_mode_enabled(self) -> bool:
+        return self._is_any_threaded_pullback_pipeline_enabled() and bool(
+            getattr(settings, "ENABLE_PIPELINE_DEGRADED_MODE", False)
+        )
+
+    def _is_pipeline_backpressure_enabled(self) -> bool:
+        return self._is_pipeline_health_monitoring_enabled() or self._is_pipeline_degraded_mode_enabled()
+
+    def is_pipeline_degraded(self) -> bool:
+        controller = getattr(self, "_strategy_pipeline_degraded_controller", None)
+        return bool(controller is not None and controller.is_degraded())
+
+    def cleanup_threaded_pipeline_state(self, now: Optional[datetime] = None) -> Dict[str, int]:
+        current_now = now or datetime.now(KST)
+        removed_pullback_candidates = 0
+        removed_shadow_candidates = 0
+        removed_shadow_intents = 0
+        if self._pullback_candidate_store is not None:
+            removed_pullback_candidates = int(self._pullback_candidate_store.cleanup_expired(current_now) or 0)
+        with self._strategy_shadow_state_lock:
+            for key, candidate in list(self._strategy_shadow_candidates.items()):
+                expires_at = getattr(candidate, "expires_at", None)
+                if isinstance(expires_at, datetime) and expires_at <= current_now:
+                    self._strategy_shadow_candidates.pop(key, None)
+                    removed_shadow_candidates += 1
+            for key, intent in list(self._strategy_shadow_intents.items()):
+                expires_at = getattr(intent, "expires_at", None)
+                if isinstance(expires_at, datetime) and expires_at <= current_now:
+                    self._strategy_shadow_intents.pop(key, None)
+                    removed_shadow_intents += 1
+        total_candidates = int(removed_pullback_candidates + removed_shadow_candidates)
+        stats = {
+            "pullback_candidates": removed_pullback_candidates,
+            "shadow_candidates": removed_shadow_candidates,
+            "shadow_intents": removed_shadow_intents,
+        }
+        self._candidate_cleanup_stats = stats
+        self._candidate_store_size = max(
+            int((self._pullback_candidate_store.size() if self._pullback_candidate_store is not None else 0) or 0)
+            + sum(int(value or 0) for value in dict(self.get_strategy_shadow_counts().get("candidates") or {}).values()),
+            0,
+        )
+        if total_candidates or removed_shadow_intents:
+            logger.info(
+                "[PIPELINE_HEALTH] candidate_cleanup pullback=%s shadow_candidates=%s shadow_intents=%s",
+                removed_pullback_candidates,
+                removed_shadow_candidates,
+                removed_shadow_intents,
+            )
+        return stats
+
     def _is_threaded_pullback_pipeline_running(self) -> bool:
         stop_event = getattr(self, "_pullback_pipeline_stop_event", None)
         workers = (
+            getattr(self, "_pipeline_health_monitor_worker", None),
+            getattr(self, "_pullback_daily_refresh_worker", None),
             getattr(self, "_pullback_risk_snapshot_worker", None),
             getattr(self, "_pullback_setup_worker", None),
             getattr(self, "_pullback_timing_worker", None),
@@ -669,6 +764,9 @@ class MultidayExecutor:
 
     def _handle_pullback_pipeline_worker_error(self, worker_name: str, exc: Exception) -> None:
         logger.error("[PULLBACK_PIPELINE] worker=%s err=%s", worker_name, exc)
+        health_store = getattr(self, "_strategy_pipeline_health_store", None)
+        if health_store is not None:
+            health_store.mark_error(worker_name, exc)
         self._threaded_pullback_pipeline_disabled = True
         stop_event = getattr(self, "_pullback_pipeline_stop_event", None)
         if stop_event is not None:
@@ -686,14 +784,36 @@ class MultidayExecutor:
             return
         self._stop_threaded_pullback_pipeline()
         self._pullback_pipeline_stop_event = threading.Event()
+        self._strategy_pipeline_health_store = None
+        self._strategy_pipeline_degraded_controller = None
+        if self._is_pipeline_backpressure_enabled():
+            self._strategy_pipeline_health_store = WorkerHealthStore()
+            self._strategy_pipeline_degraded_controller = DegradedModeController(
+                enabled=self._is_pipeline_degraded_mode_enabled(),
+                enter_queue_depth=max(int(getattr(settings, "DEGRADED_MODE_ENTER_QUEUE_DEPTH", 512) or 512), 1),
+                exit_queue_depth=max(int(getattr(settings, "DEGRADED_MODE_EXIT_QUEUE_DEPTH", 256) or 256), 0),
+                min_hold_sec=max(float(getattr(settings, "DEGRADED_MODE_MIN_HOLD_SEC", 15) or 15.0), 0.0),
+            )
         self._pullback_candidate_store = ArmedCandidateStore()
         self._pullback_daily_context_store = DailyContextStore(
             max_symbols=max(int(getattr(settings, "DAILY_CONTEXT_STORE_MAX_SYMBOLS", 256) or 256), 1)
         )
         self._pullback_account_risk_store = AccountRiskStore()
         self._pullback_dirty_symbols = DirtySymbolSet()
+        authoritative_queue = True
+        queue_maxsize = min(
+            max(int(getattr(settings, "PULLBACK_ENTRY_INTENT_QUEUE_MAXSIZE", 256) or 256), 1),
+            max(int(getattr(settings, "MAX_INTENT_QUEUE_DEPTH", 1024) or 1024), 1),
+        )
         self._pullback_entry_queue = EntryIntentQueue(
-            maxsize=max(int(getattr(settings, "PULLBACK_ENTRY_INTENT_QUEUE_MAXSIZE", 256) or 256), 1)
+            maxsize=queue_maxsize,
+            authoritative=authoritative_queue,
+            drop_policy=str(getattr(settings, "ENTRY_INTENT_QUEUE_DROP_POLICY", "reject_new") or "reject_new"),
+            max_pending_per_symbol=(
+                max(int(getattr(settings, "MAX_PENDING_INTENTS_PER_SYMBOL", 1) or 1), 0)
+                if self._is_pipeline_backpressure_enabled()
+                else 0
+            ),
         )
         self._strategy_pipeline_enabled_tags = self._threaded_pipeline_enabled_strategy_tags()
         self._strategy_pipeline_registry = None
@@ -707,6 +827,7 @@ class MultidayExecutor:
             self._pullback_daily_refresh_worker = DailyRefreshThread(
                 executor=self,
                 daily_context_store=self._pullback_daily_context_store,
+                health_store=self._strategy_pipeline_health_store,
                 stop_event=self._pullback_pipeline_stop_event,
                 on_error=self._handle_pullback_pipeline_worker_error,
             )
@@ -714,6 +835,7 @@ class MultidayExecutor:
             self._pullback_risk_snapshot_worker = RiskSnapshotThread(
                 executor=self,
                 account_risk_store=self._pullback_account_risk_store,
+                health_store=self._strategy_pipeline_health_store,
                 stop_event=self._pullback_pipeline_stop_event,
                 on_error=self._handle_pullback_pipeline_worker_error,
             )
@@ -724,6 +846,8 @@ class MultidayExecutor:
             dirty_symbols=self._pullback_dirty_symbols,
             strategy_registry=self._strategy_pipeline_registry,
             enabled_strategy_tags=self._strategy_pipeline_enabled_tags,
+            health_store=self._strategy_pipeline_health_store,
+            degraded_controller=self._strategy_pipeline_degraded_controller,
             stop_event=self._pullback_pipeline_stop_event,
             on_error=self._handle_pullback_pipeline_worker_error,
         )
@@ -734,6 +858,8 @@ class MultidayExecutor:
             entry_queue=self._pullback_entry_queue,
             strategy_registry=self._strategy_pipeline_registry,
             enabled_strategy_tags=self._strategy_pipeline_enabled_tags,
+            health_store=self._strategy_pipeline_health_store,
+            degraded_controller=self._strategy_pipeline_degraded_controller,
             stop_event=self._pullback_pipeline_stop_event,
             on_error=self._handle_pullback_pipeline_worker_error,
         )
@@ -741,9 +867,21 @@ class MultidayExecutor:
             executor=self,
             candidate_store=self._pullback_candidate_store,
             entry_queue=self._pullback_entry_queue,
+            health_store=self._strategy_pipeline_health_store,
             stop_event=self._pullback_pipeline_stop_event,
             on_error=self._handle_pullback_pipeline_worker_error,
         )
+        if self._is_pipeline_backpressure_enabled() and self._strategy_pipeline_health_store is not None:
+            self._pipeline_health_monitor_worker = PipelineHealthMonitorThread(
+                executor=self,
+                health_store=self._strategy_pipeline_health_store,
+                degraded_controller=self._strategy_pipeline_degraded_controller,
+                entry_queue=self._pullback_entry_queue,
+                dirty_symbols=self._pullback_dirty_symbols,
+                candidate_cleanup=self.cleanup_threaded_pipeline_state,
+                stop_event=self._pullback_pipeline_stop_event,
+                on_error=self._handle_pullback_pipeline_worker_error,
+            )
         subscribe_quotes = getattr(self.market_data_provider, "subscribe_quotes", None)
         if callable(subscribe_quotes):
             try:
@@ -781,6 +919,8 @@ class MultidayExecutor:
         self._pullback_setup_worker.start()
         self._pullback_timing_worker.start()
         self._pullback_order_worker.start()
+        if self._pipeline_health_monitor_worker is not None:
+            self._pipeline_health_monitor_worker.start()
         logger.info("[PULLBACK_PIPELINE] started symbol=%s", self.stock_code)
 
     def _stop_threaded_pullback_pipeline(self) -> None:
@@ -798,6 +938,7 @@ class MultidayExecutor:
 
         current_thread = threading.current_thread()
         for attr_name in (
+            "_pipeline_health_monitor_worker",
             "_pullback_daily_refresh_worker",
             "_pullback_risk_snapshot_worker",
             "_pullback_setup_worker",
@@ -817,6 +958,8 @@ class MultidayExecutor:
         self._pullback_candidate_store = None
         self._pullback_daily_context_store = None
         self._pullback_account_risk_store = None
+        self._strategy_pipeline_health_store = None
+        self._strategy_pipeline_degraded_controller = None
         self._strategy_pipeline_registry = None
         self._strategy_pipeline_enabled_tags = ()
         self.clear_strategy_shadow_state()
@@ -834,6 +977,18 @@ class MultidayExecutor:
         self._authoritative_order_handoff_path = ""
         self._mixed_strategy_dedupe_count = 0
         self._mixed_strategy_tiebreak_count = 0
+        self._worker_health_state = {}
+        self._worker_state_reason = {}
+        self._worker_lag_sec = {}
+        self._dirty_symbol_count = 0
+        self._candidate_store_size = 0
+        self._dropped_intent_count = 0
+        self._degraded_mode_transitions = 0
+        self._degraded_mode_current = False
+        self._degraded_mode_reason = ""
+        self._degraded_ingress_reject_count_by_strategy = {}
+        self._authoritative_queue_reject_reason = ""
+        self._candidate_cleanup_stats = {}
 
     def is_cached_intraday_provider_ready(self) -> bool:
         provider = getattr(self, "market_data_provider", None)
@@ -920,6 +1075,22 @@ class MultidayExecutor:
             ),
             "mixed_strategy_dedupe_count": int(getattr(self, "_mixed_strategy_dedupe_count", 0) or 0),
             "mixed_strategy_tiebreak_count": int(getattr(self, "_mixed_strategy_tiebreak_count", 0) or 0),
+            "worker_health_state": dict(getattr(self, "_worker_health_state", {}) or {}),
+            "worker_state_reason": dict(getattr(self, "_worker_state_reason", {}) or {}),
+            "worker_lag_sec": dict(getattr(self, "_worker_lag_sec", {}) or {}),
+            "dirty_symbol_count": int(getattr(self, "_dirty_symbol_count", 0) or 0),
+            "candidate_store_size": int(getattr(self, "_candidate_store_size", 0) or 0),
+            "dropped_intent_count": int(getattr(self, "_dropped_intent_count", 0) or 0),
+            "degraded_mode_transitions": int(getattr(self, "_degraded_mode_transitions", 0) or 0),
+            "degraded_mode_current": bool(getattr(self, "_degraded_mode_current", False)),
+            "degraded_mode_reason": str(getattr(self, "_degraded_mode_reason", "") or ""),
+            "degraded_ingress_reject_count_by_strategy": dict(
+                getattr(self, "_degraded_ingress_reject_count_by_strategy", {}) or {}
+            ),
+            "authoritative_queue_reject_reason": str(
+                getattr(self, "_authoritative_queue_reject_reason", "") or ""
+            ),
+            "candidate_cleanup_stats": dict(getattr(self, "_candidate_cleanup_stats", {}) or {}),
             "risk_snapshot_refresh_ms": float(getattr(self, "_risk_snapshot_refresh_ms", 0.0) or 0.0),
             "risk_snapshot_refresh_count": int(getattr(self, "_risk_snapshot_refresh_count", 0) or 0),
             "holdings_snapshot_refresh_count": int(getattr(self, "_holdings_snapshot_refresh_count", 0) or 0),

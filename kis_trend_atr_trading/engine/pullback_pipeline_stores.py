@@ -50,6 +50,19 @@ class ArmedCandidateStore:
         with self._lock:
             return list(self._candidates.keys())
 
+    def cleanup_expired(self, now: Optional[datetime] = None) -> int:
+        current_now = now or datetime.now()
+        removed = 0
+        with self._lock:
+            for symbol, candidate in list(self._candidates.items()):
+                expires_at = getattr(candidate, "expires_at", None)
+                if not isinstance(expires_at, datetime):
+                    continue
+                if expires_at <= current_now:
+                    self._candidates.pop(symbol, None)
+                    removed += 1
+        return removed
+
 
 class DailyContextStore:
     def __init__(self, max_symbols: int = 256) -> None:
@@ -143,14 +156,27 @@ class DirtySymbolSet:
 
 
 class EntryIntentQueue:
-    def __init__(self, maxsize: int = 256) -> None:
+    def __init__(
+        self,
+        maxsize: int = 256,
+        *,
+        authoritative: bool = True,
+        drop_policy: str = "reject_new",
+        max_pending_per_symbol: int = 0,
+    ) -> None:
         self._queue: queue.PriorityQueue[tuple[tuple[Any, ...], int, Any]] = queue.PriorityQueue(
             maxsize=max(int(maxsize), 1)
         )
         self._lock = threading.Lock()
+        self._authoritative = bool(authoritative)
+        self._drop_policy = str(drop_policy or "reject_new").strip().lower() or "reject_new"
+        self._max_pending_per_symbol = max(int(max_pending_per_symbol or 0), 0)
         self._active_keys: set[str] = set()
+        self._active_symbol_counts: Dict[str, int] = {}
         self._enqueue_seq: int = 0
         self._mixed_strategy_tiebreak_count: int = 0
+        self._dropped_count: int = 0
+        self._last_reject_reason: str = ""
 
     @staticmethod
     def _strategy_rank(strategy_tag: str) -> int:
@@ -179,10 +205,45 @@ class EntryIntentQueue:
                 return True
         return False
 
+    def _symbol_count(self, symbol: str) -> int:
+        return int(self._active_symbol_counts.get(str(symbol).zfill(6), 0) or 0)
+
+    def _inc_symbol_count(self, symbol: str) -> None:
+        normalized = str(symbol).zfill(6)
+        self._active_symbol_counts[normalized] = self._symbol_count(normalized) + 1
+
+    def _dec_symbol_count(self, symbol: str) -> None:
+        normalized = str(symbol).zfill(6)
+        count = max(self._symbol_count(normalized) - 1, 0)
+        if count <= 0:
+            self._active_symbol_counts.pop(normalized, None)
+        else:
+            self._active_symbol_counts[normalized] = count
+
+    def _remove_active_intent_locked(self, intent: Any) -> None:
+        self._active_keys.discard(intent.intent_key)
+        self._dec_symbol_count(getattr(intent, "symbol", ""))
+
+    def _drop_oldest_locked(self) -> bool:
+        if self._authoritative or self._drop_policy != "drop_oldest":
+            return False
+        try:
+            _priority, _seq, dropped_intent = self._queue.get_nowait()
+        except queue.Empty:
+            return False
+        self._remove_active_intent_locked(dropped_intent)
+        self._dropped_count += 1
+        self._queue.task_done()
+        return True
+
     def put_if_absent(self, intent: Any) -> bool:
         key = intent.intent_key
         with self._lock:
             if key in self._active_keys:
+                self._last_reject_reason = "duplicate"
+                return False
+            if self._max_pending_per_symbol > 0 and self._symbol_count(getattr(intent, "symbol", "")) >= self._max_pending_per_symbol:
+                self._last_reject_reason = "pending_symbol_cap"
                 return False
             if self._has_other_strategy_for_symbol(
                 symbol=getattr(intent, "symbol", ""),
@@ -190,15 +251,32 @@ class EntryIntentQueue:
             ):
                 self._mixed_strategy_tiebreak_count += 1
             self._active_keys.add(key)
+            self._inc_symbol_count(getattr(intent, "symbol", ""))
             self._enqueue_seq += 1
             enqueue_seq = self._enqueue_seq
         try:
             self._queue.put_nowait((self._intent_priority(intent), enqueue_seq, intent))
+            with self._lock:
+                self._last_reject_reason = ""
             return True
         except queue.Full:
             with self._lock:
-                self._active_keys.discard(key)
-            return False
+                if not self._drop_oldest_locked():
+                    self._active_keys.discard(key)
+                    self._dec_symbol_count(getattr(intent, "symbol", ""))
+                    self._last_reject_reason = "queue_full"
+                    return False
+            try:
+                self._queue.put_nowait((self._intent_priority(intent), enqueue_seq, intent))
+                with self._lock:
+                    self._last_reject_reason = ""
+                return True
+            except queue.Full:
+                with self._lock:
+                    self._active_keys.discard(key)
+                    self._dec_symbol_count(getattr(intent, "symbol", ""))
+                    self._last_reject_reason = "queue_full"
+                return False
 
     def get(self, timeout: float = 0.5) -> Any:
         _, _, intent = self._queue.get(timeout=timeout)
@@ -206,7 +284,7 @@ class EntryIntentQueue:
 
     def complete(self, intent: Any) -> None:
         with self._lock:
-            self._active_keys.discard(intent.intent_key)
+            self._remove_active_intent_locked(intent)
         self._queue.task_done()
 
     def qsize(self) -> int:
@@ -223,6 +301,14 @@ class EntryIntentQueue:
     def mixed_strategy_tiebreak_count(self) -> int:
         with self._lock:
             return int(self._mixed_strategy_tiebreak_count)
+
+    def dropped_count(self) -> int:
+        with self._lock:
+            return int(self._dropped_count)
+
+    def last_reject_reason(self) -> str:
+        with self._lock:
+            return str(self._last_reject_reason or "")
 
 
 class AccountRiskStore:

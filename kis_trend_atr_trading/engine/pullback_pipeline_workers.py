@@ -27,6 +27,11 @@ try:
         DirtySymbolSet,
         EntryIntentQueue,
     )
+    from engine.strategy_pipeline_health import (
+        DegradedModeController,
+        PipelineHealthMonitorThread,
+        WorkerHealthStore,
+    )
     from engine.strategy_pipeline_registry import StrategyRegistry
     from strategy.multiday_trend_atr import SignalType
     from strategy.opening_range_breakout import ORBDecision, ORBCandidate
@@ -51,6 +56,11 @@ except ImportError:
         DirtySymbolSet,
         EntryIntentQueue,
     )
+    from kis_trend_atr_trading.engine.strategy_pipeline_health import (
+        DegradedModeController,
+        PipelineHealthMonitorThread,
+        WorkerHealthStore,
+    )
     from kis_trend_atr_trading.engine.strategy_pipeline_registry import StrategyRegistry
     from kis_trend_atr_trading.strategy.opening_range_breakout import ORBDecision, ORBCandidate
     from kis_trend_atr_trading.strategy.pullback_rebreakout import PullbackDecision
@@ -72,6 +82,20 @@ def _strategy_queue_counts(entry_queue: EntryIntentQueue) -> dict[str, int]:
     return counts
 
 
+def _worker_health_queue_depth(queue_like: Any) -> int:
+    qsize = getattr(queue_like, "qsize", None)
+    if callable(qsize):
+        try:
+            return int(qsize() or 0)
+        except Exception:
+            return 0
+    return 0
+
+
+def _worker_is_degraded(controller: Optional[DegradedModeController]) -> bool:
+    return bool(controller is not None and controller.is_degraded())
+
+
 class RiskSnapshotThread(threading.Thread):
     def __init__(
         self,
@@ -80,28 +104,44 @@ class RiskSnapshotThread(threading.Thread):
         account_risk_store: AccountRiskStore,
         stop_event: threading.Event,
         on_error: Callable[[str, Exception], None],
+        health_store: Optional[WorkerHealthStore] = None,
     ) -> None:
         super().__init__(name="RiskSnapshotThread", daemon=True)
         self._executor = executor
         self._account_risk_store = account_risk_store
+        self._health_store = health_store
         self._stop_event = stop_event
         self._on_error = on_error
         self.error_state: str = ""
 
     def run(self) -> None:
         interval_sec = max(float(getattr(settings, "RISK_SNAPSHOT_REFRESH_SEC", 30) or 30.0), 1.0)
+        if self._health_store is not None:
+            stall_after = max(float(getattr(self._executor, "_pipeline_worker_stall_sec", 20.0) or 20.0), interval_sec * 2.0)
+            self._health_store.ensure_worker(self.name, stall_after_sec=stall_after)
         while not self._stop_event.is_set():
             started = time.perf_counter()
             try:
                 self._run_cycle()
             except Exception as exc:
                 self.error_state = str(exc)
+                if self._health_store is not None:
+                    self._health_store.mark_error(self.name, exc)
                 logger.error("[PULLBACK_RISK] worker_error=%s", exc)
                 self._on_error(self.name, exc)
                 return
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             setattr(self._executor, "_risk_snapshot_refresh_ms", elapsed_ms)
+            if self._health_store is not None:
+                self._health_store.mark_success(
+                    self.name,
+                    processed_delta=1,
+                    avg_eval_ms=elapsed_ms,
+                    state_reason="risk_snapshot_cycle",
+                )
             self._stop_event.wait(interval_sec)
+        if self._health_store is not None:
+            self._health_store.mark_stopped(self.name, state_reason="stop_event_set")
 
     def _run_cycle(self) -> None:
         now_kst = datetime.now(KST)
@@ -198,10 +238,12 @@ class DailyRefreshThread(threading.Thread):
         daily_context_store: DailyContextStore,
         stop_event: threading.Event,
         on_error: Callable[[str, Exception], None],
+        health_store: Optional[WorkerHealthStore] = None,
     ) -> None:
         super().__init__(name="DailyRefreshThread", daemon=True)
         self._executor = executor
         self._daily_context_store = daily_context_store
+        self._health_store = health_store
         self._stop_event = stop_event
         self._on_error = on_error
         self._last_trade_date: str = ""
@@ -293,16 +335,31 @@ class DailyRefreshThread(threading.Thread):
 
     def run(self) -> None:
         interval_sec = max(float(getattr(settings, "DAILY_CONTEXT_REFRESH_SEC", 60) or 60.0), 1.0)
+        if self._health_store is not None:
+            stall_after = max(float(getattr(self._executor, "_pipeline_worker_stall_sec", 20.0) or 20.0), interval_sec * 2.0)
+            self._health_store.ensure_worker(self.name, stall_after_sec=stall_after)
         while not self._stop_event.is_set():
             started = time.perf_counter()
             try:
                 self._run_cycle()
             except Exception as exc:
+                if self._health_store is not None:
+                    self._health_store.mark_error(self.name, exc)
                 self._on_error(self.name, exc)
                 return
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             setattr(self._executor, "_daily_context_refresh_ms", elapsed_ms)
+            if self._health_store is not None:
+                self._health_store.mark_success(
+                    self.name,
+                    processed_delta=1,
+                    avg_eval_ms=elapsed_ms,
+                    queue_depth=int(self._daily_context_store.size()),
+                    state_reason="daily_refresh_cycle",
+                )
             self._stop_event.wait(interval_sec)
+        if self._health_store is not None:
+            self._health_store.mark_stopped(self.name, state_reason="stop_event_set")
 
     def _run_cycle(self) -> None:
         now_kst = self._now()
@@ -353,6 +410,8 @@ class PullbackSetupWorker(threading.Thread):
         enabled_strategy_tags: tuple[str, ...],
         stop_event: threading.Event,
         on_error: Callable[[str, Exception], None],
+        health_store: Optional[WorkerHealthStore] = None,
+        degraded_controller: Optional[DegradedModeController] = None,
     ) -> None:
         super().__init__(name="PullbackSetupWorker", daemon=True)
         self._executor = executor
@@ -361,6 +420,8 @@ class PullbackSetupWorker(threading.Thread):
         self._dirty_symbols = dirty_symbols
         self._strategy_registry = strategy_registry
         self._enabled_strategy_tags = tuple(enabled_strategy_tags or ())
+        self._health_store = health_store
+        self._degraded_controller = degraded_controller
         self._stop_event = stop_event
         self._on_error = on_error
 
@@ -462,22 +523,40 @@ class PullbackSetupWorker(threading.Thread):
 
     def run(self) -> None:
         interval_sec = max(float(getattr(settings, "PULLBACK_SETUP_REFRESH_SEC", 60) or 60.0), 1.0)
+        if self._health_store is not None:
+            stall_after = max(float(getattr(self._executor, "_pipeline_worker_stall_sec", 20.0) or 20.0), interval_sec * 2.0)
+            self._health_store.ensure_worker(self.name, stall_after_sec=stall_after)
         while not self._stop_event.is_set():
             started = time.perf_counter()
             try:
-                self._run_cycle()
+                if _worker_is_degraded(self._degraded_controller):
+                    setattr(self._executor, "_pullback_setup_skip_reason", "degraded_mode")
+                else:
+                    self._run_cycle()
+                elapsed_ms = (time.perf_counter() - started) * 1000.0
+                setattr(self._executor, "_pullback_setup_eval_ms", elapsed_ms)
+                self._record_setup_metrics(elapsed_ms)
+                if self._health_store is not None:
+                    self._health_store.mark_success(
+                        self.name,
+                        processed_delta=1,
+                        avg_eval_ms=elapsed_ms,
+                        queue_depth=self._candidate_store.size(),
+                        state_reason="degraded_mode" if _worker_is_degraded(self._degraded_controller) else "setup_cycle",
+                    )
+                logger.debug(
+                    "[PULLBACK_PIPELINE] pullback_setup_eval_ms=%.2f pullback_candidate_store_size=%s",
+                    elapsed_ms,
+                    self._candidate_store.size(),
+                )
             except Exception as exc:
+                if self._health_store is not None:
+                    self._health_store.mark_error(self.name, exc)
                 self._on_error(self.name, exc)
                 return
-            elapsed_ms = (time.perf_counter() - started) * 1000.0
-            setattr(self._executor, "_pullback_setup_eval_ms", elapsed_ms)
-            self._record_setup_metrics(elapsed_ms)
-            logger.debug(
-                "[PULLBACK_PIPELINE] pullback_setup_eval_ms=%.2f pullback_candidate_store_size=%s",
-                elapsed_ms,
-                self._candidate_store.size(),
-            )
             self._stop_event.wait(interval_sec)
+        if self._health_store is not None:
+            self._health_store.mark_stopped(self.name, state_reason="stop_event_set")
 
     def _run_cycle(self) -> None:
         if bool(getattr(settings, "ENABLE_PULLBACK_DAILY_REFRESH_THREAD", False)) and self._daily_context_store is not None:
@@ -741,6 +820,8 @@ class PullbackTimingWorker(threading.Thread):
         enabled_strategy_tags: tuple[str, ...],
         stop_event: threading.Event,
         on_error: Callable[[str, Exception], None],
+        health_store: Optional[WorkerHealthStore] = None,
+        degraded_controller: Optional[DegradedModeController] = None,
     ) -> None:
         super().__init__(name="PullbackTimingWorker", daemon=True)
         self._executor = executor
@@ -749,28 +830,69 @@ class PullbackTimingWorker(threading.Thread):
         self._entry_queue = entry_queue
         self._strategy_registry = strategy_registry
         self._enabled_strategy_tags = tuple(enabled_strategy_tags or ())
+        self._health_store = health_store
+        self._degraded_controller = degraded_controller
         self._stop_event = stop_event
         self._on_error = on_error
 
     def run(self) -> None:
         poll_sec = max(float(getattr(settings, "PULLBACK_TIMING_DIRTY_POLL_SEC", 0.5) or 0.5), 0.05)
+        max_batch = max(int(getattr(settings, "MAX_DIRTY_SYMBOL_BATCH", 50) or 50), 1)
+        if self._health_store is not None:
+            self._health_store.ensure_worker(
+                self.name,
+                stall_after_sec=max(float(getattr(self._executor, "_pipeline_worker_stall_sec", 20.0) or 20.0), poll_sec * 8.0),
+            )
         while not self._stop_event.is_set():
             try:
-                symbols = self._dirty_symbols.drain()
+                symbols = self._dirty_symbols.drain(max_items=max_batch)
+                if self._health_store is not None:
+                    self._health_store.heartbeat(
+                        self.name,
+                        queue_depth=self._entry_queue.qsize(),
+                        state_reason="idle" if not symbols else "timing_batch",
+                    )
                 if not symbols:
                     self._stop_event.wait(poll_sec)
                     continue
+                if _worker_is_degraded(self._degraded_controller):
+                    setattr(self._executor, "_pullback_timing_skip_reason", "degraded_mode")
+                    if self._health_store is not None:
+                        self._health_store.mark_success(
+                            self.name,
+                            processed_delta=0,
+                            avg_eval_ms=0.0,
+                            queue_depth=self._entry_queue.qsize(),
+                            state_reason="degraded_mode",
+                        )
+                    continue
+                processed = 0
+                batch_elapsed_ms = 0.0
                 for symbol in symbols:
                     if self._stop_event.is_set():
                         return
                     started = time.perf_counter()
                     self._process_symbol(symbol)
                     elapsed_ms = (time.perf_counter() - started) * 1000.0
+                    batch_elapsed_ms += elapsed_ms
+                    processed += 1
                     setattr(self._executor, "_pullback_timing_eval_ms", elapsed_ms)
                     setattr(self._executor, "_strategy_timing_eval_ms", elapsed_ms)
+                if self._health_store is not None:
+                    self._health_store.mark_success(
+                        self.name,
+                        processed_delta=max(processed, 1),
+                        avg_eval_ms=(batch_elapsed_ms / max(processed, 1)),
+                        queue_depth=self._entry_queue.qsize(),
+                        state_reason="timing_batch",
+                    )
             except Exception as exc:
+                if self._health_store is not None:
+                    self._health_store.mark_error(self.name, exc)
                 self._on_error(self.name, exc)
                 return
+        if self._health_store is not None:
+            self._health_store.mark_stopped(self.name, state_reason="stop_event_set")
 
     def _registry_entry(self):
         if self._strategy_registry is None:
@@ -793,11 +915,40 @@ class PullbackTimingWorker(threading.Thread):
             setattr(self._executor, "_mixed_strategy_tiebreak_count", int(mixed_tiebreak() or 0))
 
     def _enqueue_authoritative_intent(self, intent: Any) -> bool:
+        queue_depth_limit = max(int(getattr(settings, "MAX_INTENT_QUEUE_DEPTH", 1024) or 1024), 1)
+        strategy_tag = str(getattr(intent, "strategy_tag", "") or "")
+        queue_depth = int(self._entry_queue.qsize() or 0)
+        if _worker_is_degraded(self._degraded_controller):
+            self._record_ingress_reject(strategy_tag=strategy_tag, reason="degraded_mode")
+            return False
+        if queue_depth >= queue_depth_limit:
+            self._record_ingress_reject(strategy_tag=strategy_tag, reason="queue_depth_limit")
+            return False
         queued = self._entry_queue.put_if_absent(intent)
         self._update_queue_metrics()
         if not queued:
-            setattr(self._executor, "_authoritative_intent_reject_reason", "duplicate_or_queue_full")
+            queue_reason = str(getattr(self._entry_queue, "last_reject_reason", lambda: "")() or "")
+            self._record_ingress_reject(
+                strategy_tag=strategy_tag,
+                reason=queue_reason or "duplicate_or_queue_full",
+                dropped_delta=int(getattr(self._entry_queue, "dropped_count", lambda: 0)() or 0),
+            )
         return queued
+
+    def _record_ingress_reject(self, *, strategy_tag: str, reason: str, dropped_delta: int = 0) -> None:
+        setattr(self._executor, "_authoritative_intent_reject_reason", str(reason or ""))
+        setattr(self._executor, "_authoritative_queue_reject_reason", str(reason or ""))
+        if str(reason or "") in {"degraded_mode", "queue_depth_limit"}:
+            counts = dict(getattr(self._executor, "_degraded_ingress_reject_count_by_strategy", {}) or {})
+            counts[str(strategy_tag or "")] = int(counts.get(str(strategy_tag or ""), 0) or 0) + 1
+            setattr(self._executor, "_degraded_ingress_reject_count_by_strategy", counts)
+        if self._health_store is not None:
+            self._health_store.heartbeat(
+                self.name,
+                queue_depth=self._entry_queue.qsize(),
+                dropped_delta=max(int(dropped_delta or 0), 0),
+                state_reason=f"ingress_reject:{reason}",
+            )
 
     def _process_shadow_strategy_timing(
         self,
@@ -1050,24 +1201,44 @@ class OrderExecutionWorker(threading.Thread):
         entry_queue: EntryIntentQueue,
         stop_event: threading.Event,
         on_error: Callable[[str, Exception], None],
+        health_store: Optional[WorkerHealthStore] = None,
     ) -> None:
         super().__init__(name="OrderExecutionWorker", daemon=True)
         self._executor = executor
         self._candidate_store = candidate_store
         self._entry_queue = entry_queue
+        self._health_store = health_store
         self._stop_event = stop_event
         self._on_error = on_error
 
     def run(self) -> None:
+        if self._health_store is not None:
+            self._health_store.ensure_worker(
+                self.name,
+                stall_after_sec=max(float(getattr(self._executor, "_pipeline_worker_stall_sec", 20.0) or 20.0), 5.0),
+            )
         while not self._stop_event.is_set():
             intent: Optional[Any] = None
             try:
+                if self._health_store is not None:
+                    self._health_store.heartbeat(self.name, queue_depth=self._entry_queue.qsize(), state_reason="waiting")
                 intent = self._entry_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
             try:
+                started = time.perf_counter()
                 self._process_intent(intent)
+                if self._health_store is not None:
+                    self._health_store.mark_success(
+                        self.name,
+                        processed_delta=1,
+                        avg_eval_ms=(time.perf_counter() - started) * 1000.0,
+                        queue_depth=self._entry_queue.qsize(),
+                        state_reason="order_drain",
+                    )
             except Exception as exc:
+                if self._health_store is not None:
+                    self._health_store.mark_error(self.name, exc)
                 self._on_error(self.name, exc)
                 return
             finally:
@@ -1078,6 +1249,8 @@ class OrderExecutionWorker(threading.Thread):
                     setattr(self._executor, "_intent_queue_depth_by_strategy", strategy_counts)
                     setattr(self._executor, "_authoritative_intent_queue_depth", int(self._entry_queue.qsize()))
                     setattr(self._executor, "_authoritative_intent_queue_depth_by_strategy", strategy_counts)
+        if self._health_store is not None:
+            self._health_store.mark_stopped(self.name, state_reason="stop_event_set")
 
     def _now(self) -> datetime:
         return datetime.now(KST)
