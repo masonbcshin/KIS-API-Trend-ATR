@@ -136,6 +136,43 @@ class _DummyExecutor:
         return None
 
 
+class _DummyMarketRegimeWorker:
+    started = 0
+    joined = 0
+    status = {
+        "snapshot": None,
+        "refresh_state": "bootstrap_pending",
+        "market_regime_background_refresh_ms": 0.0,
+        "market_regime_daily_context_refresh_ms": 0.0,
+        "market_regime_intraday_guard_ms": 0.0,
+        "market_regime_quote_source": "skip",
+        "market_regime_quote_state": "absent",
+        "market_regime_daily_context_state": "absent",
+        "market_regime_background_last_success_age_sec": -1.0,
+        "market_regime_background_refresh_fail_count": 0,
+        "market_regime_worker_error_state": "",
+    }
+
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+        self._alive = False
+
+    def start(self):
+        self.__class__.started += 1
+        self._alive = True
+
+    def is_alive(self):
+        return self._alive
+
+    def join(self, timeout=None):
+        self.__class__.joined += 1
+        self._alive = False
+
+    def get_status(self, now=None):
+        return dict(self.__class__.status)
+
+
 class TestMainMultidayMultiSymbols(unittest.TestCase):
     def test_run_trade_executes_all_selected_symbols_once(self):
         _DummyExecutor.created_symbols = []
@@ -167,6 +204,142 @@ class TestMainMultidayMultiSymbols(unittest.TestCase):
         self.assertEqual(_DummyExecutor.run_once_calls, ["005930", "000660"])
         self.assertEqual(len(set(_DummyExecutor.risk_manager_ids)), 1)
         self.assertTrue(any("[LOOP_METRIC]" in line for line in captured.output))
+
+    def test_market_regime_background_mode_keeps_main_loop_read_only(self):
+        _DummyExecutor.created_symbols = []
+        _DummyExecutor.run_once_calls = []
+        _DummyExecutor.risk_manager_ids = []
+        _DummyMarketRegimeWorker.started = 0
+        _DummyMarketRegimeWorker.joined = 0
+        _DummyMarketRegimeWorker.status = {
+            "snapshot": None,
+            "refresh_state": "bootstrap_pending",
+            "market_regime_background_refresh_ms": 12.0,
+            "market_regime_daily_context_refresh_ms": 5.0,
+            "market_regime_intraday_guard_ms": 1.0,
+            "market_regime_quote_source": "skip",
+            "market_regime_quote_state": "absent",
+            "market_regime_daily_context_state": "fresh",
+            "market_regime_background_last_success_age_sec": -1.0,
+            "market_regime_background_refresh_fail_count": 0,
+            "market_regime_worker_error_state": "",
+        }
+        selector = _DummySelector()
+
+        with patch.object(main_multiday, "KISApi", _DummyAPI), \
+             patch.object(main_multiday, "MultidayExecutor", _DummyExecutor), \
+             patch.object(main_multiday, "MultidayTrendATRStrategy", lambda: object()), \
+             patch.object(main_multiday, "MarketRegimeRefreshThread", _DummyMarketRegimeWorker), \
+             patch.object(main_multiday, "refresh_shared_market_regime_snapshot", side_effect=AssertionError("sync refresh should not be called")), \
+             patch.object(main_multiday.UniverseSelector, "from_yaml", return_value=selector), \
+             patch.object(main_multiday, "get_trading_mode", return_value="PAPER"), \
+             patch.object(
+                 main_multiday,
+                 "get_market_session_state",
+                 return_value=(main_multiday.MarketSessionState.IN_SESSION, "regular_session_open"),
+             ), \
+             patch.object(main_multiday, "get_instance_lock", return_value=_DummyLock()), \
+             patch.object(main_multiday.settings, "ENABLE_MARKET_REGIME_FILTER", True), \
+             patch.object(main_multiday.settings, "ENABLE_MARKET_REGIME_REFRESH_THREAD", True), \
+             patch.object(main_multiday.settings, "validate_settings", return_value=True), \
+             patch.object(main_multiday.settings, "get_settings_summary", return_value=""):
+            main_multiday.run_trade(
+                stock_code=main_multiday.settings.DEFAULT_STOCK_CODE,
+                interval=0,
+                max_runs=1,
+            )
+
+        self.assertEqual(_DummyMarketRegimeWorker.started, 1)
+        self.assertEqual(_DummyMarketRegimeWorker.joined, 1)
+
+    def test_market_regime_worker_error_does_not_trigger_sync_refresh_fallback(self):
+        _DummyExecutor.created_symbols = []
+        _DummyExecutor.run_once_calls = []
+        _DummyExecutor.risk_manager_ids = []
+        _DummyMarketRegimeWorker.started = 0
+        _DummyMarketRegimeWorker.joined = 0
+        _DummyMarketRegimeWorker.status = {
+            "snapshot": None,
+            "refresh_state": "refresh_fail",
+            "market_regime_background_refresh_ms": 30.0,
+            "market_regime_daily_context_refresh_ms": 0.0,
+            "market_regime_intraday_guard_ms": 0.0,
+            "market_regime_quote_source": "skip",
+            "market_regime_quote_state": "absent",
+            "market_regime_daily_context_state": "absent",
+            "market_regime_background_last_success_age_sec": -1.0,
+            "market_regime_background_refresh_fail_count": 3,
+            "market_regime_worker_error_state": "boom",
+        }
+        selector = _DummySelector()
+
+        with patch.object(main_multiday, "KISApi", _DummyAPI), \
+             patch.object(main_multiday, "MultidayExecutor", _DummyExecutor), \
+             patch.object(main_multiday, "MultidayTrendATRStrategy", lambda: object()), \
+             patch.object(main_multiday, "MarketRegimeRefreshThread", _DummyMarketRegimeWorker), \
+             patch.object(main_multiday, "refresh_shared_market_regime_snapshot", side_effect=AssertionError("sync refresh should not be called")), \
+             patch.object(main_multiday.UniverseSelector, "from_yaml", return_value=selector), \
+             patch.object(main_multiday, "get_trading_mode", return_value="PAPER"), \
+             patch.object(
+                 main_multiday,
+                 "get_market_session_state",
+                 return_value=(main_multiday.MarketSessionState.IN_SESSION, "regular_session_open"),
+             ), \
+             patch.object(main_multiday, "get_instance_lock", return_value=_DummyLock()), \
+             patch.object(main_multiday.settings, "ENABLE_MARKET_REGIME_FILTER", True), \
+             patch.object(main_multiday.settings, "ENABLE_MARKET_REGIME_REFRESH_THREAD", True), \
+             patch.object(main_multiday.settings, "validate_settings", return_value=True), \
+             patch.object(main_multiday.settings, "get_settings_summary", return_value=""):
+            main_multiday.run_trade(
+                stock_code=main_multiday.settings.DEFAULT_STOCK_CODE,
+                interval=0,
+                max_runs=1,
+            )
+
+        self.assertEqual(_DummyMarketRegimeWorker.started, 1)
+        self.assertEqual(_DummyMarketRegimeWorker.joined, 1)
+
+    def test_market_regime_sync_refresh_path_remains_when_background_flag_is_off(self):
+        _DummyExecutor.created_symbols = []
+        _DummyExecutor.run_once_calls = []
+        _DummyExecutor.risk_manager_ids = []
+        selector = _DummySelector()
+        refresh_calls = {"count": 0}
+
+        def _refresh(*args, **kwargs):
+            refresh_calls["count"] += 1
+            return types.SimpleNamespace(
+                snapshot=None,
+                total_refresh_elapsed_sec=0.0,
+                refreshed=False,
+                budget_exceeded=False,
+                error=None,
+                refresh_skipped_reason="unit_test_sync_path",
+            )
+
+        with patch.object(main_multiday, "KISApi", _DummyAPI), \
+             patch.object(main_multiday, "MultidayExecutor", _DummyExecutor), \
+             patch.object(main_multiday, "MultidayTrendATRStrategy", lambda: object()), \
+             patch.object(main_multiday.UniverseSelector, "from_yaml", return_value=selector), \
+             patch.object(main_multiday, "refresh_shared_market_regime_snapshot", side_effect=_refresh), \
+             patch.object(main_multiday, "get_trading_mode", return_value="PAPER"), \
+             patch.object(
+                 main_multiday,
+                 "get_market_session_state",
+                 return_value=(main_multiday.MarketSessionState.IN_SESSION, "regular_session_open"),
+             ), \
+             patch.object(main_multiday, "get_instance_lock", return_value=_DummyLock()), \
+             patch.object(main_multiday.settings, "ENABLE_MARKET_REGIME_FILTER", True), \
+             patch.object(main_multiday.settings, "ENABLE_MARKET_REGIME_REFRESH_THREAD", False), \
+             patch.object(main_multiday.settings, "validate_settings", return_value=True), \
+             patch.object(main_multiday.settings, "get_settings_summary", return_value=""):
+            main_multiday.run_trade(
+                stock_code=main_multiday.settings.DEFAULT_STOCK_CODE,
+                interval=0,
+                max_runs=1,
+            )
+
+        self.assertGreater(refresh_calls["count"], 0)
 
 
 if __name__ == "__main__":

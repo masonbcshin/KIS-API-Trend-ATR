@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from pathlib import Path
 import sys
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -12,6 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import engine.multiday_executor as multiday_executor
+import engine.market_regime_worker as market_regime_worker
 import utils.market_regime as market_regime
 from engine.multiday_executor import MultidayExecutor
 from strategy.multiday_trend_atr import SignalType, TradingSignal, TrendType
@@ -109,6 +112,14 @@ def _regime_settings(**overrides):
         "MARKET_REGIME_FAIL_MODE": "closed",
         "MARKET_REGIME_REFRESH_BUDGET_SEC": 1.5,
         "MARKET_REGIME_BOOTSTRAP_BUDGET_SEC": 3.0,
+        "ENABLE_MARKET_REGIME_REFRESH_THREAD": False,
+        "MARKET_REGIME_REFRESH_INTERVAL_SEC": 30.0,
+        "MARKET_REGIME_DAILY_CONTEXT_REFRESH_SEC": 300.0,
+        "MARKET_REGIME_INTRADAY_USE_WS_CACHE_ONLY": True,
+        "MARKET_REGIME_QUOTE_FALLBACK_MODE": "skip",
+        "MARKET_REGIME_FORCE_DAILY_REFRESH_ON_TRADE_DATE_CHANGE": True,
+        "MARKET_REGIME_BACKGROUND_STALE_GRACE_SEC": 180.0,
+        "MARKET_REGIME_QUOTE_MAX_AGE_SEC": 15.0,
         "MARKET_REGIME_BAD_BLOCK_NEW_BUY": True,
         "MARKET_REGIME_NEUTRAL_ALLOW_BUY": True,
         "MARKET_REGIME_NEUTRAL_POSITION_SCALE": 1.0,
@@ -308,6 +319,209 @@ def test_market_regime_intraday_drop_downgrades_to_bad():
     assert snapshot.reason == "intraday_drop_guard"
     assert snapshot.intraday_guard_active is True
     assert snapshot.intraday_guard_reason == "intraday_drop:069500"
+
+
+def test_apply_intraday_guard_uses_ws_cache_quote_without_rest_fallback():
+    now_kst = _kst_dt(2026, 3, 2, 9, 10)
+    service = market_regime.MarketRegimeService(
+        _DummyAPI(
+            {
+                "069500": _make_daily_df([100 + idx for idx in range(25)]),
+                "229200": _make_daily_df([200 + idx for idx in range(25)]),
+            }
+        )
+    )
+
+    with _regime_settings():
+        daily_context = service.build_daily_context(check_time=now_kst)
+        with patch.object(
+            service,
+            "_load_intraday_probe",
+            side_effect=AssertionError("REST intraday quote should not be called"),
+        ):
+            result = service.apply_intraday_guard(
+                daily_context,
+                check_time=now_kst,
+                include_metrics=True,
+                quote_snapshot_loader=lambda symbol: {
+                    "current_price": 98.0 if str(symbol) == "069500" else 101.0,
+                    "open_price": 100.0,
+                    "received_at": now_kst,
+                    "quote_age_sec": 0.0,
+                },
+                use_ws_cache_only=True,
+                quote_fallback_mode="skip",
+                quote_max_age_sec=15.0,
+                snapshot_source="background_refresh",
+            )
+
+    assert result.snapshot.regime == market_regime.MarketRegime.BAD
+    assert result.snapshot.reason == "intraday_drop_guard"
+    assert result.snapshot.intraday_guard_reason == "intraday_drop:069500"
+    assert result.quote_source == "ws_cache"
+    assert result.quote_state == "fresh"
+
+
+def test_quote_missing_with_skip_fallback_adopts_daily_only_snapshot_without_rest_call():
+    now_kst = _kst_dt(2026, 3, 2, 9, 10)
+    service = market_regime.MarketRegimeService(
+        _DummyAPI(
+            {
+                "069500": _make_daily_df([100 + idx for idx in range(25)]),
+                "229200": _make_daily_df([200 + idx for idx in range(25)]),
+            }
+        )
+    )
+
+    with _regime_settings():
+        daily_context = service.build_daily_context(check_time=now_kst)
+        with patch.object(
+            service,
+            "_load_intraday_probe",
+            side_effect=AssertionError("REST intraday quote should not be called"),
+        ):
+            result = service.apply_intraday_guard(
+                daily_context,
+                check_time=now_kst,
+                include_metrics=True,
+                quote_snapshot_loader=lambda _symbol: {},
+                use_ws_cache_only=True,
+                quote_fallback_mode="skip",
+                quote_max_age_sec=15.0,
+                snapshot_source="background_refresh",
+            )
+
+    assert result.snapshot.regime == daily_context.regime
+    assert result.snapshot.reason == daily_context.reason
+    assert result.snapshot.intraday_guard_reason is None
+    assert result.snapshot.intraday_guard_active is True
+    assert result.quote_source == "skip"
+    assert result.quote_state == "absent"
+
+
+def test_quote_stale_with_skip_fallback_adopts_daily_only_snapshot_without_rest_call():
+    now_kst = _kst_dt(2026, 3, 2, 9, 10)
+    service = market_regime.MarketRegimeService(
+        _DummyAPI(
+            {
+                "069500": _make_daily_df([100 + idx for idx in range(25)]),
+                "229200": _make_daily_df([200 + idx for idx in range(25)]),
+            }
+        )
+    )
+
+    with _regime_settings():
+        daily_context = service.build_daily_context(check_time=now_kst)
+        with patch.object(
+            service,
+            "_load_intraday_probe",
+            side_effect=AssertionError("REST intraday quote should not be called"),
+        ):
+            result = service.apply_intraday_guard(
+                daily_context,
+                check_time=now_kst,
+                include_metrics=True,
+                quote_snapshot_loader=lambda _symbol: {
+                    "current_price": 98.0,
+                    "open_price": 100.0,
+                    "received_at": now_kst - timedelta(seconds=60),
+                    "quote_age_sec": 60.0,
+                },
+                use_ws_cache_only=True,
+                quote_fallback_mode="skip",
+                quote_max_age_sec=15.0,
+                snapshot_source="background_refresh",
+            )
+
+    assert result.snapshot.regime == daily_context.regime
+    assert result.snapshot.reason == daily_context.reason
+    assert result.snapshot.intraday_guard_reason is None
+    assert result.quote_source == "skip"
+    assert result.quote_state == "stale"
+
+
+def test_market_regime_refresh_thread_bootstrap_refreshes_snapshot_immediately():
+    service = market_regime.MarketRegimeService(
+        _DummyAPI(
+            {
+                "069500": _make_daily_df([100 + idx for idx in range(25)]),
+                "229200": _make_daily_df([200 + idx for idx in range(25)]),
+            }
+        )
+    )
+    stop_event = threading.Event()
+
+    with _regime_settings(
+        ENABLE_MARKET_REGIME_REFRESH_THREAD=True,
+        MARKET_REGIME_REFRESH_INTERVAL_SEC=30.0,
+    ):
+        worker = market_regime_worker.MarketRegimeRefreshThread(
+            service=service,
+            quote_snapshot_loader=lambda _symbol: {},
+            stop_event=stop_event,
+        )
+        worker.start()
+        deadline = time.monotonic() + 1.0
+        snapshot = None
+        while time.monotonic() < deadline:
+            snapshot = worker.get_snapshot(check_time=_kst_dt(2026, 3, 2, 9, 10))
+            if snapshot is not None:
+                break
+            time.sleep(0.01)
+        stop_event.set()
+        worker.join(timeout=1.0)
+
+    assert snapshot is not None
+    status = worker.get_status(now=_kst_dt(2026, 3, 2, 9, 10))
+    assert status["refresh_state"] in ("refreshed", "background_stale")
+    assert status["market_regime_background_refresh_fail_count"] == 0
+
+
+def test_market_regime_refresh_thread_forces_daily_refresh_on_trade_date_change():
+    service = market_regime.MarketRegimeService(api=SimpleNamespace())
+    worker = market_regime_worker.MarketRegimeRefreshThread(service=service)
+    worker._last_trade_date = "2026-03-02"
+    worker._stop_event = SimpleNamespace(is_set=lambda: False, wait=lambda _timeout: False)
+
+    with patch.object(
+        market_regime_worker,
+        "datetime",
+        SimpleNamespace(now=lambda _tz=None: _kst_dt(2026, 3, 3, 9, 0)),
+    ):
+        should_force = worker._wait_until_next_cycle(
+            interval_sec=30.0,
+            force_on_trade_date_change=True,
+        )
+
+    assert should_force is True
+
+
+def test_market_regime_refresh_thread_keeps_absent_snapshot_on_daily_context_failure():
+    service = market_regime.MarketRegimeService(_DummyAPI({}))
+    stop_event = threading.Event()
+
+    with _regime_settings(
+        ENABLE_MARKET_REGIME_REFRESH_THREAD=True,
+        MARKET_REGIME_REFRESH_INTERVAL_SEC=30.0,
+    ):
+        worker = market_regime_worker.MarketRegimeRefreshThread(
+            service=service,
+            quote_snapshot_loader=lambda _symbol: {},
+            stop_event=stop_event,
+        )
+        worker.start()
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline and not worker.get_status().get(
+            "market_regime_worker_error_state"
+        ):
+            time.sleep(0.01)
+        stop_event.set()
+        worker.join(timeout=1.0)
+
+    status = worker.get_status(now=_kst_dt(2026, 3, 2, 9, 10))
+    assert status["snapshot"] is None
+    assert status["refresh_state"] == "refresh_fail"
+    assert status["market_regime_worker_error_state"]
 
 
 def test_shared_snapshot_is_reused_within_ttl():

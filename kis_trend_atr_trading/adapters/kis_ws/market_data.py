@@ -156,6 +156,66 @@ class KISWSMarketDataProvider(MarketDataProvider):
             "ws_connected": bool(running) and not bool(failed),
         }
 
+    def get_cached_quote_snapshot(self, stock_code: str) -> dict:
+        """Return only in-memory quote cache without triggering REST fallback."""
+        code = str(stock_code).zfill(6)
+        with self._lock:
+            snapshot = dict(self._quote_snapshot.get(code) or {})
+            running = self._ws_running
+            failed = self._ws_failed
+            static_snapshot = dict(self._quote_static_cache.get(code) or {})
+            static_cached_at = self._quote_static_cache_ts.get(code)
+
+        now = datetime.now()
+        static_cache_valid = (
+            static_snapshot
+            and static_cached_at is not None
+            and (
+                self._quote_static_cache_ttl_sec <= 0
+                or (now - static_cached_at).total_seconds() < self._quote_static_cache_ttl_sec
+            )
+            and static_cached_at.date() == now.date()
+        )
+        if not static_cache_valid:
+            static_snapshot = {}
+
+        if not snapshot and not static_snapshot:
+            return {}
+
+        received_at = snapshot.get("received_at") or static_snapshot.get("received_at")
+        quote_age_sec = float("inf")
+        if isinstance(received_at, datetime):
+            current_now = datetime.now(received_at.tzinfo) if received_at.tzinfo else datetime.now()
+            quote_age_sec = max((current_now - received_at).total_seconds(), 0.0)
+
+        current_price = snapshot.get("current_price")
+        if current_price in (None, 0, 0.0):
+            current_price = static_snapshot.get("current_price", 0.0)
+
+        return {
+            "stock_code": code,
+            "stock_name": static_snapshot.get("stock_name"),
+            "current_price": float(current_price or 0.0),
+            "open_price": float(static_snapshot.get("open_price", 0.0) or 0.0),
+            "best_ask": (
+                float(snapshot.get("best_ask"))
+                if snapshot.get("best_ask") not in (None, "", 0, 0.0)
+                else None
+            ),
+            "best_bid": (
+                float(snapshot.get("best_bid"))
+                if snapshot.get("best_bid") not in (None, "", 0, 0.0)
+                else None
+            ),
+            "received_at": received_at,
+            "quote_age_sec": quote_age_sec,
+            "session_high": float(snapshot.get("session_high", 0.0) or 0.0),
+            "session_low": float(snapshot.get("session_low", 0.0) or 0.0),
+            "source": "ws_tick" if snapshot else "ws_static_cache",
+            "data_feed": "ws",
+            "ws_connected": bool(running) and not bool(failed),
+        }
+
     def get_latest_price_with_open(self, stock_code: str) -> Tuple[float, float]:
         """
         Return `(current_price, open_price)` while minimizing duplicate REST quote calls.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from enum import Enum
@@ -81,12 +82,50 @@ class MarketRegimeProbeLoadResult:
 
 
 @dataclass(frozen=True)
+class DailyRegimeContext:
+    trade_date: str
+    refreshed_at: datetime
+    context_version: str
+    source: str
+    success: bool
+    stale: bool
+    kospi_probe: MarketRegimeProbe
+    kosdaq_probe: MarketRegimeProbe
+    regime: MarketRegime
+    reason: str
+
+
+@dataclass(frozen=True)
+class DailyRegimeContextBuildResult:
+    context: DailyRegimeContext
+    daily_fetch_elapsed_sec: float = 0.0
+    classify_elapsed_sec: float = 0.0
+    total_refresh_elapsed_sec: float = 0.0
+
+
+@dataclass(frozen=True)
+class MarketRegimeGuardResult:
+    snapshot: MarketRegimeSnapshot
+    intraday_fetch_elapsed_sec: float = 0.0
+    intraday_guard_elapsed_sec: float = 0.0
+    total_refresh_elapsed_sec: float = 0.0
+    quote_source: str = ""
+    quote_state: str = ""
+    intraday_guard_reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class MarketRegimeBuildResult:
     snapshot: MarketRegimeSnapshot
     daily_fetch_elapsed_sec: float = 0.0
     intraday_fetch_elapsed_sec: float = 0.0
     classify_elapsed_sec: float = 0.0
     total_refresh_elapsed_sec: float = 0.0
+    daily_context_refresh_elapsed_sec: float = 0.0
+    intraday_guard_elapsed_sec: float = 0.0
+    quote_source: str = ""
+    quote_state: str = ""
+    daily_context_state: str = ""
 
 
 @dataclass
@@ -150,6 +189,29 @@ def get_market_regime_bootstrap_budget_sec() -> float:
     return max(float(getattr(settings, "MARKET_REGIME_BOOTSTRAP_BUDGET_SEC", 3.0) or 3.0), 0.0)
 
 
+def get_market_regime_daily_context_refresh_sec() -> float:
+    return max(
+        float(getattr(settings, "MARKET_REGIME_DAILY_CONTEXT_REFRESH_SEC", 300) or 300.0),
+        1.0,
+    )
+
+
+def get_market_regime_background_stale_grace_sec() -> float:
+    return max(
+        float(getattr(settings, "MARKET_REGIME_BACKGROUND_STALE_GRACE_SEC", 180) or 180.0),
+        1.0,
+    )
+
+
+def get_market_regime_quote_max_age_sec() -> float:
+    return max(float(getattr(settings, "MARKET_REGIME_QUOTE_MAX_AGE_SEC", 15) or 15.0), 0.0)
+
+
+def get_market_regime_quote_fallback_mode() -> str:
+    mode = str(getattr(settings, "MARKET_REGIME_QUOTE_FALLBACK_MODE", "skip") or "skip").strip().lower()
+    return mode if mode in ("skip", "rest") else "skip"
+
+
 def get_market_regime_fail_mode() -> str:
     fail_mode = str(getattr(settings, "MARKET_REGIME_FAIL_MODE", "closed") or "closed").strip().lower()
     return fail_mode if fail_mode in ("open", "closed") else "closed"
@@ -171,6 +233,38 @@ def is_market_regime_snapshot_expired(
     if snapshot is None:
         return True
     return materialize_market_regime_snapshot(snapshot, check_time).is_expired(check_time)
+
+
+def get_daily_regime_context_state(
+    context: Optional[DailyRegimeContext],
+    *,
+    check_time: Optional[datetime] = None,
+    stale_after_sec: Optional[float] = None,
+    expected_trade_date: Optional[str] = None,
+    expected_context_version_prefix: Optional[str] = None,
+) -> tuple[Optional[DailyRegimeContext], str]:
+    if context is None:
+        return None, "absent"
+
+    now_kst = ensure_kst(check_time)
+    if expected_trade_date and str(context.trade_date) != str(expected_trade_date):
+        return replace(context, stale=True), "trade_date_mismatch"
+    if expected_context_version_prefix and not str(context.context_version or "").startswith(
+        str(expected_context_version_prefix)
+    ):
+        return replace(context, stale=True), "version_mismatch"
+    if not bool(context.success):
+        return replace(context, stale=True), "absent"
+
+    effective_stale_after_sec = (
+        get_market_regime_daily_context_refresh_sec()
+        if stale_after_sec is None
+        else max(float(stale_after_sec or 0.0), 0.0)
+    )
+    age_sec = max((now_kst - ensure_kst(context.refreshed_at)).total_seconds(), 0.0)
+    if effective_stale_after_sec > 0 and age_sec > effective_stale_after_sec:
+        return replace(context, stale=True), "stale"
+    return replace(context, stale=False), "fresh"
 
 
 def refresh_shared_market_regime_snapshot(
@@ -288,6 +382,314 @@ class MarketRegimeService:
     def __init__(self, api: Any):
         self.api = api
 
+    @staticmethod
+    def _regime_symbols() -> tuple[str, str]:
+        return (
+            str(getattr(settings, "MARKET_REGIME_KOSPI_SYMBOL", "069500") or "069500"),
+            str(getattr(settings, "MARKET_REGIME_KOSDAQ_SYMBOL", "229200") or "229200"),
+        )
+
+    @staticmethod
+    def _regime_daily_settings() -> tuple[int, int, float]:
+        return (
+            max(int(getattr(settings, "MARKET_REGIME_MA_PERIOD", 20) or 20), 1),
+            max(int(getattr(settings, "MARKET_REGIME_LOOKBACK_DAYS", 3) or 3), 1),
+            float(getattr(settings, "MARKET_REGIME_BAD_3D_RETURN_PCT", -0.03) or -0.03),
+        )
+
+    def daily_context_version_prefix(self, trade_date: str) -> str:
+        ma_period, lookback_days, bad_3d_return_pct = self._regime_daily_settings()
+        kospi_symbol, kosdaq_symbol = self._regime_symbols()
+        payload = "|".join(
+            [
+                str(trade_date or ""),
+                str(ma_period),
+                str(lookback_days),
+                f"{bad_3d_return_pct:.6f}",
+                kospi_symbol,
+                kosdaq_symbol,
+            ]
+        )
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:10]
+
+    def _build_daily_context_version(
+        self,
+        *,
+        trade_date: str,
+        kospi: MarketRegimeProbe,
+        kosdaq: MarketRegimeProbe,
+        regime: MarketRegime,
+        reason: str,
+    ) -> str:
+        prefix = self.daily_context_version_prefix(trade_date)
+        payload = "|".join(
+            [
+                prefix,
+                regime.value,
+                str(reason or ""),
+                f"{float(kospi.close or 0.0):.6f}",
+                f"{float(kospi.ma or 0.0):.6f}",
+                f"{float(kospi.return_pct or 0.0):.6f}",
+                f"{float(kosdaq.close or 0.0):.6f}",
+                f"{float(kosdaq.ma or 0.0):.6f}",
+                f"{float(kosdaq.return_pct or 0.0):.6f}",
+            ]
+        )
+        return f"{prefix}:{hashlib.sha1(payload.encode('utf-8')).hexdigest()[:10]}"
+
+    def build_daily_context(
+        self,
+        *,
+        check_time: Optional[datetime] = None,
+        include_metrics: bool = False,
+        source: str = "main_loop_cache",
+    ) -> Any:
+        started_at = monotonic()
+        now_kst = ensure_kst(check_time)
+        trade_date = now_kst.date().isoformat()
+        ma_period, lookback_days, bad_3d_return_pct = self._regime_daily_settings()
+        kospi_symbol, kosdaq_symbol = self._regime_symbols()
+
+        kospi_result = self._load_probe(
+            symbol=kospi_symbol,
+            ma_period=ma_period,
+            lookback_days=lookback_days,
+            as_of=now_kst,
+            load_intraday=False,
+        )
+        kosdaq_result = self._load_probe(
+            symbol=kosdaq_symbol,
+            ma_period=ma_period,
+            lookback_days=lookback_days,
+            as_of=now_kst,
+            load_intraday=False,
+        )
+        classify_started_at = monotonic()
+        regime, reason = self._classify_daily(
+            kospi=kospi_result.probe,
+            kosdaq=kosdaq_result.probe,
+            bad_3d_return_pct=bad_3d_return_pct,
+        )
+        classify_elapsed_sec = monotonic() - classify_started_at
+        context = DailyRegimeContext(
+            trade_date=trade_date,
+            refreshed_at=now_kst,
+            context_version=self._build_daily_context_version(
+                trade_date=trade_date,
+                kospi=kospi_result.probe,
+                kosdaq=kosdaq_result.probe,
+                regime=regime,
+                reason=reason,
+            ),
+            source=source,
+            success=True,
+            stale=False,
+            kospi_probe=kospi_result.probe,
+            kosdaq_probe=kosdaq_result.probe,
+            regime=regime,
+            reason=reason,
+        )
+        if not include_metrics:
+            return context
+        return DailyRegimeContextBuildResult(
+            context=context,
+            daily_fetch_elapsed_sec=(
+                kospi_result.daily_fetch_elapsed_sec + kosdaq_result.daily_fetch_elapsed_sec
+            ),
+            classify_elapsed_sec=classify_elapsed_sec,
+            total_refresh_elapsed_sec=(monotonic() - started_at),
+        )
+
+    def _build_snapshot_from_context(
+        self,
+        *,
+        daily_context: DailyRegimeContext,
+        check_time: datetime,
+        regime: MarketRegime,
+        reason: str,
+        intraday_guard_reason: Optional[str],
+        snapshot_source: str,
+        intraday_guard_active: bool,
+        stale_after_sec_override: Optional[float] = None,
+    ) -> MarketRegimeSnapshot:
+        ttl_sec = get_market_regime_cache_ttl_sec(check_time)
+        stale_max_sec = max(
+            float(getattr(settings, "MARKET_REGIME_STALE_MAX_SEC", 180) or 180),
+            float(ttl_sec),
+        )
+        if stale_after_sec_override is not None:
+            stale_max_sec = max(stale_max_sec, float(stale_after_sec_override or 0.0))
+        return MarketRegimeSnapshot(
+            regime=regime,
+            reason=reason,
+            as_of=check_time,
+            expires_at=check_time + timedelta(seconds=ttl_sec),
+            stale_after=check_time + timedelta(seconds=stale_max_sec),
+            is_stale=False,
+            kospi_symbol=daily_context.kospi_probe.symbol,
+            kosdaq_symbol=daily_context.kosdaq_probe.symbol,
+            kospi_close=daily_context.kospi_probe.close,
+            kospi_ma=daily_context.kospi_probe.ma,
+            kosdaq_close=daily_context.kosdaq_probe.close,
+            kosdaq_ma=daily_context.kosdaq_probe.ma,
+            kospi_3d_return_pct=daily_context.kospi_probe.return_pct,
+            kosdaq_3d_return_pct=daily_context.kosdaq_probe.return_pct,
+            intraday_guard_active=intraday_guard_active,
+            intraday_guard_reason=intraday_guard_reason,
+            source=snapshot_source,
+        )
+
+    @staticmethod
+    def _quote_snapshot_to_probe(
+        probe: MarketRegimeProbe,
+        quote_snapshot: Optional[dict[str, Any]],
+    ) -> MarketRegimeProbe:
+        if not isinstance(quote_snapshot, dict) or not quote_snapshot:
+            return probe
+        current_price = float(quote_snapshot.get("current_price", 0.0) or 0.0)
+        open_price = float(quote_snapshot.get("open_price", 0.0) or 0.0)
+        intraday_open_return_pct = None
+        if current_price > 0 and open_price > 0:
+            intraday_open_return_pct = (current_price / open_price) - 1.0
+        return replace(
+            probe,
+            current_price=(current_price if current_price > 0 else None),
+            open_price=(open_price if open_price > 0 else None),
+            intraday_open_return_pct=intraday_open_return_pct,
+        )
+
+    def apply_intraday_guard(
+        self,
+        daily_context: DailyRegimeContext,
+        *,
+        check_time: Optional[datetime] = None,
+        include_metrics: bool = False,
+        quote_snapshot_loader: Optional[Callable[[str], Optional[dict[str, Any]]]] = None,
+        use_ws_cache_only: bool = False,
+        quote_fallback_mode: str = "rest",
+        quote_max_age_sec: float = 15.0,
+        snapshot_source: str = "main_loop_cache",
+        stale_after_sec_override: Optional[float] = None,
+        daily_context_state: str = "fresh",
+    ) -> Any:
+        started_at = monotonic()
+        now_kst = ensure_kst(check_time)
+        intraday_guard_active = is_opening_guard_window(now_kst)
+        regime = daily_context.regime
+        reason = daily_context.reason
+        intraday_guard_reason = None
+        quote_source = "skip"
+        quote_state = "absent"
+        intraday_fetch_elapsed_sec = 0.0
+
+        kospi = daily_context.kospi_probe
+        kosdaq = daily_context.kosdaq_probe
+
+        if intraday_guard_active:
+            quote_states: list[str] = []
+            quote_sources: list[str] = []
+            loader = quote_snapshot_loader if callable(quote_snapshot_loader) else None
+
+            def _load_quote(symbol: str) -> tuple[Optional[dict[str, Any]], str, str]:
+                if loader is not None:
+                    snapshot = loader(symbol)
+                    if isinstance(snapshot, dict) and snapshot:
+                        raw_age_sec = snapshot.get("quote_age_sec")
+                        age_sec = (
+                            float(raw_age_sec)
+                            if raw_age_sec is not None
+                            else float("inf")
+                        )
+                        received_at = snapshot.get("received_at")
+                        if age_sec == float("inf") and isinstance(received_at, datetime):
+                            current_now = datetime.now(received_at.tzinfo) if received_at.tzinfo else datetime.now()
+                            age_sec = max((current_now - received_at).total_seconds(), 0.0)
+                        if age_sec <= max(float(quote_max_age_sec or 0.0), 0.0):
+                            return snapshot, "ws_cache", "fresh"
+                        if use_ws_cache_only or str(quote_fallback_mode or "skip").lower() != "rest":
+                            return None, "skip", "stale"
+                    else:
+                        if use_ws_cache_only or str(quote_fallback_mode or "skip").lower() != "rest":
+                            return None, "skip", "absent"
+                if use_ws_cache_only:
+                    return None, "skip", "absent"
+                if str(quote_fallback_mode or "rest").lower() != "rest":
+                    return None, "skip", "absent"
+                intraday = self._load_intraday_probe(symbol)
+                if intraday.get("current_price") is None or intraday.get("open_price") is None:
+                    return None, "rest", "absent"
+                return (
+                    {
+                        "current_price": intraday.get("current_price"),
+                        "open_price": intraday.get("open_price"),
+                        "received_at": now_kst,
+                        "quote_age_sec": 0.0,
+                        "source": "rest_quote",
+                    },
+                    "rest",
+                    "fresh",
+                )
+
+            intraday_fetch_started_at = monotonic()
+            kospi_quote, kospi_source, kospi_state = _load_quote(daily_context.kospi_probe.symbol)
+            kosdaq_quote, kosdaq_source, kosdaq_state = _load_quote(daily_context.kosdaq_probe.symbol)
+            intraday_fetch_elapsed_sec = monotonic() - intraday_fetch_started_at
+
+            quote_states.extend([kospi_state, kosdaq_state])
+            quote_sources.extend([kospi_source, kosdaq_source])
+            if "rest" in quote_sources:
+                quote_source = "rest"
+            elif "ws_cache" in quote_sources:
+                quote_source = "ws_cache"
+            else:
+                quote_source = "skip"
+            if "fresh" in quote_states:
+                quote_state = "fresh"
+            elif "stale" in quote_states:
+                quote_state = "stale"
+            else:
+                quote_state = "absent"
+
+            if kospi_quote is not None:
+                kospi = self._quote_snapshot_to_probe(kospi, kospi_quote)
+            if kosdaq_quote is not None:
+                kosdaq = self._quote_snapshot_to_probe(kosdaq, kosdaq_quote)
+
+            regime, reason, intraday_guard_reason = self._apply_intraday_guard(
+                regime=regime,
+                reason=reason,
+                kospi=kospi,
+                kosdaq=kosdaq,
+                check_time=now_kst,
+            )
+
+        guard_elapsed_sec = monotonic() - started_at
+        snapshot = self._build_snapshot_from_context(
+            daily_context=daily_context,
+            check_time=now_kst,
+            regime=regime,
+            reason=reason,
+            intraday_guard_reason=intraday_guard_reason,
+            snapshot_source=snapshot_source,
+            intraday_guard_active=intraday_guard_active,
+            stale_after_sec_override=stale_after_sec_override,
+        )
+        self._log_snapshot(snapshot)
+        if not include_metrics:
+            return snapshot
+        return MarketRegimeBuildResult(
+            snapshot=snapshot,
+            daily_fetch_elapsed_sec=0.0,
+            intraday_fetch_elapsed_sec=intraday_fetch_elapsed_sec,
+            classify_elapsed_sec=0.0,
+            total_refresh_elapsed_sec=guard_elapsed_sec,
+            daily_context_refresh_elapsed_sec=0.0,
+            intraday_guard_elapsed_sec=guard_elapsed_sec,
+            quote_source=quote_source,
+            quote_state=quote_state,
+            daily_context_state=daily_context_state,
+        )
+
     def build_snapshot(
         self,
         check_time: Optional[datetime] = None,
@@ -295,82 +697,38 @@ class MarketRegimeService:
     ) -> Any:
         started_at = monotonic()
         now_kst = ensure_kst(check_time)
-        ma_period = max(int(getattr(settings, "MARKET_REGIME_MA_PERIOD", 20) or 20), 1)
-        lookback_days = max(int(getattr(settings, "MARKET_REGIME_LOOKBACK_DAYS", 3) or 3), 1)
-        bad_3d_return_pct = float(
-            getattr(settings, "MARKET_REGIME_BAD_3D_RETURN_PCT", -0.03) or -0.03
-        )
-        intraday_guard_active = is_opening_guard_window(now_kst)
-
-        kospi_result = self._load_probe(
-            symbol=str(getattr(settings, "MARKET_REGIME_KOSPI_SYMBOL", "069500") or "069500"),
-            ma_period=ma_period,
-            lookback_days=lookback_days,
-            as_of=now_kst,
-            load_intraday=intraday_guard_active,
-        )
-        kosdaq_result = self._load_probe(
-            symbol=str(getattr(settings, "MARKET_REGIME_KOSDAQ_SYMBOL", "229200") or "229200"),
-            ma_period=ma_period,
-            lookback_days=lookback_days,
-            as_of=now_kst,
-            load_intraday=intraday_guard_active,
-        )
-        kospi = kospi_result.probe
-        kosdaq = kosdaq_result.probe
-
-        classify_started_at = monotonic()
-        regime, reason = self._classify_daily(
-            kospi=kospi,
-            kosdaq=kosdaq,
-            bad_3d_return_pct=bad_3d_return_pct,
-        )
-        regime, reason, intraday_guard_reason = self._apply_intraday_guard(
-            regime=regime,
-            reason=reason,
-            kospi=kospi,
-            kosdaq=kosdaq,
+        daily_result = self.build_daily_context(
             check_time=now_kst,
-        )
-        classify_elapsed_sec = monotonic() - classify_started_at
-
-        ttl_sec = get_market_regime_cache_ttl_sec(now_kst)
-        stale_max_sec = max(
-            float(getattr(settings, "MARKET_REGIME_STALE_MAX_SEC", 180) or 180),
-            float(ttl_sec),
-        )
-        snapshot = MarketRegimeSnapshot(
-            regime=regime,
-            reason=reason,
-            as_of=now_kst,
-            expires_at=now_kst + timedelta(seconds=ttl_sec),
-            stale_after=now_kst + timedelta(seconds=stale_max_sec),
-            is_stale=False,
-            kospi_symbol=kospi.symbol,
-            kosdaq_symbol=kosdaq.symbol,
-            kospi_close=kospi.close,
-            kospi_ma=kospi.ma,
-            kosdaq_close=kosdaq.close,
-            kosdaq_ma=kosdaq.ma,
-            kospi_3d_return_pct=kospi.return_pct,
-            kosdaq_3d_return_pct=kosdaq.return_pct,
-            intraday_guard_active=intraday_guard_active,
-            intraday_guard_reason=intraday_guard_reason,
+            include_metrics=True,
             source="main_loop_cache",
         )
-        self._log_snapshot(snapshot)
+        build_result = self.apply_intraday_guard(
+            daily_result.context,
+            check_time=now_kst,
+            include_metrics=True,
+            quote_snapshot_loader=None,
+            use_ws_cache_only=False,
+            quote_fallback_mode="rest",
+            quote_max_age_sec=get_market_regime_quote_max_age_sec(),
+            snapshot_source="main_loop_cache",
+            daily_context_state="fresh",
+        )
         if not include_metrics:
-            return snapshot
+            return build_result.snapshot
         return MarketRegimeBuildResult(
-            snapshot=snapshot,
-            daily_fetch_elapsed_sec=(
-                kospi_result.daily_fetch_elapsed_sec + kosdaq_result.daily_fetch_elapsed_sec
+            snapshot=build_result.snapshot,
+            daily_fetch_elapsed_sec=daily_result.daily_fetch_elapsed_sec,
+            intraday_fetch_elapsed_sec=build_result.intraday_fetch_elapsed_sec,
+            classify_elapsed_sec=daily_result.classify_elapsed_sec,
+            total_refresh_elapsed_sec=max(
+                float(monotonic() - started_at),
+                float(daily_result.total_refresh_elapsed_sec + build_result.total_refresh_elapsed_sec),
             ),
-            intraday_fetch_elapsed_sec=(
-                kospi_result.intraday_fetch_elapsed_sec + kosdaq_result.intraday_fetch_elapsed_sec
-            ),
-            classify_elapsed_sec=classify_elapsed_sec,
-            total_refresh_elapsed_sec=(monotonic() - started_at),
+            daily_context_refresh_elapsed_sec=daily_result.total_refresh_elapsed_sec,
+            intraday_guard_elapsed_sec=build_result.intraday_guard_elapsed_sec,
+            quote_source=build_result.quote_source,
+            quote_state=build_result.quote_state,
+            daily_context_state="fresh",
         )
 
     def _load_probe(
