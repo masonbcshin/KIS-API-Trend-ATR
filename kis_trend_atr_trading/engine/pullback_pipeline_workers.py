@@ -96,6 +96,10 @@ def _worker_is_degraded(controller: Optional[DegradedModeController]) -> bool:
     return bool(controller is not None and controller.is_degraded())
 
 
+def _persistence_manager(executor: Any) -> Optional[Any]:
+    return getattr(executor, "_pipeline_persistence_manager", None)
+
+
 class RiskSnapshotThread(threading.Thread):
     def __init__(
         self,
@@ -920,18 +924,56 @@ class PullbackTimingWorker(threading.Thread):
         queue_depth = int(self._entry_queue.qsize() or 0)
         if _worker_is_degraded(self._degraded_controller):
             self._record_ingress_reject(strategy_tag=strategy_tag, reason="degraded_mode")
+            manager = _persistence_manager(self._executor)
+            if manager is not None:
+                manager.append_intent_state(
+                    intent=intent,
+                    journal_state="rejected",
+                    reason="degraded_mode",
+                    message="authoritative ingress rejected by degraded mode",
+                    source="timing_worker",
+                )
             return False
         if queue_depth >= queue_depth_limit:
             self._record_ingress_reject(strategy_tag=strategy_tag, reason="queue_depth_limit")
+            manager = _persistence_manager(self._executor)
+            if manager is not None:
+                manager.append_intent_state(
+                    intent=intent,
+                    journal_state="rejected",
+                    reason="queue_depth_limit",
+                    message="authoritative ingress rejected by queue depth limit",
+                    source="timing_worker",
+                )
             return False
         queued = self._entry_queue.put_if_absent(intent)
         self._update_queue_metrics()
+        manager = _persistence_manager(self._executor)
         if not queued:
             queue_reason = str(getattr(self._entry_queue, "last_reject_reason", lambda: "")() or "")
             self._record_ingress_reject(
                 strategy_tag=strategy_tag,
                 reason=queue_reason or "duplicate_or_queue_full",
                 dropped_delta=int(getattr(self._entry_queue, "dropped_count", lambda: 0)() or 0),
+            )
+            if manager is not None:
+                manager.append_intent_state(
+                    intent=intent,
+                    journal_state=(
+                        "duplicate_blocked"
+                        if str(queue_reason or "") in {"duplicate", "pending_symbol_cap"}
+                        else "rejected"
+                    ),
+                    reason=queue_reason or "duplicate_or_queue_full",
+                    message="authoritative ingress rejected",
+                    source="timing_worker",
+                )
+        elif manager is not None:
+            manager.append_intent_state(
+                intent=intent,
+                journal_state="accepted",
+                message="authoritative ingress accepted",
+                source="timing_worker",
             )
         return queued
 
@@ -1164,6 +1206,27 @@ class PullbackTimingWorker(threading.Thread):
         else:
             queued = self._entry_queue.put_if_absent(intent)
             self._update_queue_metrics()
+            manager = _persistence_manager(self._executor)
+            if queued and manager is not None:
+                manager.append_intent_state(
+                    intent=intent,
+                    journal_state="accepted",
+                    message="authoritative ingress accepted",
+                    source="timing_worker",
+                )
+            elif manager is not None:
+                queue_reason = str(getattr(self._entry_queue, "last_reject_reason", lambda: "")() or "")
+                manager.append_intent_state(
+                    intent=intent,
+                    journal_state=(
+                        "duplicate_blocked"
+                        if str(queue_reason or "") in {"duplicate", "pending_symbol_cap"}
+                        else "rejected"
+                    ),
+                    reason=queue_reason or "duplicate_or_queue_full",
+                    message="authoritative ingress rejected",
+                    source="timing_worker",
+                )
         self._process_shadow_strategy_timing(
             strategy_tag="trend_atr",
             symbol=symbol,
@@ -1259,6 +1322,33 @@ class OrderExecutionWorker(threading.Thread):
         consumed = dict(getattr(self._executor, "_authoritative_intent_consumed_count_by_strategy", {}) or {})
         consumed[strategy_tag] = int(consumed.get(strategy_tag, 0) or 0) + 1
         setattr(self._executor, "_authoritative_intent_consumed_count_by_strategy", consumed)
+
+    def _journal_reject(self, intent: Any, reason: str) -> None:
+        manager = _persistence_manager(self._executor)
+        if manager is None:
+            return
+        manager.append_intent_state(
+            intent=intent,
+            journal_state=manager.classify_reject_state(reason),
+            reason=reason,
+            message=reason,
+            source="order_worker",
+        )
+
+    def _journal_order_result(self, intent: Any, order_result: dict) -> None:
+        manager = _persistence_manager(self._executor)
+        if manager is None:
+            return
+        state = manager.classify_order_result(order_result)
+        broker_order_id = str(order_result.get("order_no") or "")
+        manager.append_order_state(
+            intent=intent,
+            journal_state=state,
+            reason=str(order_result.get("reason") or ""),
+            message=str(order_result.get("message") or ""),
+            broker_order_id=broker_order_id,
+            source="order_worker",
+        )
 
     def _record_reject(self, *, strategy_tag: str, symbol: str, reason: str, dedupe: bool = False) -> None:
         setattr(self._executor, "_authoritative_intent_reject_reason", str(reason or ""))
@@ -1510,6 +1600,7 @@ class OrderExecutionWorker(threading.Thread):
                 reason=reason,
                 dedupe=reason in {"existing_position", "pending_order", "existing_holding"},
             )
+            self._journal_reject(intent, reason)
             if strategy_tag == "pullback_rebreakout":
                 self._candidate_store.remove(symbol)
             else:
@@ -1524,4 +1615,5 @@ class OrderExecutionWorker(threading.Thread):
                 symbol=symbol,
                 reason=str(order_result.get("reason") or order_result.get("message") or "handoff_rejected"),
             )
+        self._journal_order_result(intent, order_result)
         self._mark_completed(intent, order_result=order_result)

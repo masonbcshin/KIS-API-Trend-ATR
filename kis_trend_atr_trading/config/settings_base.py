@@ -544,6 +544,40 @@ CANDIDATE_CLEANUP_INTERVAL_SEC: int = int(os.getenv("CANDIDATE_CLEANUP_INTERVAL_
 DEGRADED_MODE_ENTER_QUEUE_DEPTH: int = int(os.getenv("DEGRADED_MODE_ENTER_QUEUE_DEPTH", "512"))
 DEGRADED_MODE_EXIT_QUEUE_DEPTH: int = int(os.getenv("DEGRADED_MODE_EXIT_QUEUE_DEPTH", "256"))
 DEGRADED_MODE_MIN_HOLD_SEC: int = int(os.getenv("DEGRADED_MODE_MIN_HOLD_SEC", "15"))
+ENABLE_PIPELINE_STATE_PERSISTENCE: bool = os.getenv(
+    "ENABLE_PIPELINE_STATE_PERSISTENCE",
+    "false",
+).lower() in (
+    "true",
+    "1",
+    "yes",
+)
+PIPELINE_STATE_DIR: str = str(
+    os.getenv("PIPELINE_STATE_DIR", "data/pipeline_state") or "data/pipeline_state"
+).strip() or "data/pipeline_state"
+PIPELINE_CANDIDATE_SNAPSHOT_INTERVAL_SEC: int = int(
+    os.getenv("PIPELINE_CANDIDATE_SNAPSHOT_INTERVAL_SEC", "15")
+)
+PIPELINE_INTENT_JOURNAL_ENABLED: bool = os.getenv(
+    "PIPELINE_INTENT_JOURNAL_ENABLED",
+    "true",
+).lower() in (
+    "true",
+    "1",
+    "yes",
+)
+PIPELINE_INTENT_MAX_AGE_SEC: int = int(os.getenv("PIPELINE_INTENT_MAX_AGE_SEC", "120"))
+PIPELINE_CANDIDATE_MAX_RECOVER_AGE_SEC: int = int(
+    os.getenv("PIPELINE_CANDIDATE_MAX_RECOVER_AGE_SEC", "300")
+)
+PIPELINE_RECOVER_ONLY_CURRENT_TRADE_DATE: bool = os.getenv(
+    "PIPELINE_RECOVER_ONLY_CURRENT_TRADE_DATE",
+    "true",
+).lower() in (
+    "true",
+    "1",
+    "yes",
+)
 ENABLE_PULLBACK_DAILY_REFRESH_THREAD: bool = os.getenv(
     "ENABLE_PULLBACK_DAILY_REFRESH_THREAD",
     "false",

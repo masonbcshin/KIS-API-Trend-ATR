@@ -50,6 +50,10 @@ class ArmedCandidateStore:
         with self._lock:
             return list(self._candidates.keys())
 
+    def snapshot(self) -> Dict[str, PullbackSetupCandidate]:
+        with self._lock:
+            return dict(self._candidates)
+
     def cleanup_expired(self, now: Optional[datetime] = None) -> int:
         current_now = now or datetime.now()
         removed = 0
