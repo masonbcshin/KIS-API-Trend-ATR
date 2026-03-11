@@ -389,11 +389,21 @@ class PullbackSetupWorker(threading.Thread):
         registry_entry = self._strategy_registry.get(strategy_tag)
         if registry_entry is None:
             return
+        intraday_provider_ready = bool(
+            getattr(self._executor, "is_cached_intraday_provider_ready", lambda: False)()
+        )
+        intraday_bars = []
+        if strategy_tag == "opening_range_breakout":
+            fetch_cached_intraday = getattr(self._executor, "fetch_cached_intraday_bars_if_available", None)
+            if callable(fetch_cached_intraday):
+                intraday_bars = list(fetch_cached_intraday(n=120) or [])
         evaluation = registry_entry.setup_evaluator.evaluate_setup(
             daily_df=daily_df,
             daily_context=daily_context,
             current_price=current_price,
             open_price=open_price,
+            intraday_bars=intraday_bars,
+            intraday_provider_ready=intraday_provider_ready,
             stock_code=self._executor.stock_code,
             stock_name=stock_name,
             check_time=decision_time,
@@ -403,7 +413,18 @@ class PullbackSetupWorker(threading.Thread):
             has_pending_order=has_pending_order,
             market_regime_snapshot=getattr(self._executor, "market_regime_snapshot", None),
         )
-        setattr(self._executor, "_trend_atr_adapter_path_used", strategy_tag == "trend_atr")
+        if strategy_tag == "trend_atr":
+            setattr(self._executor, "_trend_atr_adapter_path_used", True)
+        if strategy_tag == "opening_range_breakout":
+            setattr(self._executor, "_orb_adapter_path_used", True)
+            orb_state = str(
+                (evaluation.meta or {}).get(
+                    "intraday_source_state",
+                    (getattr(evaluation.candidate, "meta", {}) or {}).get("intraday_source_state", "missing"),
+                )
+                or "missing"
+            )
+            setattr(self._executor, "_orb_intraday_source_state", orb_state)
         if evaluation.candidate is None:
             remove_shadow_candidate(strategy_tag, self._executor.stock_code)
             remove_shadow_intent = getattr(self._executor, "remove_strategy_shadow_intent", None)
@@ -514,6 +535,22 @@ class PullbackSetupWorker(threading.Thread):
                 decision_time=datetime.now(KST),
                 has_pending_order=has_pending_order,
             )
+            self._process_shadow_strategy_setup(
+                strategy_tag="opening_range_breakout",
+                daily_df=df,
+                daily_context=None,
+                current_price=current_price,
+                open_price=float(quote_snapshot.get("open_price", 0.0) or 0.0),
+                stock_name=str(quote_snapshot.get("stock_name") or ""),
+                decision_time=datetime.now(KST),
+                has_pending_order=has_pending_order,
+            )
+            get_shadow_candidate = getattr(self._executor, "get_strategy_shadow_candidate", None)
+            if callable(get_shadow_candidate):
+                for strategy_tag in ("trend_atr", "opening_range_breakout"):
+                    if strategy_tag in self._enabled_strategy_tags and get_shadow_candidate(strategy_tag, self._executor.stock_code) is not None:
+                        self._dirty_symbols.mark(self._executor.stock_code)
+                        break
             self._candidate_store.remove(self._executor.stock_code)
             if terminal is not None:
                 setattr(self._executor, "_pullback_threaded_context_version", "")
@@ -524,6 +561,16 @@ class PullbackSetupWorker(threading.Thread):
         self._candidate_store.upsert(candidate)
         self._process_shadow_strategy_setup(
             strategy_tag="trend_atr",
+            daily_df=df,
+            daily_context=None,
+            current_price=current_price,
+            open_price=float(quote_snapshot.get("open_price", 0.0) or 0.0),
+            stock_name=str(quote_snapshot.get("stock_name") or ""),
+            decision_time=datetime.now(KST),
+            has_pending_order=has_pending_order,
+        )
+        self._process_shadow_strategy_setup(
+            strategy_tag="opening_range_breakout",
             daily_df=df,
             daily_context=None,
             current_price=current_price,
@@ -621,6 +668,22 @@ class PullbackSetupWorker(threading.Thread):
                 decision_time=decision_time,
                 has_pending_order=has_pending_order,
             )
+            self._process_shadow_strategy_setup(
+                strategy_tag="opening_range_breakout",
+                daily_df=None,
+                daily_context=context,
+                current_price=current_price,
+                open_price=float(quote_snapshot.get("open_price", 0.0) or 0.0),
+                stock_name=str(quote_snapshot.get("stock_name") or ""),
+                decision_time=decision_time,
+                has_pending_order=has_pending_order,
+            )
+            get_shadow_candidate = getattr(self._executor, "get_strategy_shadow_candidate", None)
+            if callable(get_shadow_candidate):
+                for strategy_tag in ("trend_atr", "opening_range_breakout"):
+                    if strategy_tag in self._enabled_strategy_tags and get_shadow_candidate(strategy_tag, self._executor.stock_code) is not None:
+                        self._dirty_symbols.mark(self._executor.stock_code)
+                        break
             self._candidate_store.remove(self._executor.stock_code)
             if terminal is not None:
                 setattr(self._executor, "_pullback_threaded_context_version", "")
@@ -631,6 +694,16 @@ class PullbackSetupWorker(threading.Thread):
         self._candidate_store.upsert(candidate)
         self._process_shadow_strategy_setup(
             strategy_tag="trend_atr",
+            daily_df=None,
+            daily_context=context,
+            current_price=current_price,
+            open_price=float(quote_snapshot.get("open_price", 0.0) or 0.0),
+            stock_name=str(quote_snapshot.get("stock_name") or ""),
+            decision_time=decision_time,
+            has_pending_order=has_pending_order,
+        )
+        self._process_shadow_strategy_setup(
+            strategy_tag="opening_range_breakout",
             daily_df=None,
             daily_context=context,
             current_price=current_price,
@@ -734,6 +807,19 @@ class PullbackTimingWorker(threading.Thread):
             has_pending_order=has_pending_order,
             current_context_version=None,
         )
+        if strategy_tag == "opening_range_breakout":
+            setattr(self._executor, "_orb_adapter_path_used", True)
+            orb_state = str(
+                (decision.meta or {}).get(
+                    "decision_meta",
+                    {},
+                ).get(
+                    "intraday_source_state",
+                    (decision.meta or {}).get("entry_meta", {}).get("intraday_source_state", "missing"),
+                )
+                or "missing"
+            )
+            setattr(self._executor, "_orb_intraday_source_state", orb_state)
         if not bool(decision.should_emit_intent):
             remove_shadow_intent(strategy_tag, symbol)
             return
@@ -761,6 +847,14 @@ class PullbackTimingWorker(threading.Thread):
                     )
                     self._process_shadow_strategy_timing(
                         strategy_tag="trend_atr",
+                        symbol=symbol,
+                        current_price=current_price,
+                        quote_snapshot=quote_snapshot,
+                        intraday_bars=intraday_bars,
+                        has_pending_order=self._executor._has_active_pending_buy_order(),
+                    )
+                    self._process_shadow_strategy_timing(
+                        strategy_tag="opening_range_breakout",
                         symbol=symbol,
                         current_price=current_price,
                         quote_snapshot=quote_snapshot,
@@ -852,6 +946,14 @@ class PullbackTimingWorker(threading.Thread):
         setattr(self._executor, "_pullback_intent_queue_depth", self._entry_queue.qsize())
         self._process_shadow_strategy_timing(
             strategy_tag="trend_atr",
+            symbol=symbol,
+            current_price=current_price,
+            quote_snapshot=quote_snapshot,
+            intraday_bars=intraday_bars,
+            has_pending_order=has_pending_order,
+        )
+        self._process_shadow_strategy_timing(
+            strategy_tag="opening_range_breakout",
             symbol=symbol,
             current_price=current_price,
             quote_snapshot=quote_snapshot,

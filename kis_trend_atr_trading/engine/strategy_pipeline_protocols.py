@@ -45,6 +45,8 @@ class StrategySetupEvaluator(Protocol):
         stock_name: str,
         current_price: float,
         open_price: Optional[float],
+        intraday_bars: Optional[list[dict]],
+        intraday_provider_ready: bool,
         check_time: Any,
         market_phase: Optional[Any],
         market_venue: Optional[Any],

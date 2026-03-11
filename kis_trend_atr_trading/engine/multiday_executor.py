@@ -441,6 +441,8 @@ class MultidayExecutor:
         self._strategy_end_to_end_latency_ms: float = 0.0
         self._strategy_regime_snapshot_state_used: str = "absent"
         self._trend_atr_adapter_path_used: bool = False
+        self._orb_adapter_path_used: bool = False
+        self._orb_intraday_source_state: str = "missing"
         self._risk_snapshot_refresh_ms: float = 0.0
         self._risk_snapshot_refresh_count: int = 0
         self._holdings_snapshot_refresh_count: int = 0
@@ -690,6 +692,7 @@ class MultidayExecutor:
             self._strategy_pipeline_registry = build_default_strategy_registry(
                 pullback_strategy=self.strategy.pullback_strategy,
                 trend_atr_strategy=self.strategy,
+                orb_strategy=getattr(self.strategy, "orb_strategy", None),
             )
         if self._is_pullback_daily_refresh_enabled():
             self._pullback_daily_refresh_worker = DailyRefreshThread(
@@ -813,18 +816,26 @@ class MultidayExecutor:
         self._pullback_threaded_context_version = ""
         self._pullback_daily_context_version = ""
         self._trend_atr_adapter_path_used = False
+        self._orb_adapter_path_used = False
+        self._orb_intraday_source_state = "missing"
+
+    def is_cached_intraday_provider_ready(self) -> bool:
+        provider = getattr(self, "market_data_provider", None)
+        if provider is None:
+            return False
+        is_ws_connected = getattr(provider, "is_ws_connected", None)
+        if not callable(is_ws_connected):
+            return False
+        try:
+            return bool(is_ws_connected())
+        except Exception:
+            return False
 
     def fetch_cached_intraday_bars_if_available(self, n: int = 120) -> list[dict]:
         provider = getattr(self, "market_data_provider", None)
         if provider is None:
             return []
-        is_ws_connected = getattr(provider, "is_ws_connected", None)
-        if not callable(is_ws_connected):
-            return []
-        try:
-            if not bool(is_ws_connected()):
-                return []
-        except Exception:
+        if not self.is_cached_intraday_provider_ready():
             return []
         try:
             bars = provider.get_recent_bars(
@@ -876,6 +887,8 @@ class MultidayExecutor:
                 getattr(self, "_strategy_regime_snapshot_state_used", "absent") or "absent"
             ),
             "trend_atr_adapter_path_used": bool(getattr(self, "_trend_atr_adapter_path_used", False)),
+            "orb_adapter_path_used": bool(getattr(self, "_orb_adapter_path_used", False)),
+            "orb_intraday_source_state": str(getattr(self, "_orb_intraday_source_state", "missing") or "missing"),
             "risk_snapshot_refresh_ms": float(getattr(self, "_risk_snapshot_refresh_ms", 0.0) or 0.0),
             "risk_snapshot_refresh_count": int(getattr(self, "_risk_snapshot_refresh_count", 0) or 0),
             "holdings_snapshot_refresh_count": int(getattr(self, "_holdings_snapshot_refresh_count", 0) or 0),

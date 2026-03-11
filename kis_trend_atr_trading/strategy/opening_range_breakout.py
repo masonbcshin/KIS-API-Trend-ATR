@@ -39,6 +39,30 @@ class ORBCandidate:
     meta: Dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class ORBSetupCandidate:
+    symbol: str
+    strategy_tag: str
+    created_at: datetime
+    expires_at: datetime
+    opening_range_high: float
+    opening_range_low: float
+    atr: float
+    source: str
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ORBTimingDecision:
+    should_emit_intent: bool = False
+    reason: str = ""
+    reason_code: str = ""
+    timing_source: str = ""
+    invalidate_candidate: bool = False
+    entry_reference_price: float = 0.0
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+
 class OpeningRangeBreakoutStrategy:
     strategy_tag = "opening_range_breakout"
 
@@ -160,6 +184,384 @@ class OpeningRangeBreakoutStrategy:
         if total_volume <= 0:
             return 0.0
         return total_turnover / total_volume
+
+    def _resolve_phase_context(
+        self,
+        *,
+        check_time: datetime,
+        market_phase: Optional[object],
+        market_venue: Optional[object],
+    ) -> MarketPhaseContext:
+        raw_phase = getattr(market_phase, "value", market_phase)
+        phase_token = str(raw_phase or "").strip().upper()
+        if phase_token in {item.value for item in VenueMarketPhase}:
+            return MarketPhaseContext(
+                venue=TradingVenue.KRX if phase_token.startswith("KRX_") else TradingVenue.NXT,
+                phase=VenueMarketPhase(phase_token),
+                source_session_state="provided_phase",
+            )
+        return resolve_market_phase_context(
+            check_time=check_time,
+            venue=market_venue or TradingVenue.KRX,
+            session_state=market_phase,
+        )
+
+    def _resolve_intraday_source_state(
+        self,
+        *,
+        bars: list[dict],
+        decision_time: datetime,
+        range_minutes: int,
+        provider_ready: bool,
+    ) -> str:
+        if not provider_ready:
+            return "unsupported"
+        if not bars:
+            return "missing"
+        if len(bars) < int(range_minutes):
+            return "insufficient"
+        last_bar_at = self._parse_bar_time(bars[-1].get("start_at") or bars[-1].get("date"))
+        if last_bar_at is None:
+            return "missing"
+        if (decision_time - last_bar_at).total_seconds() > 180.0:
+            return "stale"
+        return "fresh"
+
+    def evaluate_setup_candidate(
+        self,
+        *,
+        df: pd.DataFrame,
+        current_price: float,
+        open_price: Optional[float],
+        intraday_bars: Optional[list[dict]],
+        stock_code: str,
+        stock_name: str = "",
+        check_time: Optional[datetime] = None,
+        market_phase: Optional[object] = None,
+        market_venue: Optional[object] = None,
+        has_existing_position: bool = False,
+        has_pending_order: bool = False,
+        market_regime_snapshot: Optional[object] = None,
+        intraday_provider_ready: bool = True,
+    ) -> tuple[Optional[ORBSetupCandidate], Optional[ORBCandidate]]:
+        if not bool(getattr(settings, "ENABLE_OPENING_RANGE_BREAKOUT_STRATEGY", False)):
+            return None, ORBCandidate(decision=ORBDecision.NOOP)
+
+        now_kst = self._resolve_time(check_time)
+        if has_existing_position:
+            return None, ORBCandidate(
+                decision=ORBDecision.BLOCKED,
+                reason="기존 포지션 보유 중 - ORB 신규 진입 차단",
+                reason_code="orb_existing_position",
+            )
+        if has_pending_order and bool(getattr(settings, "ORB_BLOCK_IF_PENDING_ORDER", True)):
+            return None, ORBCandidate(
+                decision=ORBDecision.BLOCKED,
+                reason="미종결 주문 존재 - ORB 신규 진입 차단",
+                reason_code="orb_pending_order",
+            )
+
+        phase_context = self._resolve_phase_context(
+            check_time=now_kst,
+            market_phase=market_phase,
+            market_venue=market_venue,
+        )
+        allowed_venues = self._resolve_venues(
+            getattr(settings, "ORB_ALLOWED_ENTRY_VENUES", TradingVenue.KRX.value)
+        )
+        if bool(getattr(settings, "ORB_ONLY_MAIN_MARKET", True)) and not phase_allowed_for_entry(
+            phase_context.phase,
+            allowed_venues=allowed_venues,
+        ):
+            return None, ORBCandidate(
+                decision=ORBDecision.BLOCKED,
+                reason="메인마켓 phase가 아니어서 ORB 신규 진입 차단",
+                reason_code="orb_not_main_market",
+                meta={
+                    "market_phase": phase_context.phase.value,
+                    "market_venue": phase_context.venue.value,
+                },
+            )
+
+        regime = getattr(market_regime_snapshot, "regime", None)
+        regime_is_stale = bool(getattr(market_regime_snapshot, "is_stale", False))
+        if regime is not None and not regime_is_stale and str(getattr(regime, "value", regime)).upper() == "BAD":
+            regime_value = str(getattr(regime, "value", regime))
+            return None, ORBCandidate(
+                decision=ORBDecision.BLOCKED,
+                reason="시장 레짐 BAD - ORB 신규 진입 차단",
+                reason_code="orb_regime_bad",
+                meta={"market_regime": regime_value},
+            )
+
+        if df.empty:
+            return None, ORBCandidate(decision=ORBDecision.NOOP)
+        latest = df.iloc[-1]
+        prev_high = float(latest.get("prev_high", 0.0) or 0.0)
+        prev_close = float(latest.get("prev_close", 0.0) or 0.0)
+        atr = float(latest.get("atr", 0.0) or 0.0)
+        adx = float(latest.get("adx", 0.0) or 0.0)
+        trend_ma = float(latest.get("ma", 0.0) or 0.0)
+        latest_close = float(latest.get("close", 0.0) or 0.0)
+        if prev_high <= 0 or atr <= 0 or trend_ma <= 0:
+            return None, ORBCandidate(decision=ORBDecision.NOOP)
+        if current_price <= prev_high or not open_price or open_price <= prev_high:
+            return None, ORBCandidate(decision=ORBDecision.NOOP)
+        if latest_close <= trend_ma:
+            return None, ORBCandidate(decision=ORBDecision.NOOP)
+        if bool(getattr(settings, "ORB_USE_ADX_FILTER", True)) and adx < float(
+            getattr(settings, "ORB_MIN_ADX", 20.0) or 20.0
+        ):
+            return None, ORBCandidate(decision=ORBDecision.NOOP)
+
+        asset_type = detect_asset_type(stock_code=stock_code, stock_name=stock_name)
+        open_vs_prev_high_pct = compute_extension_pct(open_price, prev_high)
+        min_open_gap_pct = max(float(getattr(settings, "ORB_MIN_OPEN_ABOVE_PREV_HIGH_PCT", 0.0) or 0.0), 0.0)
+        max_open_gap_pct = self._asset_type_max_pct(
+            asset_type,
+            getattr(settings, "ORB_MAX_OPEN_ABOVE_PREV_HIGH_PCT_ETF", 0.0),
+            getattr(settings, "ORB_MAX_OPEN_ABOVE_PREV_HIGH_PCT_STOCK", 0.0),
+        )
+        if open_vs_prev_high_pct < min_open_gap_pct:
+            return None, ORBCandidate(decision=ORBDecision.NOOP)
+        if max_open_gap_pct > 0 and open_vs_prev_high_pct > max_open_gap_pct:
+            return None, ORBCandidate(
+                decision=ORBDecision.BLOCKED,
+                reason="ORB 시가 갭이 허용 범위를 초과",
+                reason_code="orb_gap_too_large",
+            )
+
+        bars = self._normalize_intraday_bars(intraday_bars or [], decision_time=now_kst)
+        range_minutes = max(int(getattr(settings, "ORB_OPENING_RANGE_MINUTES", 5) or 5), 3)
+        source_state = self._resolve_intraday_source_state(
+            bars=bars,
+            decision_time=now_kst,
+            range_minutes=range_minutes,
+            provider_ready=bool(intraday_provider_ready),
+        )
+        if source_state in {"unsupported", "missing", "insufficient", "stale"}:
+            return None, ORBCandidate(
+                decision=ORBDecision.NOOP,
+                reason=f"orb_intraday_{source_state}",
+                reason_code=f"orb_intraday_{source_state}",
+                meta={"intraday_source_state": source_state},
+            )
+
+        market_open_at = now_kst.replace(
+            hour=MARKET_OPEN.hour,
+            minute=MARKET_OPEN.minute,
+            second=0,
+            microsecond=0,
+        )
+        minutes_since_open = max((now_kst - market_open_at).total_seconds() / 60.0, 0.0)
+        opening_guard_minutes = 0
+        if bool(getattr(settings, "ENABLE_OPENING_NO_ENTRY_GUARD", False)):
+            opening_guard_minutes = max(int(getattr(settings, "OPENING_NO_ENTRY_MINUTES", 0) or 0), 0)
+        entry_start_minutes = max(
+            range_minutes,
+            max(int(getattr(settings, "ORB_ENTRY_START_MINUTES", 0) or 0), 0),
+            opening_guard_minutes,
+        )
+        entry_cutoff_minutes = max(
+            int(getattr(settings, "ORB_ENTRY_CUTOFF_MINUTES", 90) or 90),
+            entry_start_minutes,
+        )
+        if minutes_since_open < entry_start_minutes or minutes_since_open > entry_cutoff_minutes:
+            return None, ORBCandidate(decision=ORBDecision.NOOP)
+
+        opening_range_bars = bars[:range_minutes]
+        opening_range_high = max(float(bar["high"]) for bar in opening_range_bars)
+        opening_range_low = min(float(bar["low"]) for bar in opening_range_bars)
+        candidate = ORBSetupCandidate(
+            symbol=str(stock_code).zfill(6),
+            strategy_tag=self.strategy_tag,
+            created_at=now_kst,
+            expires_at=market_open_at + timedelta(minutes=entry_cutoff_minutes),
+            opening_range_high=float(opening_range_high),
+            opening_range_low=float(opening_range_low),
+            atr=float(atr or 0.0),
+            source="orb_setup",
+            meta={
+                "strategy_tag": self.strategy_tag,
+                "asset_type": asset_type,
+                "prev_high": prev_high,
+                "prev_close": prev_close,
+                "current_price": float(current_price or 0.0),
+                "current_price_at_signal": float(current_price or 0.0),
+                "open_price": float(open_price or 0.0),
+                "entry_reference_price": opening_range_high,
+                "entry_reference_label": "opening_range_high",
+                "opening_range_high": opening_range_high,
+                "opening_range_low": opening_range_low,
+                "opening_range_minutes": range_minutes,
+                "open_vs_prev_high_pct": open_vs_prev_high_pct,
+                "signal_time": now_kst.isoformat(),
+                "adx": adx,
+                "intraday_source_state": source_state,
+                "expiry_authority": "orb_entry_cutoff",
+                "market_phase": phase_context.phase.value,
+                "market_venue": phase_context.venue.value,
+            },
+        )
+        return candidate, None
+
+    def confirm_timing(
+        self,
+        *,
+        candidate: ORBSetupCandidate,
+        current_price: float,
+        intraday_bars: Optional[list[dict]],
+        stock_code: str,
+        stock_name: str = "",
+        check_time: Optional[datetime] = None,
+        market_phase: Optional[object] = None,
+        market_venue: Optional[object] = None,
+        has_existing_position: bool = False,
+        has_pending_order: bool = False,
+        intraday_provider_ready: bool = True,
+    ) -> ORBTimingDecision:
+        now_kst = self._resolve_time(check_time)
+        if candidate.expires_at <= now_kst:
+            return ORBTimingDecision(
+                should_emit_intent=False,
+                reason="orb_candidate_expired",
+                reason_code="orb_candidate_expired",
+                timing_source="expired",
+                invalidate_candidate=True,
+                entry_reference_price=float(candidate.opening_range_high or 0.0),
+            )
+        if has_existing_position:
+            return ORBTimingDecision(
+                should_emit_intent=False,
+                reason="orb_existing_position",
+                reason_code="orb_existing_position",
+                timing_source="precheck",
+                invalidate_candidate=True,
+                entry_reference_price=float(candidate.opening_range_high or 0.0),
+            )
+        if has_pending_order and bool(getattr(settings, "ORB_BLOCK_IF_PENDING_ORDER", True)):
+            return ORBTimingDecision(
+                should_emit_intent=False,
+                reason="orb_pending_order",
+                reason_code="orb_pending_order",
+                timing_source="precheck",
+                entry_reference_price=float(candidate.opening_range_high or 0.0),
+            )
+
+        phase_context = self._resolve_phase_context(
+            check_time=now_kst,
+            market_phase=market_phase,
+            market_venue=market_venue,
+        )
+        allowed_venues = self._resolve_venues(
+            getattr(settings, "ORB_ALLOWED_ENTRY_VENUES", TradingVenue.KRX.value)
+        )
+        if bool(getattr(settings, "ORB_ONLY_MAIN_MARKET", True)) and not phase_allowed_for_entry(
+            phase_context.phase,
+            allowed_venues=allowed_venues,
+        ):
+            return ORBTimingDecision(
+                should_emit_intent=False,
+                reason="orb_not_main_market",
+                reason_code="orb_not_main_market",
+                timing_source="phase_block",
+                invalidate_candidate=True,
+                entry_reference_price=float(candidate.opening_range_high or 0.0),
+                meta={"intraday_source_state": "fresh"},
+            )
+
+        bars = self._normalize_intraday_bars(intraday_bars or [], decision_time=now_kst)
+        range_minutes = max(int(candidate.meta.get("opening_range_minutes", getattr(settings, "ORB_OPENING_RANGE_MINUTES", 5)) or 5), 3)
+        source_state = self._resolve_intraday_source_state(
+            bars=bars,
+            decision_time=now_kst,
+            range_minutes=range_minutes,
+            provider_ready=bool(intraday_provider_ready),
+        )
+        if source_state in {"unsupported", "missing", "insufficient", "stale"}:
+            return ORBTimingDecision(
+                should_emit_intent=False,
+                reason=f"orb_intraday_{source_state}",
+                reason_code=f"orb_intraday_{source_state}",
+                timing_source="intraday_unavailable",
+                entry_reference_price=float(candidate.opening_range_high or 0.0),
+                meta={"intraday_source_state": source_state},
+            )
+        if current_price <= float(candidate.opening_range_high or 0.0):
+            return ORBTimingDecision(
+                should_emit_intent=False,
+                reason="orb_breakout_not_confirmed",
+                reason_code="orb_breakout_not_confirmed",
+                timing_source="waiting_breakout",
+                entry_reference_price=float(candidate.opening_range_high or 0.0),
+                meta={"intraday_source_state": source_state},
+            )
+
+        asset_type = str(candidate.meta.get("asset_type") or ASSET_TYPE_STOCK)
+        orb_extension_pct = compute_extension_pct(current_price, float(candidate.opening_range_high or 0.0))
+        max_orb_extension_pct = self._asset_type_max_pct(
+            asset_type,
+            getattr(settings, "ORB_MAX_EXTENSION_PCT_ETF", 0.0),
+            getattr(settings, "ORB_MAX_EXTENSION_PCT_STOCK", 0.0),
+        )
+        if max_orb_extension_pct > 0 and orb_extension_pct > max_orb_extension_pct:
+            return ORBTimingDecision(
+                should_emit_intent=False,
+                reason="ORB 돌파 추격폭 상한 초과",
+                reason_code="orb_extension_exceeded",
+                timing_source="extension_block",
+                entry_reference_price=float(candidate.opening_range_high or 0.0),
+                meta={
+                    "intraday_source_state": source_state,
+                    "entry_reference_price": float(candidate.opening_range_high or 0.0),
+                    "entry_reference_label": "opening_range_high",
+                    "max_allowed_pct": max_orb_extension_pct,
+                    "extension_pct": orb_extension_pct,
+                },
+            )
+
+        recent_lookback = max(int(getattr(settings, "ORB_RECENT_BREAKOUT_LOOKBACK_BARS", 3) or 3), 1)
+        rearm_band_pct = max(float(getattr(settings, "ORB_REARM_BAND_PCT", 0.002) or 0.0), 0.0)
+        recent_bars = bars[-recent_lookback:]
+        rearm_threshold_price = float(candidate.opening_range_high or 0.0) * (1.0 + rearm_band_pct)
+        breakout_is_fresh = any(float(bar.get("close", 0.0) or 0.0) <= rearm_threshold_price for bar in recent_bars)
+        if not breakout_is_fresh:
+            return ORBTimingDecision(
+                should_emit_intent=False,
+                reason="ORB 돌파가 이미 진행되어 fresh breakout 구간이 아님",
+                reason_code="orb_breakout_not_fresh",
+                timing_source="freshness_block",
+                entry_reference_price=float(candidate.opening_range_high or 0.0),
+                meta={"intraday_source_state": source_state},
+            )
+
+        vwap = self._compute_vwap(bars)
+        if bool(getattr(settings, "ORB_REQUIRE_ABOVE_VWAP", True)) and vwap > 0 and current_price < vwap:
+            return ORBTimingDecision(
+                should_emit_intent=False,
+                reason="ORB 진입 시점이 VWAP 아래라서 차단",
+                reason_code="orb_below_vwap",
+                timing_source="vwap_block",
+                entry_reference_price=float(candidate.opening_range_high or 0.0),
+                meta={"intraday_source_state": source_state},
+            )
+
+        return ORBTimingDecision(
+            should_emit_intent=True,
+            reason=f"장초 ORB 돌파 ({range_minutes}분 range high {float(candidate.opening_range_high or 0.0):,.0f})",
+            reason_code="",
+            timing_source="intraday_orb",
+            entry_reference_price=float(candidate.opening_range_high or 0.0),
+            meta={
+                **dict(candidate.meta or {}),
+                "intraday_source_state": source_state,
+                "orb_vwap": vwap,
+                "extension_pct": orb_extension_pct,
+                "max_allowed_pct": max_orb_extension_pct,
+                "entry_reference_price": float(candidate.opening_range_high or 0.0),
+                "entry_reference_label": "opening_range_high",
+            },
+        )
 
     def evaluate(
         self,

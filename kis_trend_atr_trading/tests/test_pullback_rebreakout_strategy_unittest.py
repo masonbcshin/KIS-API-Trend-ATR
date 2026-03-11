@@ -133,6 +133,38 @@ def _patch_multi_strategy_registry_enabled():
     )
 
 
+def _make_orb_intraday_bars(*, day: datetime, opening_range_high: float, opening_range_low: float) -> list[dict]:
+    bars: list[dict] = []
+    market_open = day.replace(hour=9, minute=0, second=0, microsecond=0)
+    for minute_idx in range(5):
+        start_at = market_open + timedelta(minutes=minute_idx)
+        close_price = opening_range_high * (0.998 + minute_idx * 0.0002)
+        bars.append(
+            {
+                "start_at": start_at,
+                "open": close_price * 0.999,
+                "high": opening_range_high if minute_idx == 1 else close_price * 1.001,
+                "low": opening_range_low if minute_idx == 0 else close_price * 0.999,
+                "close": close_price,
+                "volume": 1000 + minute_idx * 100,
+            }
+        )
+    for minute_idx in range(5, 32):
+        start_at = market_open + timedelta(minutes=minute_idx)
+        close_price = opening_range_high * (0.999 + max(minute_idx - 28, 0) * 0.0006)
+        bars.append(
+            {
+                "start_at": start_at,
+                "open": close_price * 0.9995,
+                "high": close_price * 1.001,
+                "low": close_price * 0.9985,
+                "close": close_price,
+                "volume": 1500 + minute_idx * 40,
+            }
+        )
+    return bars
+
+
 def _make_setup_candidate(current_price: float = 175.2):
     sleeve = PullbackRebreakoutStrategy()
     prepared_df = _make_pullback_indicator_df()
@@ -1395,6 +1427,135 @@ def test_trend_atr_registry_shadow_routing_keeps_order_path_legacy_and_read_only
     assert trend_intent.strategy_tag == "trend_atr"
     assert entry_queue.qsize() == 1
     assert executor._trend_atr_adapter_path_used is True
+
+
+def test_multi_strategy_registry_shadow_routing_keeps_orb_intent_non_authoritative_and_read_only():
+    executor = MultidayExecutor.__new__(MultidayExecutor)
+    executor.stock_code = "005930"
+    executor.strategy = MultidayTrendATRStrategy()
+    executor.market_phase_context = VenueMarketPhase.KRX_CONTINUOUS
+    executor.market_venue_context = "KRX"
+    executor.market_regime_snapshot = object()
+    executor._market_regime_worker_error_state = ""
+    executor._strategy_shadow_state_lock = threading.Lock()
+    executor._strategy_shadow_candidates = {}
+    executor._strategy_shadow_intents = {}
+    executor._trend_atr_adapter_path_used = False
+    executor._orb_adapter_path_used = False
+    executor._orb_intraday_source_state = "missing"
+    executor._pullback_threaded_context_version = ""
+    executor._pullback_daily_context_version = ""
+    executor._pullback_setup_skip_reason = ""
+    executor._pullback_timing_skip_reason = ""
+    executor._candidate_store_size_by_strategy = {}
+    executor._intent_queue_depth_by_strategy = {}
+    decision_time = _kst_dt(2026, 2, 20, 9, 31)
+    prepared_df = _make_pullback_indicator_df()
+    prev_high = float(prepared_df.iloc[-1]["prev_high"])
+    opening_range_high = prev_high * 1.01
+    intraday_bars = _make_orb_intraday_bars(
+        day=decision_time,
+        opening_range_high=opening_range_high,
+        opening_range_low=prev_high * 1.004,
+    )
+    executor._pullback_latest_quote_snapshot = {
+        "stock_code": "005930",
+        "stock_name": "삼성전자",
+        "current_price": opening_range_high * 1.003,
+        "open_price": prev_high * 1.006,
+        "received_at": decision_time,
+    }
+    executor.fetch_quote_snapshot = lambda: dict(executor._pullback_latest_quote_snapshot)
+    executor.get_cached_pullback_quote_snapshot = lambda: dict(executor._pullback_latest_quote_snapshot)
+    executor.fetch_market_data = lambda: prepared_df.copy()
+    executor.fetch_cached_intraday_bars_if_available = lambda n=120: list(intraday_bars)
+    executor.is_cached_intraday_provider_ready = lambda: True
+    executor._has_active_pending_buy_order = lambda: False
+    executor.cached_account_has_holding = lambda _symbol: False
+    executor.refresh_shared_market_regime_snapshot = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("registry shadow routing must not sync refresh market regime")
+    )
+    candidate_store = ArmedCandidateStore()
+    _, _, pullback_candidate = _make_setup_candidate()
+    candidate_store.upsert(pullback_candidate)
+    dirty = DirtySymbolSet()
+    entry_queue = EntryIntentQueue(maxsize=8)
+    registry = build_default_strategy_registry(
+        pullback_strategy=executor.strategy.pullback_strategy,
+        trend_atr_strategy=executor.strategy,
+        orb_strategy=executor.strategy.orb_strategy,
+    )
+    setup_worker = PullbackSetupWorker(
+        executor=executor,
+        candidate_store=candidate_store,
+        daily_context_store=None,
+        dirty_symbols=dirty,
+        strategy_registry=registry,
+        enabled_strategy_tags=("pullback_rebreakout", "trend_atr", "opening_range_breakout"),
+        stop_event=threading.Event(),
+        on_error=lambda *_args: None,
+    )
+    timing_worker = PullbackTimingWorker(
+        executor=executor,
+        candidate_store=candidate_store,
+        dirty_symbols=dirty,
+        entry_queue=entry_queue,
+        strategy_registry=registry,
+        enabled_strategy_tags=("pullback_rebreakout", "trend_atr", "opening_range_breakout"),
+        stop_event=threading.Event(),
+        on_error=lambda *_args: None,
+    )
+
+    with _patch_pullback_enabled(), \
+         patch.object(multiday_trend_atr.settings, "ENABLE_MULTI_STRATEGY_THREADED_PIPELINE", True), \
+         patch.object(multiday_trend_atr.settings, "THREADED_PIPELINE_ENABLED_STRATEGIES", "pullback_rebreakout,trend_atr,opening_range_breakout"), \
+         patch.object(multiday_trend_atr.settings, "STRATEGY_CANDIDATE_MAX_AGE_SEC", 300), \
+         patch.object(multiday_trend_atr.settings, "ENABLE_OPENING_RANGE_BREAKOUT_STRATEGY", True), \
+         patch.object(multiday_trend_atr.settings, "ORB_OPENING_RANGE_MINUTES", 5), \
+         patch.object(multiday_trend_atr.settings, "ORB_ENTRY_CUTOFF_MINUTES", 90), \
+         patch.object(multiday_trend_atr.settings, "ORB_MIN_OPEN_ABOVE_PREV_HIGH_PCT", 0.003), \
+         patch.object(multiday_trend_atr.settings, "ORB_MAX_OPEN_ABOVE_PREV_HIGH_PCT_STOCK", 0.10), \
+         patch.object(multiday_trend_atr.settings, "ORB_MAX_OPEN_ABOVE_PREV_HIGH_PCT_ETF", 0.05), \
+         patch.object(multiday_trend_atr.settings, "ORB_MAX_EXTENSION_PCT_STOCK", 0.01), \
+         patch.object(multiday_trend_atr.settings, "ORB_MAX_EXTENSION_PCT_ETF", 0.006), \
+         patch.object(multiday_trend_atr.settings, "ORB_REQUIRE_ABOVE_VWAP", True), \
+         patch.object(multiday_trend_atr.settings, "ORB_USE_ADX_FILTER", False), \
+         patch.object(multiday_trend_atr.settings, "ORB_RECENT_BREAKOUT_LOOKBACK_BARS", 3), \
+         patch.object(multiday_trend_atr.settings, "ORB_REARM_BAND_PCT", 0.002):
+        setup_worker._process_shadow_strategy_setup(
+            strategy_tag="trend_atr",
+            daily_df=prepared_df.copy(),
+            daily_context=None,
+            current_price=float(executor._pullback_latest_quote_snapshot["current_price"]),
+            open_price=float(executor._pullback_latest_quote_snapshot["open_price"]),
+            stock_name="삼성전자",
+            decision_time=decision_time,
+            has_pending_order=False,
+        )
+        setup_worker._process_shadow_strategy_setup(
+            strategy_tag="opening_range_breakout",
+            daily_df=prepared_df.copy(),
+            daily_context=None,
+            current_price=float(executor._pullback_latest_quote_snapshot["current_price"]),
+            open_price=float(executor._pullback_latest_quote_snapshot["open_price"]),
+            stock_name="삼성전자",
+            decision_time=decision_time,
+            has_pending_order=False,
+        )
+        timing_worker._process_symbol("005930")
+
+    trend_intent = executor.get_strategy_shadow_intent("trend_atr", "005930")
+    orb_candidate = executor.get_strategy_shadow_candidate("opening_range_breakout", "005930")
+    orb_intent = executor.get_strategy_shadow_intent("opening_range_breakout", "005930")
+
+    assert trend_intent is not None
+    assert orb_candidate is not None
+    assert orb_candidate.strategy_tag == "opening_range_breakout"
+    assert orb_intent is not None
+    assert orb_intent.strategy_tag == "opening_range_breakout"
+    assert entry_queue.qsize() == 1
+    assert executor._orb_adapter_path_used is True
+    assert executor._orb_intraday_source_state == "fresh"
 
 
 def test_strategy_candidate_max_age_does_not_change_legacy_trend_atr_signal(sample_uptrend_df):
