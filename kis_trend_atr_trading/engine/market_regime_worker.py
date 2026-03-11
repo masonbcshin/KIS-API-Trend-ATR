@@ -62,6 +62,7 @@ class MarketRegimeRefreshThread(threading.Thread):
         self._last_trade_date: str = ""
         self._bootstrap_attempted: bool = False
         self._refresh_fail_count: int = 0
+        self._refresh_error_streak: int = 0
         self._background_refresh_ms: float = 0.0
         self._daily_context_refresh_ms: float = 0.0
         self._intraday_guard_ms: float = 0.0
@@ -69,6 +70,7 @@ class MarketRegimeRefreshThread(threading.Thread):
         self._quote_state: str = "absent"
         self._daily_context_state: str = "absent"
         self._last_success_at: Optional[datetime] = None
+        self._heartbeat_at: Optional[datetime] = None
         self._error_state: str = ""
         self._refresh_state: str = "bootstrap_pending"
 
@@ -86,6 +88,7 @@ class MarketRegimeRefreshThread(threading.Thread):
             refresh_state = self._refresh_state
             error_state = self._error_state
             fail_count = self._refresh_fail_count
+            error_streak = self._refresh_error_streak
             background_refresh_ms = self._background_refresh_ms
             daily_context_refresh_ms = self._daily_context_refresh_ms
             intraday_guard_ms = self._intraday_guard_ms
@@ -93,10 +96,14 @@ class MarketRegimeRefreshThread(threading.Thread):
             quote_state = self._quote_state
             daily_context_state = self._daily_context_state
             bootstrap_attempted = self._bootstrap_attempted
+            heartbeat_at = self._heartbeat_at
         snapshot = materialize_market_regime_snapshot(snapshot, now_kst)
         last_success_age_sec = -1.0
+        heartbeat_age_sec = -1.0
         if last_success_at is not None:
             last_success_age_sec = max((now_kst - ensure_kst(last_success_at)).total_seconds(), 0.0)
+        if heartbeat_at is not None:
+            heartbeat_age_sec = max((now_kst - ensure_kst(heartbeat_at)).total_seconds(), 0.0)
         if snapshot is not None and snapshot.is_stale:
             refresh_state = "background_stale"
         elif snapshot is None and bootstrap_attempted:
@@ -115,6 +122,8 @@ class MarketRegimeRefreshThread(threading.Thread):
             "market_regime_daily_context_state": daily_context_state or "absent",
             "market_regime_background_last_success_age_sec": float(last_success_age_sec),
             "market_regime_background_refresh_fail_count": int(fail_count or 0),
+            "market_regime_worker_error_streak": int(error_streak or 0),
+            "market_regime_worker_heartbeat_age_sec": float(heartbeat_age_sec),
             "market_regime_worker_error_state": error_state or "",
         }
 
@@ -130,7 +139,9 @@ class MarketRegimeRefreshThread(threading.Thread):
             force_daily = True
             while not self._stop_event.is_set():
                 self._bootstrap_attempted = True
+                self._touch_heartbeat()
                 self._run_cycle(force_daily=force_daily)
+                self._touch_heartbeat()
                 force_daily = False
                 if self._stop_event.is_set():
                     break
@@ -322,6 +333,11 @@ class MarketRegimeRefreshThread(threading.Thread):
             self._error_state = str(error_state or "")
             if success_time is not None:
                 self._last_success_at = ensure_kst(success_time)
+                self._refresh_error_streak = 0
+
+    def _touch_heartbeat(self, now_kst: Optional[datetime] = None) -> None:
+        with self._lock:
+            self._heartbeat_at = ensure_kst(now_kst or datetime.now(KST))
 
     def _record_failure(
         self,
@@ -333,7 +349,9 @@ class MarketRegimeRefreshThread(threading.Thread):
     ) -> None:
         with self._lock:
             self._refresh_fail_count += 1
+            self._refresh_error_streak += 1
         error_state = str(exc)
+        self._touch_heartbeat(now_kst)
         self._update_metrics(
             snapshot=self.get_snapshot(now_kst),
             daily_context=self._daily_context,
@@ -348,11 +366,14 @@ class MarketRegimeRefreshThread(threading.Thread):
         )
         logger.error(
             "[MARKET_REGIME_BG] refresh_failed err=%s market_regime_daily_context_state=%s "
-            "market_regime_background_last_success_age_sec=%.3f market_regime_background_refresh_fail_count=%s",
+            "market_regime_background_last_success_age_sec=%.3f "
+            "market_regime_background_refresh_fail_count=%s "
+            "market_regime_worker_error_streak=%s",
             error_state,
             daily_context_state,
             float(self.get_status(now_kst).get("market_regime_background_last_success_age_sec", -1.0)),
             int(self.get_status(now_kst).get("market_regime_background_refresh_fail_count", 0)),
+            int(self.get_status(now_kst).get("market_regime_worker_error_streak", 0)),
         )
         if callable(self._on_error):
             self._on_error(self.name, exc)

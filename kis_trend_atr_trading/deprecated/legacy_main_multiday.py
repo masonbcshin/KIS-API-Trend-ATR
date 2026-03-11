@@ -504,6 +504,8 @@ def run_trade(
         market_regime_service = MarketRegimeService(api=api)
         shared_market_regime_snapshot = None
         market_regime_background_enabled = _is_market_regime_refresh_thread_enabled()
+        market_regime_restart_attempts = 0
+        market_regime_next_restart_monotonic = 0.0
 
         # 주문 수량 계산
         order_quantity = settings.ORDER_QUANTITY
@@ -1021,15 +1023,20 @@ def run_trade(
                 return
             if market_regime_worker is not None and market_regime_worker.is_alive():
                 return
-            market_regime_worker_stop_event = threading.Event()
-            market_regime_worker = MarketRegimeRefreshThread(
-                service=market_regime_service,
-                quote_snapshot_loader=_load_market_regime_ws_quote_snapshot,
-                stop_event=market_regime_worker_stop_event,
-                on_error=_handle_market_regime_worker_error,
-            )
-            market_regime_worker.start()
-            logger.info("[MARKET_REGIME_BG] worker_started")
+            try:
+                market_regime_worker_stop_event = threading.Event()
+                market_regime_worker = MarketRegimeRefreshThread(
+                    service=market_regime_service,
+                    quote_snapshot_loader=_load_market_regime_ws_quote_snapshot,
+                    stop_event=market_regime_worker_stop_event,
+                    on_error=_handle_market_regime_worker_error,
+                )
+                market_regime_worker.start()
+                logger.info("[MARKET_REGIME_BG] worker_started")
+            except Exception as exc:
+                logger.error("[MARKET_REGIME_BG] worker_start_failed err=%s", exc)
+                market_regime_worker = None
+                market_regime_worker_stop_event = None
 
         def _stop_market_regime_worker() -> None:
             nonlocal market_regime_worker, market_regime_worker_stop_event
@@ -1039,6 +1046,119 @@ def run_trade(
                 market_regime_worker.join(timeout=2.0)
             market_regime_worker = None
             market_regime_worker_stop_event = None
+
+        def _market_regime_worker_restart_enabled() -> bool:
+            return bool(
+                market_regime_background_enabled
+                and getattr(settings, "ENABLE_MARKET_REGIME_WORKER_AUTO_RESTART", True)
+            )
+
+        def _market_regime_worker_restart_error_threshold() -> int:
+            return max(
+                int(getattr(settings, "MARKET_REGIME_WORKER_RESTART_ERROR_THRESHOLD", 3) or 3),
+                1,
+            )
+
+        def _market_regime_worker_restart_base_backoff_sec() -> float:
+            return max(
+                float(getattr(settings, "MARKET_REGIME_WORKER_RESTART_BASE_BACKOFF_SEC", 5) or 5.0),
+                0.0,
+            )
+
+        def _market_regime_worker_restart_max_backoff_sec() -> float:
+            return max(
+                float(getattr(settings, "MARKET_REGIME_WORKER_RESTART_MAX_BACKOFF_SEC", 60) or 60.0),
+                _market_regime_worker_restart_base_backoff_sec(),
+            )
+
+        def _market_regime_worker_stall_sec() -> float:
+            return max(
+                float(getattr(settings, "MARKET_REGIME_WORKER_STALL_SEC", 120) or 120.0),
+                1.0,
+            )
+
+        def _maybe_restart_market_regime_worker(*, now_kst: datetime, now_monotonic: float) -> None:
+            nonlocal market_regime_restart_attempts, market_regime_next_restart_monotonic
+            if not _market_regime_worker_restart_enabled():
+                return
+
+            worker = market_regime_worker
+            status = {}
+            if worker is not None:
+                try:
+                    status = dict(worker.get_status(now=now_kst) or {})
+                except Exception as exc:
+                    logger.error("[MARKET_REGIME_BG] worker_status_read_failed err=%s", exc)
+                    status = {"market_regime_worker_error_state": str(exc or "status_read_failed")}
+
+            error_state = str(status.get("market_regime_worker_error_state") or "").strip()
+            error_streak = int(status.get("market_regime_worker_error_streak", 0) or 0)
+            heartbeat_age_sec = float(
+                status.get("market_regime_worker_heartbeat_age_sec", -1.0) or -1.0
+            )
+            restart_reason = ""
+            if worker is None:
+                restart_reason = "worker_missing"
+            elif not worker.is_alive():
+                restart_reason = "worker_dead"
+            elif heartbeat_age_sec >= _market_regime_worker_stall_sec():
+                restart_reason = "worker_stalled"
+            elif error_state and error_streak >= _market_regime_worker_restart_error_threshold():
+                restart_reason = "worker_error_streak"
+
+            if not restart_reason:
+                if market_regime_restart_attempts:
+                    logger.info("[MARKET_REGIME_BG] worker_recovered restart_attempts=%s", market_regime_restart_attempts)
+                market_regime_restart_attempts = 0
+                market_regime_next_restart_monotonic = 0.0
+                return
+
+            if now_monotonic < market_regime_next_restart_monotonic:
+                remaining_sec = max(market_regime_next_restart_monotonic - now_monotonic, 0.0)
+                logger.warning(
+                    "[MARKET_REGIME_BG] restart_backoff_active reason=%s remaining_sec=%.3f "
+                    "market_regime_worker_error_state=%s market_regime_worker_error_streak=%s "
+                    "market_regime_worker_heartbeat_age_sec=%.3f",
+                    restart_reason,
+                    remaining_sec,
+                    error_state or "none",
+                    error_streak,
+                    heartbeat_age_sec,
+                )
+                return
+
+            _stop_market_regime_worker()
+            _start_market_regime_worker()
+            restarted = bool(market_regime_worker is not None and market_regime_worker.is_alive())
+            if not restarted:
+                logger.error(
+                    "[MARKET_REGIME_BG] worker_restart_failed reason=%s "
+                    "market_regime_worker_error_state=%s market_regime_worker_error_streak=%s "
+                    "market_regime_worker_heartbeat_age_sec=%.3f",
+                    restart_reason,
+                    error_state or "none",
+                    error_streak,
+                    heartbeat_age_sec,
+                )
+                return
+            market_regime_restart_attempts += 1
+            backoff_sec = min(
+                _market_regime_worker_restart_base_backoff_sec()
+                * (2 ** max(market_regime_restart_attempts - 1, 0)),
+                _market_regime_worker_restart_max_backoff_sec(),
+            )
+            market_regime_next_restart_monotonic = now_monotonic + max(backoff_sec, 0.0)
+            logger.warning(
+                "[MARKET_REGIME_BG] worker_restarted reason=%s restart_attempt=%s next_backoff_sec=%.3f "
+                "market_regime_worker_error_state=%s market_regime_worker_error_streak=%s "
+                "market_regime_worker_heartbeat_age_sec=%.3f",
+                restart_reason,
+                market_regime_restart_attempts,
+                backoff_sec,
+                error_state or "none",
+                error_streak,
+                heartbeat_age_sec,
+            )
 
         def _resolve_effective_feed_mode(decision) -> str:
             if ws_provider is None:
@@ -1486,6 +1606,11 @@ def run_trade(
             market_regime_filter_enabled = bool(
                 getattr(settings, "ENABLE_MARKET_REGIME_FILTER", False)
             )
+            if market_regime_background_enabled:
+                _maybe_restart_market_regime_worker(
+                    now_kst=now_kst,
+                    now_monotonic=time.monotonic(),
+                )
             should_refresh_market_regime = (
                 market_regime_filter_enabled
                 and decision.policy.allow_new_entries
@@ -1537,6 +1662,8 @@ def run_trade(
                         "market_regime_daily_context_state=%s "
                         "market_regime_background_last_success_age_sec=%.3f "
                         "market_regime_background_refresh_fail_count=%s "
+                        "market_regime_worker_error_streak=%s "
+                        "market_regime_worker_heartbeat_age_sec=%.3f "
                         "market_regime_worker_error_state=%s snapshot_as_of=%s snapshot_stale=%s",
                         market_regime_refresh_state,
                         float(
@@ -1581,6 +1708,20 @@ def run_trade(
                                 0,
                             )
                             or 0
+                        ),
+                        int(
+                            market_regime_background_status.get(
+                                "market_regime_worker_error_streak",
+                                0,
+                            )
+                            or 0
+                        ),
+                        float(
+                            market_regime_background_status.get(
+                                "market_regime_worker_heartbeat_age_sec",
+                                -1.0,
+                            )
+                            or -1.0
                         ),
                         worker_error_state or "none",
                         _snapshot_as_of(shared_market_regime_snapshot),
