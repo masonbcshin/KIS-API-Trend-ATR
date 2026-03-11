@@ -443,6 +443,13 @@ class MultidayExecutor:
         self._trend_atr_adapter_path_used: bool = False
         self._orb_adapter_path_used: bool = False
         self._orb_intraday_source_state: str = "missing"
+        self._authoritative_intent_queue_depth: int = 0
+        self._authoritative_intent_queue_depth_by_strategy: Dict[str, int] = {}
+        self._authoritative_intent_reject_reason: str = ""
+        self._authoritative_intent_consumed_count_by_strategy: Dict[str, int] = {}
+        self._authoritative_order_handoff_path: str = ""
+        self._mixed_strategy_dedupe_count: int = 0
+        self._mixed_strategy_tiebreak_count: int = 0
         self._risk_snapshot_refresh_ms: float = 0.0
         self._risk_snapshot_refresh_count: int = 0
         self._holdings_snapshot_refresh_count: int = 0
@@ -608,11 +615,13 @@ class MultidayExecutor:
     def _is_multi_strategy_threaded_pipeline_enabled(self) -> bool:
         if not bool(getattr(settings, "ENABLE_MULTI_STRATEGY_THREADED_PIPELINE", False)):
             return False
-        if not bool(getattr(settings, "ENABLE_PULLBACK_REBREAKOUT_STRATEGY", False)):
-            return False
         if bool(getattr(self, "_threaded_pullback_pipeline_disabled", False)):
             return False
-        return "pullback_rebreakout" in self._threaded_pipeline_enabled_strategy_tags()
+        enabled_tags = self._threaded_pipeline_enabled_strategy_tags()
+        return any(
+            tag in {"pullback_rebreakout", "trend_atr", "opening_range_breakout"}
+            for tag in enabled_tags
+        )
 
     def _is_threaded_pullback_pipeline_enabled(self) -> bool:
         if self._is_multi_strategy_threaded_pipeline_enabled():
@@ -818,6 +827,13 @@ class MultidayExecutor:
         self._trend_atr_adapter_path_used = False
         self._orb_adapter_path_used = False
         self._orb_intraday_source_state = "missing"
+        self._authoritative_intent_queue_depth = 0
+        self._authoritative_intent_queue_depth_by_strategy = {}
+        self._authoritative_intent_reject_reason = ""
+        self._authoritative_intent_consumed_count_by_strategy = {}
+        self._authoritative_order_handoff_path = ""
+        self._mixed_strategy_dedupe_count = 0
+        self._mixed_strategy_tiebreak_count = 0
 
     def is_cached_intraday_provider_ready(self) -> bool:
         provider = getattr(self, "market_data_provider", None)
@@ -889,6 +905,21 @@ class MultidayExecutor:
             "trend_atr_adapter_path_used": bool(getattr(self, "_trend_atr_adapter_path_used", False)),
             "orb_adapter_path_used": bool(getattr(self, "_orb_adapter_path_used", False)),
             "orb_intraday_source_state": str(getattr(self, "_orb_intraday_source_state", "missing") or "missing"),
+            "authoritative_intent_queue_depth": int(getattr(self, "_authoritative_intent_queue_depth", 0) or 0),
+            "authoritative_intent_queue_depth_by_strategy": dict(
+                getattr(self, "_authoritative_intent_queue_depth_by_strategy", {}) or {}
+            ),
+            "authoritative_intent_reject_reason": str(
+                getattr(self, "_authoritative_intent_reject_reason", "") or ""
+            ),
+            "authoritative_intent_consumed_count_by_strategy": dict(
+                getattr(self, "_authoritative_intent_consumed_count_by_strategy", {}) or {}
+            ),
+            "authoritative_order_handoff_path": str(
+                getattr(self, "_authoritative_order_handoff_path", "") or ""
+            ),
+            "mixed_strategy_dedupe_count": int(getattr(self, "_mixed_strategy_dedupe_count", 0) or 0),
+            "mixed_strategy_tiebreak_count": int(getattr(self, "_mixed_strategy_tiebreak_count", 0) or 0),
             "risk_snapshot_refresh_ms": float(getattr(self, "_risk_snapshot_refresh_ms", 0.0) or 0.0),
             "risk_snapshot_refresh_count": int(getattr(self, "_risk_snapshot_refresh_count", 0) or 0),
             "holdings_snapshot_refresh_count": int(getattr(self, "_holdings_snapshot_refresh_count", 0) or 0),

@@ -46,7 +46,7 @@ from utils.entry_utils import (
     compute_extension_pct,
     detect_asset_type,
 )
-from strategy.opening_range_breakout import ORBDecision, OpeningRangeBreakoutStrategy
+from strategy.opening_range_breakout import ORBCandidate, ORBDecision, OpeningRangeBreakoutStrategy
 from strategy.pullback_rebreakout import (
     PullbackCandidate,
     PullbackDecision,
@@ -1088,6 +1088,75 @@ class MultidayTrendATRStrategy:
             trend=trend,
             meta=signal_meta,
         )
+
+    def build_orb_buy_signal(
+        self,
+        *,
+        orb_candidate: ORBCandidate,
+        df_with_indicators: pd.DataFrame,
+        current_price: float,
+        open_price: Optional[float],
+        stock_code: str,
+        stock_name: str,
+        check_time: Optional[datetime],
+    ) -> TradingSignal:
+        latest = df_with_indicators.iloc[-1]
+        current_atr = latest.get("atr", 0) if not pd.isna(latest.get("atr", 0)) else 0
+        trend = self.get_trend(df_with_indicators)
+        latest_prev_close = latest.get("prev_close", 0.0)
+        if pd.isna(latest_prev_close):
+            latest_prev_close = 0.0
+        guards_ok, guard_reason, orb_meta = self._apply_shared_entry_guards(
+            stock_code=stock_code,
+            stock_name=stock_name,
+            current_price=current_price,
+            open_price=open_price,
+            trigger_price=float(orb_candidate.trigger_price or 0.0),
+            prev_close=float(latest_prev_close or 0.0),
+            check_time=check_time,
+            atr=float(orb_candidate.atr or 0.0),
+            base_meta=dict(orb_candidate.meta or {}),
+            skip_breakout_extension_cap=True,
+            skip_entry_gap_filter=True,
+        )
+        orb_meta.update(
+            {
+                "strategy_tag": orb_candidate.meta.get("strategy_tag", "opening_range_breakout"),
+                "adx": float(orb_candidate.meta.get("adx", latest.get("adx", 0.0)) or 0.0),
+            }
+        )
+        if not guards_ok:
+            return TradingSignal(
+                signal_type=SignalType.HOLD,
+                price=current_price,
+                reason=guard_reason,
+                atr=current_atr,
+                trend=trend,
+                reason_code=str(orb_meta.get("reason_code") or ""),
+                meta=orb_meta,
+            )
+
+        stop_loss = self.calculate_stop_loss(current_price, orb_candidate.atr)
+        take_profit = self.calculate_take_profit(current_price, orb_candidate.atr)
+
+        trade_logger.log_signal(
+            signal_type="BUY",
+            stock_code=stock_code,
+            price=current_price,
+            reason=orb_candidate.reason,
+        )
+
+        return TradingSignal(
+            signal_type=SignalType.BUY,
+            price=current_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            trailing_stop=stop_loss,
+            reason=orb_candidate.reason,
+            atr=orb_candidate.atr,
+            trend=trend,
+            meta=orb_meta,
+        )
     
     # ════════════════════════════════════════════════════════════════
     # 시그널 생성 (메인 로직)
@@ -1315,59 +1384,14 @@ class MultidayTrendATRStrategy:
             )
 
         if orb_candidate.decision == ORBDecision.BUY:
-            latest_prev_close = latest.get("prev_close", 0.0)
-            if pd.isna(latest_prev_close):
-                latest_prev_close = 0.0
-            guards_ok, guard_reason, orb_meta = self._apply_shared_entry_guards(
-                stock_code=stock_code,
-                stock_name=stock_name,
+            return self.build_orb_buy_signal(
+                orb_candidate=orb_candidate,
+                df_with_indicators=df_with_indicators,
                 current_price=current_price,
                 open_price=open_price,
-                trigger_price=float(orb_candidate.trigger_price or 0.0),
-                prev_close=float(latest_prev_close or 0.0),
-                check_time=check_time,
-                atr=float(orb_candidate.atr or 0.0),
-                base_meta=dict(orb_candidate.meta or {}),
-                skip_breakout_extension_cap=True,
-                skip_entry_gap_filter=True,
-            )
-            orb_meta.update(
-                {
-                    "strategy_tag": orb_candidate.meta.get("strategy_tag", "opening_range_breakout"),
-                    "adx": float(orb_candidate.meta.get("adx", latest.get("adx", 0.0)) or 0.0),
-                }
-            )
-            if not guards_ok:
-                return TradingSignal(
-                    signal_type=SignalType.HOLD,
-                    price=current_price,
-                    reason=guard_reason,
-                    atr=current_atr,
-                    trend=trend,
-                    reason_code=str(orb_meta.get("reason_code") or ""),
-                    meta=orb_meta,
-                )
-
-            stop_loss = self.calculate_stop_loss(current_price, orb_candidate.atr)
-            take_profit = self.calculate_take_profit(current_price, orb_candidate.atr)
-
-            trade_logger.log_signal(
-                signal_type="BUY",
                 stock_code=stock_code,
-                price=current_price,
-                reason=orb_candidate.reason,
-            )
-
-            return TradingSignal(
-                signal_type=SignalType.BUY,
-                price=current_price,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                trailing_stop=stop_loss,
-                reason=orb_candidate.reason,
-                atr=orb_candidate.atr,
-                trend=trend,
-                meta=orb_meta,
+                stock_name=stock_name,
+                check_time=check_time,
             )
 
         trend_atr_setup = self.evaluate_trend_atr_setup_candidate(

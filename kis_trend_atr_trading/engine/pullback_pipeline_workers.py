@@ -12,6 +12,7 @@ import pandas as pd
 try:
     from config import settings
     from engine.pullback_pipeline_models import (
+        AuthoritativeEntryIntent,
         DailyContext,
         PullbackEntryIntent,
         PullbackSetupCandidate,
@@ -28,12 +29,14 @@ try:
     )
     from engine.strategy_pipeline_registry import StrategyRegistry
     from strategy.multiday_trend_atr import SignalType
+    from strategy.opening_range_breakout import ORBDecision, ORBCandidate
     from strategy.pullback_rebreakout import PullbackDecision
     from utils.logger import get_logger
     from utils.market_hours import KST
 except ImportError:
     from kis_trend_atr_trading.config import settings
     from kis_trend_atr_trading.engine.pullback_pipeline_models import (
+        AuthoritativeEntryIntent,
         DailyContext,
         PullbackEntryIntent,
         PullbackSetupCandidate,
@@ -49,6 +52,7 @@ except ImportError:
         EntryIntentQueue,
     )
     from kis_trend_atr_trading.engine.strategy_pipeline_registry import StrategyRegistry
+    from kis_trend_atr_trading.strategy.opening_range_breakout import ORBDecision, ORBCandidate
     from kis_trend_atr_trading.strategy.pullback_rebreakout import PullbackDecision
     from kis_trend_atr_trading.strategy.multiday_trend_atr import SignalType
     from kis_trend_atr_trading.utils.logger import get_logger
@@ -56,6 +60,16 @@ except ImportError:
 
 
 logger = get_logger("pullback_pipeline")
+
+
+def _strategy_queue_counts(entry_queue: EntryIntentQueue) -> dict[str, int]:
+    counts = {}
+    if entry_queue is None:
+        return counts
+    strategy_counts = getattr(entry_queue, "strategy_counts", None)
+    if callable(strategy_counts):
+        counts.update(dict(strategy_counts() or {}))
+    return counts
 
 
 class RiskSnapshotThread(threading.Thread):
@@ -765,6 +779,26 @@ class PullbackTimingWorker(threading.Thread):
             return None
         return self._strategy_registry.get("pullback_rebreakout")
 
+    def _should_use_authoritative_multi_strategy_queue(self) -> bool:
+        return bool(getattr(self._executor, "_is_multi_strategy_threaded_pipeline_enabled", lambda: False)())
+
+    def _update_queue_metrics(self) -> None:
+        strategy_counts = _strategy_queue_counts(self._entry_queue)
+        setattr(self._executor, "_pullback_intent_queue_depth", int(strategy_counts.get("pullback_rebreakout", 0) or 0))
+        setattr(self._executor, "_intent_queue_depth_by_strategy", strategy_counts)
+        setattr(self._executor, "_authoritative_intent_queue_depth", int(self._entry_queue.qsize()))
+        setattr(self._executor, "_authoritative_intent_queue_depth_by_strategy", strategy_counts)
+        mixed_tiebreak = getattr(self._entry_queue, "mixed_strategy_tiebreak_count", None)
+        if callable(mixed_tiebreak):
+            setattr(self._executor, "_mixed_strategy_tiebreak_count", int(mixed_tiebreak() or 0))
+
+    def _enqueue_authoritative_intent(self, intent: Any) -> bool:
+        queued = self._entry_queue.put_if_absent(intent)
+        self._update_queue_metrics()
+        if not queued:
+            setattr(self._executor, "_authoritative_intent_reject_reason", "duplicate_or_queue_full")
+        return queued
+
     def _process_shadow_strategy_timing(
         self,
         *,
@@ -834,6 +868,28 @@ class PullbackTimingWorker(threading.Thread):
             meta=dict(decision.meta or {}),
         )
         upsert_shadow_intent(strategy_tag, symbol, intent)
+        if not self._should_use_authoritative_multi_strategy_queue():
+            return
+        authoritative_payload = {
+            "strategy_entry_intent": intent,
+            "shadow_candidate": candidate,
+            "decision": decision,
+            "quote_snapshot": dict(quote_snapshot or {}),
+            "intraday_bars": list(intraday_bars or []),
+        }
+        authoritative_intent = AuthoritativeEntryIntent(
+            strategy_tag=strategy_tag,
+            symbol=str(symbol).zfill(6),
+            created_at=intent.created_at,
+            expires_at=intent.expires_at,
+            trade_date=str(intent.trade_date or ""),
+            entry_reference_price=float(intent.entry_reference_price or 0.0),
+            entry_reference_label=str(intent.entry_reference_label or "prev_high"),
+            native_payload=authoritative_payload,
+            source=str((decision.meta or {}).get("timing_source") or ""),
+            meta=dict(intent.meta or {}),
+        )
+        self._enqueue_authoritative_intent(authoritative_intent)
 
     def _process_symbol(self, symbol: str) -> None:
         candidate = self._candidate_store.get(symbol)
@@ -861,9 +917,7 @@ class PullbackTimingWorker(threading.Thread):
                         intraday_bars=intraday_bars,
                         has_pending_order=self._executor._has_active_pending_buy_order(),
                     )
-                    get_shadow_counts = getattr(self._executor, "get_strategy_shadow_counts", None)
-                    shadow_counts = get_shadow_counts() if callable(get_shadow_counts) else {"intents": {}}
-                    setattr(self._executor, "_intent_queue_depth_by_strategy", {"pullback_rebreakout": self._entry_queue.qsize(), **dict(shadow_counts.get("intents") or {})})
+                    self._update_queue_metrics()
             setattr(self._executor, "_pullback_timing_skip_reason", "no_candidate")
             return
 
@@ -942,8 +996,23 @@ class PullbackTimingWorker(threading.Thread):
                 **dict(decision.meta or {}),
             },
         )
-        queued = self._entry_queue.put_if_absent(intent)
-        setattr(self._executor, "_pullback_intent_queue_depth", self._entry_queue.qsize())
+        if self._should_use_authoritative_multi_strategy_queue():
+            authoritative_intent = AuthoritativeEntryIntent(
+                strategy_tag=intent.strategy_tag,
+                symbol=intent.symbol,
+                created_at=intent.created_at,
+                expires_at=intent.expires_at,
+                trade_date=intent.created_at.date().isoformat(),
+                entry_reference_price=float(intent.entry_reference_price or 0.0),
+                entry_reference_label=str((intent.meta or {}).get("entry_reference_label") or "pullback_intraday_high"),
+                native_payload=intent,
+                source=str(intent.source or ""),
+                meta=dict(intent.meta or {}),
+            )
+            queued = self._enqueue_authoritative_intent(authoritative_intent)
+        else:
+            queued = self._entry_queue.put_if_absent(intent)
+            self._update_queue_metrics()
         self._process_shadow_strategy_timing(
             strategy_tag="trend_atr",
             symbol=symbol,
@@ -960,9 +1029,7 @@ class PullbackTimingWorker(threading.Thread):
             intraday_bars=intraday_bars,
             has_pending_order=has_pending_order,
         )
-        get_shadow_counts = getattr(self._executor, "get_strategy_shadow_counts", None)
-        shadow_counts = get_shadow_counts() if callable(get_shadow_counts) else {"intents": {}}
-        setattr(self._executor, "_intent_queue_depth_by_strategy", {"pullback_rebreakout": self._entry_queue.qsize(), **dict(shadow_counts.get("intents") or {})})
+        self._update_queue_metrics()
         if not queued:
             setattr(self._executor, "_pullback_timing_skip_reason", "duplicate_or_queue_full")
             return
@@ -993,7 +1060,7 @@ class OrderExecutionWorker(threading.Thread):
 
     def run(self) -> None:
         while not self._stop_event.is_set():
-            intent: Optional[PullbackEntryIntent] = None
+            intent: Optional[Any] = None
             try:
                 intent = self._entry_queue.get(timeout=0.5)
             except queue.Empty:
@@ -1006,37 +1073,100 @@ class OrderExecutionWorker(threading.Thread):
             finally:
                 if intent is not None:
                     self._entry_queue.complete(intent)
-                    setattr(self._executor, "_pullback_intent_queue_depth", self._entry_queue.qsize())
+                    strategy_counts = _strategy_queue_counts(self._entry_queue)
+                    setattr(self._executor, "_pullback_intent_queue_depth", int(strategy_counts.get("pullback_rebreakout", 0) or 0))
+                    setattr(self._executor, "_intent_queue_depth_by_strategy", strategy_counts)
+                    setattr(self._executor, "_authoritative_intent_queue_depth", int(self._entry_queue.qsize()))
+                    setattr(self._executor, "_authoritative_intent_queue_depth_by_strategy", strategy_counts)
 
-    def _process_intent(self, intent: PullbackEntryIntent) -> None:
+    def _now(self) -> datetime:
+        return datetime.now(KST)
+
+    def _strategy_consumed(self, strategy_tag: str) -> None:
+        consumed = dict(getattr(self._executor, "_authoritative_intent_consumed_count_by_strategy", {}) or {})
+        consumed[strategy_tag] = int(consumed.get(strategy_tag, 0) or 0) + 1
+        setattr(self._executor, "_authoritative_intent_consumed_count_by_strategy", consumed)
+
+    def _record_reject(self, *, strategy_tag: str, symbol: str, reason: str, dedupe: bool = False) -> None:
+        setattr(self._executor, "_authoritative_intent_reject_reason", str(reason or ""))
+        if dedupe:
+            setattr(
+                self._executor,
+                "_mixed_strategy_dedupe_count",
+                int(getattr(self._executor, "_mixed_strategy_dedupe_count", 0) or 0) + 1,
+            )
+        logger.info(
+            "[ENTRY_REJECT] strategy_tag=%s symbol=%s reason=%s",
+            strategy_tag,
+            symbol,
+            reason,
+        )
+
+    def _remove_strategy_shadow_state(self, strategy_tag: str, symbol: str) -> None:
+        remove_candidate = getattr(self._executor, "remove_strategy_shadow_candidate", None)
+        remove_intent = getattr(self._executor, "remove_strategy_shadow_intent", None)
+        if callable(remove_candidate):
+            remove_candidate(strategy_tag, symbol)
+        if callable(remove_intent):
+            remove_intent(strategy_tag, symbol)
+
+    def _mark_completed(self, intent: Any, *, order_result: dict) -> None:
+        strategy_tag = str(getattr(intent, "strategy_tag", "") or "")
+        symbol = str(getattr(intent, "symbol", "") or "").zfill(6)
+        if strategy_tag == "pullback_rebreakout":
+            self._candidate_store.remove(symbol)
+        else:
+            self._remove_strategy_shadow_state(strategy_tag, symbol)
+        if order_result.get("success") or order_result.get("skipped"):
+            created_at = getattr(intent, "created_at", None)
+            native_payload = getattr(intent, "native_payload", None)
+            if isinstance(native_payload, PullbackEntryIntent):
+                created_at = native_payload.candidate_created_at
+            start_time = created_at if isinstance(created_at, datetime) else self._now()
+            elapsed_ms = max((self._now() - start_time).total_seconds() * 1000.0, 0.0)
+            setattr(self._executor, "_strategy_end_to_end_latency_ms", float(elapsed_ms))
+            if strategy_tag == "pullback_rebreakout":
+                setattr(self._executor, "_pullback_end_to_end_latency_ms", float(elapsed_ms))
+
+    def _common_precheck(self, intent: Any) -> tuple[bool, str]:
+        now = self._now()
+        expires_at = getattr(intent, "expires_at", None)
+        if isinstance(expires_at, datetime) and expires_at <= now:
+            return False, "intent_expired"
         if self._executor.strategy.has_position:
-            self._candidate_store.remove(intent.symbol)
-            return
-
+            return False, "existing_position"
         if self._executor._has_active_pending_buy_order():
-            self._candidate_store.remove(intent.symbol)
-            return
-
+            return False, "pending_order"
         if bool(getattr(self._executor, "cached_account_has_holding", lambda *_args, **_kwargs: False)(intent.symbol)):
-            self._candidate_store.remove(intent.symbol)
-            return
+            return False, "existing_holding"
+        return True, ""
 
+    def _extract_pullback_native_intent(self, intent: Any) -> PullbackEntryIntent:
+        if isinstance(intent, PullbackEntryIntent):
+            return intent
+        payload = getattr(intent, "native_payload", None)
+        if isinstance(payload, PullbackEntryIntent):
+            return payload
+        raise TypeError("pullback authoritative intent missing native payload")
+
+    def _execute_pullback_entry_intent(self, intent: Any) -> dict:
+        native_intent = self._extract_pullback_native_intent(intent)
         quote_snapshot = self._executor.fetch_quote_snapshot()
         current_price = float(quote_snapshot.get("current_price", 0.0) or 0.0)
         open_price = float(quote_snapshot.get("open_price", 0.0) or 0.0)
         if current_price <= 0:
-            return
-
+            return {"success": False, "reason": "invalid_current_price"}
         df = self._executor.fetch_market_data()
         if df is None or getattr(df, "empty", True):
-            return
+            return {"success": False, "reason": "missing_daily_data"}
+        df_with_indicators = self._executor.strategy.add_indicators(df)
 
         pullback_candidate = self._executor.strategy.pullback_strategy.evaluate(
-            df=df,
+            df=df_with_indicators,
             current_price=current_price,
-            stock_code=intent.symbol,
+            stock_code=native_intent.symbol,
             stock_name=str(quote_snapshot.get("stock_name") or ""),
-            check_time=datetime.now(KST),
+            check_time=self._now(),
             market_phase=getattr(self._executor, "market_phase_context", None),
             market_venue=getattr(self._executor, "market_venue_context", "KRX"),
             has_existing_position=self._executor.strategy.has_position,
@@ -1044,40 +1174,181 @@ class OrderExecutionWorker(threading.Thread):
             market_regime_snapshot=getattr(self._executor, "market_regime_snapshot", None),
         )
         if pullback_candidate.decision != PullbackDecision.BUY:
-            if pullback_candidate.decision == PullbackDecision.BLOCKED:
-                self._candidate_store.remove(intent.symbol)
-            return
+            return {
+                "success": False,
+                "reason": str(getattr(pullback_candidate, "reason_code", "") or getattr(pullback_candidate, "reason", "") or "pullback_not_buy"),
+                "blocked": pullback_candidate.decision == PullbackDecision.BLOCKED,
+            }
 
         signal = self._executor.strategy.build_pullback_buy_signal(
             pullback_candidate=pullback_candidate,
-            df_with_indicators=self._executor.strategy.add_indicators(df),
+            df_with_indicators=df_with_indicators,
+            current_price=current_price,
+            open_price=open_price,
+            stock_code=native_intent.symbol,
+            stock_name=str(quote_snapshot.get("stock_name") or ""),
+            check_time=self._now(),
+        )
+        if getattr(signal.signal_type, "value", signal.signal_type) != SignalType.BUY.value:
+            return {"success": False, "reason": str(getattr(signal, "reason_code", "") or getattr(signal, "reason", "") or "pullback_guard_block")}
+
+        signal.meta = dict(getattr(signal, "meta", {}) or {})
+        signal.meta.setdefault("strategy_tag", "pullback_rebreakout")
+        signal.meta["timing_source"] = native_intent.source
+        signal.meta["entry_reference_price"] = float(native_intent.entry_reference_price or 0.0)
+        signal.meta["entry_reference_label"] = "pullback_intraday_high"
+        signal.meta["pipeline_intent_created_at"] = native_intent.created_at.isoformat()
+        setattr(self._executor, "_authoritative_order_handoff_path", "pullback")
+        return dict(self._executor.execute_buy(signal) or {})
+
+    def _execute_trend_atr_entry_intent(self, intent: AuthoritativeEntryIntent) -> dict:
+        quote_snapshot = self._executor.fetch_quote_snapshot()
+        current_price = float(quote_snapshot.get("current_price", 0.0) or 0.0)
+        open_price = float(quote_snapshot.get("open_price", 0.0) or 0.0)
+        if current_price <= 0:
+            return {"success": False, "reason": "invalid_current_price"}
+        df = self._executor.fetch_market_data()
+        if df is None or getattr(df, "empty", True):
+            return {"success": False, "reason": "missing_daily_data"}
+        setup_result = self._executor.strategy.evaluate_trend_atr_setup_candidate(
+            df=df,
             current_price=current_price,
             open_price=open_price,
             stock_code=intent.symbol,
             stock_name=str(quote_snapshot.get("stock_name") or ""),
-            check_time=datetime.now(KST),
+            check_time=self._now(),
+            market_regime_snapshot=getattr(self._executor, "market_regime_snapshot", None),
+        )
+        if not bool(setup_result.get("can_enter", False)):
+            return {
+                "success": False,
+                "reason": str(setup_result.get("meta", {}).get("reason_code") or setup_result.get("reason") or "trend_atr_not_buy"),
+            }
+        signal = self._executor.strategy.build_trend_atr_buy_signal(
+            current_price=current_price,
+            entry_reason=str(setup_result.get("reason") or ""),
+            entry_atr=float(setup_result.get("atr", 0.0) or 0.0),
+            entry_meta=dict(setup_result.get("meta") or {}),
+            df_with_indicators=setup_result.get("df_with_indicators"),
         )
         if getattr(signal.signal_type, "value", signal.signal_type) != SignalType.BUY.value:
+            return {"success": False, "reason": str(getattr(signal, "reason_code", "") or getattr(signal, "reason", "") or "trend_atr_guard_block")}
+        signal.meta = dict(getattr(signal, "meta", {}) or {})
+        signal.meta["pipeline_intent_created_at"] = intent.created_at.isoformat()
+        setattr(self._executor, "_authoritative_order_handoff_path", "trend_atr")
+        return dict(self._executor.execute_buy(signal) or {})
+
+    def _execute_orb_entry_intent(self, intent: AuthoritativeEntryIntent) -> dict:
+        quote_snapshot = self._executor.fetch_quote_snapshot()
+        current_price = float(quote_snapshot.get("current_price", 0.0) or 0.0)
+        open_price = float(quote_snapshot.get("open_price", 0.0) or 0.0)
+        if current_price <= 0:
+            return {"success": False, "reason": "invalid_current_price"}
+        df = self._executor.fetch_market_data()
+        if df is None or getattr(df, "empty", True):
+            return {"success": False, "reason": "missing_daily_data"}
+        df_with_indicators = self._executor.strategy.add_indicators(df)
+        intraday_provider_ready = bool(
+            getattr(self._executor, "is_cached_intraday_provider_ready", lambda: False)()
+        )
+        intraday_bars = list(getattr(self._executor, "fetch_cached_intraday_bars_if_available", lambda n=120: [])(120) or [])
+        orb_candidate, terminal = self._executor.strategy.orb_strategy.evaluate_setup_candidate(
+            df=df_with_indicators,
+            current_price=current_price,
+            open_price=open_price,
+            intraday_bars=intraday_bars,
+            stock_code=intent.symbol,
+            stock_name=str(quote_snapshot.get("stock_name") or ""),
+            check_time=self._now(),
+            market_phase=getattr(self._executor, "market_phase_context", None),
+            market_venue=getattr(self._executor, "market_venue_context", "KRX"),
+            has_existing_position=self._executor.strategy.has_position,
+            has_pending_order=self._executor._has_active_pending_buy_order(),
+            market_regime_snapshot=getattr(self._executor, "market_regime_snapshot", None),
+            intraday_provider_ready=intraday_provider_ready,
+        )
+        if orb_candidate is None:
+            return {
+                "success": False,
+                "reason": str(getattr(terminal, "reason_code", "") or getattr(terminal, "reason", "") or "orb_not_buy"),
+            }
+        timing_decision = self._executor.strategy.orb_strategy.confirm_timing(
+            candidate=orb_candidate,
+            current_price=current_price,
+            intraday_bars=intraday_bars,
+            stock_code=intent.symbol,
+            stock_name=str(quote_snapshot.get("stock_name") or ""),
+            check_time=self._now(),
+            market_phase=getattr(self._executor, "market_phase_context", None),
+            market_venue=getattr(self._executor, "market_venue_context", "KRX"),
+            has_existing_position=self._executor.strategy.has_position,
+            has_pending_order=self._executor._has_active_pending_buy_order(),
+            intraday_provider_ready=intraday_provider_ready,
+        )
+        orb_state = str(
+            (timing_decision.meta or {}).get("intraday_source_state", (orb_candidate.meta or {}).get("intraday_source_state", "missing"))
+            or "missing"
+        )
+        setattr(self._executor, "_orb_intraday_source_state", orb_state)
+        if not bool(timing_decision.should_emit_intent):
+            return {"success": False, "reason": str(timing_decision.reason_code or timing_decision.reason or "orb_timing_block")}
+        orb_buy_candidate = ORBCandidate(
+            decision=ORBDecision.BUY,
+            reason=str(timing_decision.reason or ""),
+            reason_code=str(timing_decision.reason_code or ""),
+            atr=float(orb_candidate.atr or 0.0),
+            trigger_price=float(timing_decision.entry_reference_price or orb_candidate.opening_range_high or 0.0),
+            meta={**dict(orb_candidate.meta or {}), **dict(timing_decision.meta or {})},
+        )
+        signal = self._executor.strategy.build_orb_buy_signal(
+            orb_candidate=orb_buy_candidate,
+            df_with_indicators=df_with_indicators,
+            current_price=current_price,
+            open_price=open_price,
+            stock_code=intent.symbol,
+            stock_name=str(quote_snapshot.get("stock_name") or ""),
+            check_time=self._now(),
+        )
+        if getattr(signal.signal_type, "value", signal.signal_type) != SignalType.BUY.value:
+            return {"success": False, "reason": str(getattr(signal, "reason_code", "") or getattr(signal, "reason", "") or "orb_guard_block")}
+        signal.meta = dict(getattr(signal, "meta", {}) or {})
+        signal.meta["pipeline_intent_created_at"] = intent.created_at.isoformat()
+        setattr(self._executor, "_authoritative_order_handoff_path", "opening_range_breakout")
+        return dict(self._executor.execute_buy(signal) or {})
+
+    def _dispatch_intent(self, intent: Any) -> dict:
+        strategy_tag = str(getattr(intent, "strategy_tag", "") or "")
+        if strategy_tag == "pullback_rebreakout":
+            return self._execute_pullback_entry_intent(intent)
+        if isinstance(intent, AuthoritativeEntryIntent) and strategy_tag == "trend_atr":
+            return self._execute_trend_atr_entry_intent(intent)
+        if isinstance(intent, AuthoritativeEntryIntent) and strategy_tag == "opening_range_breakout":
+            return self._execute_orb_entry_intent(intent)
+        return {"success": False, "reason": "unsupported_strategy"}
+
+    def _process_intent(self, intent: Any) -> None:
+        strategy_tag = str(getattr(intent, "strategy_tag", "") or "")
+        symbol = str(getattr(intent, "symbol", "") or "").zfill(6)
+        allowed, reason = self._common_precheck(intent)
+        if not allowed:
+            self._record_reject(
+                strategy_tag=strategy_tag,
+                symbol=symbol,
+                reason=reason,
+                dedupe=reason in {"existing_position", "pending_order", "existing_holding"},
+            )
+            if strategy_tag == "pullback_rebreakout":
+                self._candidate_store.remove(symbol)
+            else:
+                self._remove_strategy_shadow_state(strategy_tag, symbol)
             return
 
-        signal.meta = dict(getattr(signal, "meta", {}) or {})
-        signal.meta.setdefault("strategy_tag", "pullback_rebreakout")
-        signal.meta["timing_source"] = intent.source
-        signal.meta["entry_reference_price"] = float(intent.entry_reference_price or 0.0)
-        signal.meta["entry_reference_label"] = "pullback_intraday_high"
-        signal.meta["pipeline_intent_created_at"] = intent.created_at.isoformat()
-        started = time.perf_counter()
-        order_result = self._executor.execute_buy(signal)
-        elapsed_ms = (time.perf_counter() - started) * 1000.0
-        setattr(
-            self._executor,
-            "_pullback_end_to_end_latency_ms",
-            max((datetime.now(KST) - intent.candidate_created_at).total_seconds() * 1000.0, elapsed_ms),
-        )
-        setattr(
-            self._executor,
-            "_strategy_end_to_end_latency_ms",
-            float(getattr(self._executor, "_pullback_end_to_end_latency_ms", 0.0) or 0.0),
-        )
-        if order_result.get("success") or order_result.get("skipped"):
-            self._candidate_store.remove(intent.symbol)
+        self._strategy_consumed(strategy_tag)
+        order_result = self._dispatch_intent(intent)
+        if not bool(order_result.get("success") or order_result.get("skipped")):
+            self._record_reject(
+                strategy_tag=strategy_tag,
+                symbol=symbol,
+                reason=str(order_result.get("reason") or order_result.get("message") or "handoff_rejected"),
+            )
+        self._mark_completed(intent, order_result=order_result)

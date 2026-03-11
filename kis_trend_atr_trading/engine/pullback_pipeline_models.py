@@ -109,6 +109,29 @@ class StrategyEntryIntent:
     meta: Dict[str, Any] = field(default_factory=dict)
     schema_version: str = "v1"
 
+    @property
+    def intent_key(self) -> str:
+        return f"{self.strategy_tag}:{self.symbol}"
+
+
+@dataclass(frozen=True)
+class AuthoritativeEntryIntent:
+    strategy_tag: str
+    symbol: str
+    created_at: datetime
+    expires_at: datetime
+    trade_date: str
+    entry_reference_price: float
+    entry_reference_label: str
+    native_payload: Any
+    source: str = ""
+    meta: Dict[str, Any] = field(default_factory=dict)
+    schema_version: str = "v1"
+
+    @property
+    def intent_key(self) -> str:
+        return f"{self.strategy_tag}:{self.symbol}"
+
 
 def _trade_date_from_datetime(value: datetime) -> str:
     return value.date().isoformat() if isinstance(value, datetime) else ""

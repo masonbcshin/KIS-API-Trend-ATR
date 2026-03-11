@@ -14,6 +14,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import engine.multiday_executor as multiday_executor
 from engine.pullback_pipeline_models import (
+    AuthoritativeEntryIntent,
     AccountRiskSnapshot,
     HoldingsRiskSnapshot,
     PullbackEntryIntent,
@@ -22,6 +23,7 @@ from engine.pullback_pipeline_models import (
 from engine.pullback_pipeline_stores import AccountRiskStore, ArmedCandidateStore, EntryIntentQueue
 from engine.pullback_pipeline_workers import OrderExecutionWorker
 from engine.multiday_executor import MultidayExecutor
+from strategy.opening_range_breakout import ORBSetupCandidate, ORBTimingDecision
 from strategy.multiday_trend_atr import TradingSignal, SignalType, TrendType
 from strategy.pullback_rebreakout import PullbackCandidate, PullbackDecision
 from utils.market_hours import KST
@@ -48,6 +50,11 @@ def _make_buy_signal(prev_high: float = 50000.0, strategy_tag: str = "trend_atr"
             "strategy_tag": strategy_tag,
         },
     )
+
+
+def _future_kst(minutes: int = 30) -> datetime:
+    now = datetime.now(KST)
+    return now.replace(second=0, microsecond=0) + pd.Timedelta(minutes=minutes)
 
 
 def _make_account_snapshot(
@@ -323,6 +330,174 @@ class _OrderWorkerExecutorStub:
         return {"success": True, "signal_price": signal.price}
 
 
+class _ORBStrategyStub:
+    def evaluate_setup_candidate(
+        self,
+        *,
+        df,
+        current_price,
+        open_price,
+        intraday_bars,
+        stock_code,
+        stock_name="",
+        check_time=None,
+        market_phase=None,
+        market_venue=None,
+        has_existing_position=False,
+        has_pending_order=False,
+        market_regime_snapshot=None,
+        intraday_provider_ready=True,
+    ):
+        if not intraday_provider_ready:
+            terminal = SimpleNamespace(
+                reason="orb_intraday_unsupported",
+                reason_code="orb_intraday_unsupported",
+                meta={"intraday_source_state": "unsupported"},
+            )
+            return None, terminal
+        if not intraday_bars:
+            terminal = SimpleNamespace(
+                reason="orb_intraday_missing",
+                reason_code="orb_intraday_missing",
+                meta={"intraday_source_state": "missing"},
+            )
+            return None, terminal
+        now = check_time or KST.localize(datetime(2026, 2, 20, 9, 31))
+        return ORBSetupCandidate(
+            symbol=str(stock_code).zfill(6),
+            strategy_tag="opening_range_breakout",
+            created_at=now,
+            expires_at=now.replace(hour=10, minute=30),
+            opening_range_high=50750.0,
+            opening_range_low=50300.0,
+            atr=2.0,
+            source="orb_setup",
+            meta={
+                "strategy_tag": "opening_range_breakout",
+                "entry_reference_price": 50750.0,
+                "entry_reference_label": "opening_range_high",
+                "intraday_source_state": "fresh",
+            },
+        ), None
+
+    def confirm_timing(
+        self,
+        *,
+        candidate,
+        current_price,
+        intraday_bars,
+        stock_code,
+        stock_name="",
+        check_time=None,
+        market_phase=None,
+        market_venue=None,
+        has_existing_position=False,
+        has_pending_order=False,
+        intraday_provider_ready=True,
+    ):
+        if not intraday_provider_ready:
+            return ORBTimingDecision(
+                should_emit_intent=False,
+                reason="orb_intraday_unsupported",
+                reason_code="orb_intraday_unsupported",
+                timing_source="intraday_unavailable",
+                entry_reference_price=float(candidate.opening_range_high),
+                meta={"intraday_source_state": "unsupported"},
+            )
+        return ORBTimingDecision(
+            should_emit_intent=True,
+            reason="orb breakout",
+            reason_code="",
+            timing_source="intraday_orb",
+            entry_reference_price=float(candidate.opening_range_high),
+            meta={
+                "intraday_source_state": "fresh",
+                "entry_reference_price": float(candidate.opening_range_high),
+                "entry_reference_label": "opening_range_high",
+            },
+        )
+
+
+class _MultiStrategyOrderWorkerStrategyStub(_OrderWorkerStrategyStub):
+    def __init__(self):
+        super().__init__()
+        self.orb_strategy = _ORBStrategyStub()
+
+    def evaluate_trend_atr_setup_candidate(
+        self,
+        *,
+        df,
+        current_price,
+        open_price=None,
+        stock_code="",
+        stock_name="",
+        check_time=None,
+        market_regime_snapshot=None,
+    ):
+        return {
+            "can_enter": True,
+            "reason": "trend breakout",
+            "atr": 2.0,
+            "meta": {
+                "strategy_tag": "trend_atr",
+                "entry_reference_price": 50000.0,
+                "entry_reference_label": "prev_high",
+                "extension_pct": 0.002,
+            },
+            "df_with_indicators": df,
+        }
+
+    def build_trend_atr_buy_signal(self, **_kwargs):
+        return TradingSignal(
+            signal_type=SignalType.BUY,
+            price=50100.0,
+            atr=2.0,
+            trend=TrendType.UPTREND,
+            reason="trend atr threaded",
+            meta={"strategy_tag": "trend_atr"},
+        )
+
+    def build_orb_buy_signal(self, **_kwargs):
+        return TradingSignal(
+            signal_type=SignalType.BUY,
+            price=50900.0,
+            atr=2.0,
+            trend=TrendType.UPTREND,
+            reason="orb threaded",
+            meta={"strategy_tag": "opening_range_breakout"},
+        )
+
+
+class _MultiStrategyOrderWorkerExecutorStub(_OrderWorkerExecutorStub):
+    def __init__(self):
+        super().__init__()
+        self.strategy = _MultiStrategyOrderWorkerStrategyStub()
+        self._provider_ready = True
+        self._intraday_bars = [
+            {
+                "start_at": KST.localize(datetime(2026, 2, 20, 9, 0)),
+                "open": 50500.0,
+                "high": 50750.0,
+                "low": 50300.0,
+                "close": 50600.0,
+                "volume": 1000,
+            }
+        ]
+        self.last_signal = None
+
+    def is_cached_intraday_provider_ready(self):
+        return self._provider_ready
+
+    def fetch_cached_intraday_bars_if_available(self, n: int = 120):
+        return list(self._intraday_bars)
+
+    def execute_buy(self, signal):
+        self.execute_buy_calls += 1
+        self.last_signal = signal
+        self.strategy.has_position = True
+        return {"success": True, "signal_price": signal.price}
+
+
 def test_order_worker_single_dispatches_pullback_entry_intent_once():
     executor = _OrderWorkerExecutorStub()
     store = ArmedCandidateStore()
@@ -334,11 +509,14 @@ def test_order_worker_single_dispatches_pullback_entry_intent_once():
         stop_event=threading.Event(),
         on_error=lambda *_args: None,
     )
+    created_at = _future_kst(30)
+    candidate_created_at = _future_kst(0)
+    expires_at = _future_kst(120)
     candidate = PullbackSetupCandidate(
         symbol="005930",
         strategy_tag="pullback_rebreakout",
-        created_at=KST.localize(datetime(2026, 2, 20, 10, 0)),
-        expires_at=KST.localize(datetime(2026, 2, 20, 12, 0)),
+        created_at=candidate_created_at,
+        expires_at=expires_at,
         context_version="ctx-1",
         swing_high=180.5,
         swing_low=170.0,
@@ -351,7 +529,7 @@ def test_order_worker_single_dispatches_pullback_entry_intent_once():
     first_intent = PullbackEntryIntent(
         symbol="005930",
         strategy_tag="pullback_rebreakout",
-        created_at=KST.localize(datetime(2026, 2, 20, 10, 30)),
+        created_at=created_at,
         candidate_created_at=candidate.created_at,
         expires_at=candidate.expires_at,
         context_version="ctx-1",
@@ -361,7 +539,7 @@ def test_order_worker_single_dispatches_pullback_entry_intent_once():
     duplicate_intent = PullbackEntryIntent(
         symbol="005930",
         strategy_tag="pullback_rebreakout",
-        created_at=KST.localize(datetime(2026, 2, 20, 10, 31)),
+        created_at=created_at + pd.Timedelta(minutes=1),
         candidate_created_at=candidate.created_at,
         expires_at=candidate.expires_at,
         context_version="ctx-1",
@@ -519,3 +697,213 @@ def test_order_final_validation_feature_flag_off_preserves_existing_behavior():
         result = executor._run_order_final_validation(_make_buy_signal(strategy_tag="pullback_rebreakout"))
 
     assert result["allowed"] is True
+
+
+def test_authoritative_queue_envelope_preserves_native_payload_losslessly():
+    created_at = _future_kst(30)
+    native_intent = PullbackEntryIntent(
+        symbol="005930",
+        strategy_tag="pullback_rebreakout",
+        created_at=created_at,
+        candidate_created_at=_future_kst(0),
+        expires_at=_future_kst(120),
+        context_version="ctx-1",
+        entry_reference_price=174.5,
+        source="intraday",
+        current_price=175.2,
+        meta={"entry_reference_label": "pullback_intraday_high"},
+    )
+    envelope = AuthoritativeEntryIntent(
+        strategy_tag="pullback_rebreakout",
+        symbol="005930",
+        created_at=native_intent.created_at,
+        expires_at=native_intent.expires_at,
+        trade_date="2026-02-20",
+        entry_reference_price=174.5,
+        entry_reference_label="pullback_intraday_high",
+        native_payload=native_intent,
+        source="intraday",
+    )
+    queue = EntryIntentQueue(maxsize=8)
+
+    assert queue.put_if_absent(envelope) is True
+    queued = queue.get(timeout=0.1)
+    try:
+        assert queued.native_payload is native_intent
+        assert queued.native_payload.context_version == "ctx-1"
+        assert queued.native_payload.current_price == 175.2
+    finally:
+        queue.complete(queued)
+
+
+def test_order_worker_authoritative_dispatches_trend_atr_via_native_handoff():
+    executor = _MultiStrategyOrderWorkerExecutorStub()
+    store = ArmedCandidateStore()
+    queue = EntryIntentQueue(maxsize=8)
+    worker = OrderExecutionWorker(
+        executor=executor,
+        candidate_store=store,
+        entry_queue=queue,
+        stop_event=threading.Event(),
+        on_error=lambda *_args: None,
+    )
+    intent = AuthoritativeEntryIntent(
+        strategy_tag="trend_atr",
+        symbol="005930",
+        created_at=_future_kst(30),
+        expires_at=_future_kst(120),
+        trade_date=_future_kst(30).date().isoformat(),
+        entry_reference_price=50000.0,
+        entry_reference_label="prev_high",
+        native_payload={"native_setup": {"strategy_tag": "trend_atr"}},
+        source="registry_authoritative",
+    )
+
+    worker._process_intent(intent)
+
+    assert executor.execute_buy_calls == 1
+    assert executor.last_signal.meta["strategy_tag"] == "trend_atr"
+    assert executor._authoritative_order_handoff_path == "trend_atr"
+
+
+def test_order_worker_authoritative_dispatches_orb_via_native_handoff():
+    executor = _MultiStrategyOrderWorkerExecutorStub()
+    store = ArmedCandidateStore()
+    queue = EntryIntentQueue(maxsize=8)
+    worker = OrderExecutionWorker(
+        executor=executor,
+        candidate_store=store,
+        entry_queue=queue,
+        stop_event=threading.Event(),
+        on_error=lambda *_args: None,
+    )
+    intent = AuthoritativeEntryIntent(
+        strategy_tag="opening_range_breakout",
+        symbol="005930",
+        created_at=_future_kst(5),
+        expires_at=_future_kst(90),
+        trade_date=_future_kst(5).date().isoformat(),
+        entry_reference_price=50750.0,
+        entry_reference_label="opening_range_high",
+        native_payload={"native_setup": {"strategy_tag": "opening_range_breakout"}},
+        source="intraday_orb",
+    )
+
+    worker._process_intent(intent)
+
+    assert executor.execute_buy_calls == 1
+    assert executor.last_signal.meta["strategy_tag"] == "opening_range_breakout"
+    assert executor._authoritative_order_handoff_path == "opening_range_breakout"
+
+
+def test_order_worker_rejects_orb_authoritative_intent_when_intraday_is_unsupported():
+    executor = _MultiStrategyOrderWorkerExecutorStub()
+    executor._provider_ready = False
+    executor._intraday_bars = []
+    store = ArmedCandidateStore()
+    queue = EntryIntentQueue(maxsize=8)
+    worker = OrderExecutionWorker(
+        executor=executor,
+        candidate_store=store,
+        entry_queue=queue,
+        stop_event=threading.Event(),
+        on_error=lambda *_args: None,
+    )
+    intent = AuthoritativeEntryIntent(
+        strategy_tag="opening_range_breakout",
+        symbol="005930",
+        created_at=_future_kst(5),
+        expires_at=_future_kst(90),
+        trade_date=_future_kst(5).date().isoformat(),
+        entry_reference_price=50750.0,
+        entry_reference_label="opening_range_high",
+        native_payload={"native_setup": {"strategy_tag": "opening_range_breakout"}},
+        source="intraday_orb",
+    )
+
+    worker._process_intent(intent)
+
+    assert executor.execute_buy_calls == 0
+    assert executor._authoritative_intent_reject_reason == "orb_intraday_unsupported"
+
+
+def test_mixed_strategy_authoritative_queue_uses_deterministic_tiebreak_and_consume_time_dedupe():
+    executor = _MultiStrategyOrderWorkerExecutorStub()
+    store = ArmedCandidateStore()
+    queue = EntryIntentQueue(maxsize=8)
+    worker = OrderExecutionWorker(
+        executor=executor,
+        candidate_store=store,
+        entry_queue=queue,
+        stop_event=threading.Event(),
+        on_error=lambda *_args: None,
+    )
+    candidate_created_at = _future_kst(0)
+    expires_at = _future_kst(120)
+    candidate = PullbackSetupCandidate(
+        symbol="005930",
+        strategy_tag="pullback_rebreakout",
+        created_at=candidate_created_at,
+        expires_at=expires_at,
+        context_version="ctx-1",
+        swing_high=180.5,
+        swing_low=170.0,
+        micro_high=174.5,
+        atr=2.0,
+        source="daily_setup",
+    )
+    store.upsert(candidate)
+    created_at = _future_kst(30)
+    pullback_native = PullbackEntryIntent(
+        symbol="005930",
+        strategy_tag="pullback_rebreakout",
+        created_at=created_at,
+        candidate_created_at=candidate.created_at,
+        expires_at=candidate.expires_at,
+        context_version="ctx-1",
+        entry_reference_price=174.5,
+        source="intraday",
+        meta={"entry_reference_label": "pullback_intraday_high"},
+    )
+    pullback_envelope = AuthoritativeEntryIntent(
+        strategy_tag="pullback_rebreakout",
+        symbol="005930",
+        created_at=created_at,
+        expires_at=candidate.expires_at,
+        trade_date=created_at.date().isoformat(),
+        entry_reference_price=174.5,
+        entry_reference_label="pullback_intraday_high",
+        native_payload=pullback_native,
+        source="intraday",
+    )
+    trend_envelope = AuthoritativeEntryIntent(
+        strategy_tag="trend_atr",
+        symbol="005930",
+        created_at=created_at,
+        expires_at=expires_at,
+        trade_date=created_at.date().isoformat(),
+        entry_reference_price=50000.0,
+        entry_reference_label="prev_high",
+        native_payload={"native_setup": {"strategy_tag": "trend_atr"}},
+        source="registry_authoritative",
+    )
+
+    assert queue.put_if_absent(trend_envelope) is True
+    assert queue.put_if_absent(pullback_envelope) is True
+    first = queue.get(timeout=0.1)
+    try:
+        worker._process_intent(first)
+    finally:
+        queue.complete(first)
+    second = queue.get(timeout=0.1)
+    try:
+        worker._process_intent(second)
+    finally:
+        queue.complete(second)
+
+    assert first.strategy_tag == "pullback_rebreakout"
+    assert executor.execute_buy_calls == 1
+    assert executor.last_signal.meta["strategy_tag"] == "pullback_rebreakout"
+    assert queue.mixed_strategy_tiebreak_count() == 1
+    assert executor._mixed_strategy_dedupe_count >= 1
+    assert executor._authoritative_intent_reject_reason == "existing_position"

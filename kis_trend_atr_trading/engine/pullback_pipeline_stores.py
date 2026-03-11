@@ -5,7 +5,7 @@ from dataclasses import replace
 from datetime import datetime
 import queue
 import threading
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from engine.pullback_pipeline_models import (
@@ -144,34 +144,85 @@ class DirtySymbolSet:
 
 class EntryIntentQueue:
     def __init__(self, maxsize: int = 256) -> None:
-        self._queue: queue.Queue[PullbackEntryIntent] = queue.Queue(maxsize=max(int(maxsize), 1))
+        self._queue: queue.PriorityQueue[tuple[tuple[Any, ...], int, Any]] = queue.PriorityQueue(
+            maxsize=max(int(maxsize), 1)
+        )
         self._lock = threading.Lock()
         self._active_keys: set[str] = set()
+        self._enqueue_seq: int = 0
+        self._mixed_strategy_tiebreak_count: int = 0
 
-    def put_if_absent(self, intent: PullbackEntryIntent) -> bool:
+    @staticmethod
+    def _strategy_rank(strategy_tag: str) -> int:
+        rank_map = {
+            "pullback_rebreakout": 0,
+            "trend_atr": 1,
+            "opening_range_breakout": 2,
+        }
+        return int(rank_map.get(str(strategy_tag or "").strip(), 99))
+
+    @staticmethod
+    def _intent_priority(intent: Any) -> tuple[Any, ...]:
+        created_at = getattr(intent, "created_at", None)
+        if not isinstance(created_at, datetime):
+            created_at = datetime.max
+        return (
+            created_at,
+            EntryIntentQueue._strategy_rank(str(getattr(intent, "strategy_tag", "") or "")),
+        )
+
+    def _has_other_strategy_for_symbol(self, *, symbol: str, strategy_tag: str) -> bool:
+        target_symbol = str(symbol).zfill(6)
+        for key in self._active_keys:
+            active_strategy, _, active_symbol = key.partition(":")
+            if active_symbol == target_symbol and active_strategy != str(strategy_tag or "").strip():
+                return True
+        return False
+
+    def put_if_absent(self, intent: Any) -> bool:
         key = intent.intent_key
         with self._lock:
             if key in self._active_keys:
                 return False
+            if self._has_other_strategy_for_symbol(
+                symbol=getattr(intent, "symbol", ""),
+                strategy_tag=getattr(intent, "strategy_tag", ""),
+            ):
+                self._mixed_strategy_tiebreak_count += 1
             self._active_keys.add(key)
+            self._enqueue_seq += 1
+            enqueue_seq = self._enqueue_seq
         try:
-            self._queue.put_nowait(intent)
+            self._queue.put_nowait((self._intent_priority(intent), enqueue_seq, intent))
             return True
         except queue.Full:
             with self._lock:
                 self._active_keys.discard(key)
             return False
 
-    def get(self, timeout: float = 0.5) -> PullbackEntryIntent:
-        return self._queue.get(timeout=timeout)
+    def get(self, timeout: float = 0.5) -> Any:
+        _, _, intent = self._queue.get(timeout=timeout)
+        return intent
 
-    def complete(self, intent: PullbackEntryIntent) -> None:
+    def complete(self, intent: Any) -> None:
         with self._lock:
             self._active_keys.discard(intent.intent_key)
         self._queue.task_done()
 
     def qsize(self) -> int:
         return self._queue.qsize()
+
+    def strategy_counts(self) -> Dict[str, int]:
+        with self._lock:
+            counts: Dict[str, int] = {}
+            for key in self._active_keys:
+                strategy_tag, _, _symbol = key.partition(":")
+                counts[strategy_tag] = counts.get(strategy_tag, 0) + 1
+            return counts
+
+    def mixed_strategy_tiebreak_count(self) -> int:
+        with self._lock:
+            return int(self._mixed_strategy_tiebreak_count)
 
 
 class AccountRiskStore:

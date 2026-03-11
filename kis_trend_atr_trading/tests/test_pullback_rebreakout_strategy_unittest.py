@@ -1346,7 +1346,7 @@ def test_trend_atr_registry_adapter_blocked_setup_matches_legacy_hold_semantics(
     assert "돌파" in evaluation.skip_reason
 
 
-def test_trend_atr_registry_shadow_routing_keeps_order_path_legacy_and_read_only():
+def test_trend_atr_registry_shadow_routing_enqueues_authoritative_intent_without_changing_order_worker_ssot():
     executor = MultidayExecutor.__new__(MultidayExecutor)
     executor.stock_code = "005930"
     executor.strategy = MultidayTrendATRStrategy()
@@ -1358,6 +1358,7 @@ def test_trend_atr_registry_shadow_routing_keeps_order_path_legacy_and_read_only
     executor._strategy_shadow_candidates = {}
     executor._strategy_shadow_intents = {}
     executor._trend_atr_adapter_path_used = False
+    executor._is_multi_strategy_threaded_pipeline_enabled = lambda: True
     executor._pullback_threaded_context_version = ""
     executor._pullback_daily_context_version = ""
     executor._pullback_setup_skip_reason = ""
@@ -1425,11 +1426,12 @@ def test_trend_atr_registry_shadow_routing_keeps_order_path_legacy_and_read_only
     assert trend_candidate.strategy_tag == "trend_atr"
     assert trend_intent is not None
     assert trend_intent.strategy_tag == "trend_atr"
-    assert entry_queue.qsize() == 1
+    assert entry_queue.strategy_counts()["pullback_rebreakout"] == 1
+    assert entry_queue.strategy_counts()["trend_atr"] == 1
     assert executor._trend_atr_adapter_path_used is True
 
 
-def test_multi_strategy_registry_shadow_routing_keeps_orb_intent_non_authoritative_and_read_only():
+def test_multi_strategy_registry_shadow_routing_enqueues_orb_authoritative_intent_without_generic_order_path():
     executor = MultidayExecutor.__new__(MultidayExecutor)
     executor.stock_code = "005930"
     executor.strategy = MultidayTrendATRStrategy()
@@ -1443,6 +1445,7 @@ def test_multi_strategy_registry_shadow_routing_keeps_orb_intent_non_authoritati
     executor._trend_atr_adapter_path_used = False
     executor._orb_adapter_path_used = False
     executor._orb_intraday_source_state = "missing"
+    executor._is_multi_strategy_threaded_pipeline_enabled = lambda: True
     executor._pullback_threaded_context_version = ""
     executor._pullback_daily_context_version = ""
     executor._pullback_setup_skip_reason = ""
@@ -1553,9 +1556,102 @@ def test_multi_strategy_registry_shadow_routing_keeps_orb_intent_non_authoritati
     assert orb_candidate.strategy_tag == "opening_range_breakout"
     assert orb_intent is not None
     assert orb_intent.strategy_tag == "opening_range_breakout"
-    assert entry_queue.qsize() == 1
+    assert entry_queue.strategy_counts()["pullback_rebreakout"] == 1
+    assert entry_queue.strategy_counts()["trend_atr"] == 1
+    assert entry_queue.strategy_counts()["opening_range_breakout"] == 1
     assert executor._orb_adapter_path_used is True
     assert executor._orb_intraday_source_state == "fresh"
+
+
+def test_orb_authoritative_intent_is_not_enqueued_when_intraday_provider_is_unsupported():
+    executor = MultidayExecutor.__new__(MultidayExecutor)
+    executor.stock_code = "005930"
+    executor.strategy = MultidayTrendATRStrategy()
+    executor.market_phase_context = VenueMarketPhase.KRX_CONTINUOUS
+    executor.market_venue_context = "KRX"
+    executor.market_regime_snapshot = object()
+    executor._market_regime_worker_error_state = ""
+    executor._strategy_shadow_state_lock = threading.Lock()
+    executor._strategy_shadow_candidates = {}
+    executor._strategy_shadow_intents = {}
+    executor._trend_atr_adapter_path_used = False
+    executor._orb_adapter_path_used = False
+    executor._orb_intraday_source_state = "missing"
+    executor._is_multi_strategy_threaded_pipeline_enabled = lambda: True
+    executor._pullback_threaded_context_version = ""
+    executor._pullback_daily_context_version = ""
+    executor._pullback_setup_skip_reason = ""
+    executor._pullback_timing_skip_reason = ""
+    executor._candidate_store_size_by_strategy = {}
+    executor._intent_queue_depth_by_strategy = {}
+    decision_time = _kst_dt(2026, 2, 20, 9, 31)
+    prepared_df = _make_pullback_indicator_df()
+    prev_high = float(prepared_df.iloc[-1]["prev_high"])
+    executor._pullback_latest_quote_snapshot = {
+        "stock_code": "005930",
+        "stock_name": "삼성전자",
+        "current_price": prev_high * 1.01,
+        "open_price": prev_high * 1.006,
+        "received_at": decision_time,
+    }
+    executor.fetch_quote_snapshot = lambda: dict(executor._pullback_latest_quote_snapshot)
+    executor.get_cached_pullback_quote_snapshot = lambda: dict(executor._pullback_latest_quote_snapshot)
+    executor.fetch_market_data = lambda: prepared_df.copy()
+    executor.fetch_cached_intraday_bars_if_available = lambda n=120: []
+    executor.is_cached_intraday_provider_ready = lambda: False
+    executor._has_active_pending_buy_order = lambda: False
+    executor.cached_account_has_holding = lambda _symbol: False
+    candidate_store = ArmedCandidateStore()
+    _, _, pullback_candidate = _make_setup_candidate()
+    candidate_store.upsert(pullback_candidate)
+    dirty = DirtySymbolSet()
+    entry_queue = EntryIntentQueue(maxsize=8)
+    registry = build_default_strategy_registry(
+        pullback_strategy=executor.strategy.pullback_strategy,
+        trend_atr_strategy=executor.strategy,
+        orb_strategy=executor.strategy.orb_strategy,
+    )
+    setup_worker = PullbackSetupWorker(
+        executor=executor,
+        candidate_store=candidate_store,
+        daily_context_store=None,
+        dirty_symbols=dirty,
+        strategy_registry=registry,
+        enabled_strategy_tags=("pullback_rebreakout", "opening_range_breakout"),
+        stop_event=threading.Event(),
+        on_error=lambda *_args: None,
+    )
+    timing_worker = PullbackTimingWorker(
+        executor=executor,
+        candidate_store=candidate_store,
+        dirty_symbols=dirty,
+        entry_queue=entry_queue,
+        strategy_registry=registry,
+        enabled_strategy_tags=("pullback_rebreakout", "opening_range_breakout"),
+        stop_event=threading.Event(),
+        on_error=lambda *_args: None,
+    )
+
+    with _patch_pullback_enabled(), \
+         patch.object(multiday_trend_atr.settings, "ENABLE_MULTI_STRATEGY_THREADED_PIPELINE", True), \
+         patch.object(multiday_trend_atr.settings, "THREADED_PIPELINE_ENABLED_STRATEGIES", "pullback_rebreakout,opening_range_breakout"), \
+         patch.object(multiday_trend_atr.settings, "ENABLE_OPENING_RANGE_BREAKOUT_STRATEGY", True):
+        setup_worker._process_shadow_strategy_setup(
+            strategy_tag="opening_range_breakout",
+            daily_df=prepared_df.copy(),
+            daily_context=None,
+            current_price=float(executor._pullback_latest_quote_snapshot["current_price"]),
+            open_price=float(executor._pullback_latest_quote_snapshot["open_price"]),
+            stock_name="삼성전자",
+            decision_time=decision_time,
+            has_pending_order=False,
+        )
+        timing_worker._process_symbol("005930")
+
+    assert executor.get_strategy_shadow_candidate("opening_range_breakout", "005930") is None
+    assert executor.get_strategy_shadow_intent("opening_range_breakout", "005930") is None
+    assert entry_queue.strategy_counts().get("opening_range_breakout", 0) == 0
+    assert executor._orb_intraday_source_state == "unsupported"
 
 
 def test_strategy_candidate_max_age_does_not_change_legacy_trend_atr_signal(sample_uptrend_df):
