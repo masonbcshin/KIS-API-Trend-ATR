@@ -578,6 +578,78 @@ PIPELINE_RECOVER_ONLY_CURRENT_TRADE_DATE: bool = os.getenv(
     "1",
     "yes",
 )
+ENABLE_STRATEGY_ANALYTICS: bool = os.getenv(
+    "ENABLE_STRATEGY_ANALYTICS",
+    "false",
+).lower() in (
+    "true",
+    "1",
+    "yes",
+)
+STRATEGY_ANALYTICS_EVENT_DIR: str = str(
+    os.getenv("STRATEGY_ANALYTICS_EVENT_DIR", "data/analytics") or "data/analytics"
+).strip() or "data/analytics"
+ENABLE_STRATEGY_MARKOUTS: bool = os.getenv(
+    "ENABLE_STRATEGY_MARKOUTS",
+    "false",
+).lower() in (
+    "true",
+    "1",
+    "yes",
+)
+STRATEGY_MARKOUT_HORIZONS_SEC: str = str(
+    os.getenv("STRATEGY_MARKOUT_HORIZONS_SEC", "60,180,300,600") or "60,180,300,600"
+).strip() or "60,180,300,600"
+ENABLE_STRATEGY_DIAGNOSTICS: bool = os.getenv(
+    "ENABLE_STRATEGY_DIAGNOSTICS",
+    "false",
+).lower() in (
+    "true",
+    "1",
+    "yes",
+)
+ENABLE_STRATEGY_ALERTS: bool = os.getenv(
+    "ENABLE_STRATEGY_ALERTS",
+    "false",
+).lower() in (
+    "true",
+    "1",
+    "yes",
+)
+STRATEGY_ALERT_BASELINE_DAYS: int = int(os.getenv("STRATEGY_ALERT_BASELINE_DAYS", "5"))
+STRATEGY_ALERT_MIN_SUBMITTED_COUNT: int = int(os.getenv("STRATEGY_ALERT_MIN_SUBMITTED_COUNT", "2"))
+STRATEGY_ALERT_FILL_RATE_DROP_THRESHOLD: float = float(
+    os.getenv("STRATEGY_ALERT_FILL_RATE_DROP_THRESHOLD", "0.25")
+)
+STRATEGY_ALERT_FILL_RATE_BASELINE_RATIO: float = float(
+    os.getenv("STRATEGY_ALERT_FILL_RATE_BASELINE_RATIO", "0.6")
+)
+STRATEGY_ALERT_REJECT_SPIKE_THRESHOLD: int = int(os.getenv("STRATEGY_ALERT_REJECT_SPIKE_THRESHOLD", "3"))
+STRATEGY_ALERT_REJECT_SPIKE_BASELINE_RATIO: float = float(
+    os.getenv("STRATEGY_ALERT_REJECT_SPIKE_BASELINE_RATIO", "2.0")
+)
+STRATEGY_ALERT_DEGRADED_RATIO_THRESHOLD: float = float(
+    os.getenv("STRATEGY_ALERT_DEGRADED_RATIO_THRESHOLD", "0.25")
+)
+STRATEGY_ALERT_RECOVERY_SPIKE_THRESHOLD: int = int(
+    os.getenv("STRATEGY_ALERT_RECOVERY_SPIKE_THRESHOLD", "2")
+)
+STRATEGY_ALERT_ORB_BAD_SOURCE_RATIO_THRESHOLD: float = float(
+    os.getenv("STRATEGY_ALERT_ORB_BAD_SOURCE_RATIO_THRESHOLD", "0.4")
+)
+STRATEGY_ALERT_MARKOUT_3M_DROP_BPS: float = float(
+    os.getenv("STRATEGY_ALERT_MARKOUT_3M_DROP_BPS", "-10.0")
+)
+STRATEGY_ALERT_MARKOUT_5M_DROP_BPS: float = float(
+    os.getenv("STRATEGY_ALERT_MARKOUT_5M_DROP_BPS", "-15.0")
+)
+STRATEGY_PARITY_COUNT_ABS_THRESHOLD: float = float(
+    os.getenv("STRATEGY_PARITY_COUNT_ABS_THRESHOLD", "1.0")
+)
+STRATEGY_PARITY_RATIO_THRESHOLD: float = float(os.getenv("STRATEGY_PARITY_RATIO_THRESHOLD", "0.2"))
+STRATEGY_PARITY_MARKOUT_BPS_THRESHOLD: float = float(
+    os.getenv("STRATEGY_PARITY_MARKOUT_BPS_THRESHOLD", "10.0")
+)
 ENABLE_PULLBACK_DAILY_REFRESH_THREAD: bool = os.getenv(
     "ENABLE_PULLBACK_DAILY_REFRESH_THREAD",
     "false",

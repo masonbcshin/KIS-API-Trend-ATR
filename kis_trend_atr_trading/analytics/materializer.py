@@ -8,12 +8,17 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 try:
+    from analytics.alerts import build_alert_rows as build_strategy_alert_rows
+    from analytics.diagnostics import build_diagnostics_report
     from analytics.attribution import build_attribution_rows
     from analytics.event_logger import load_strategy_events
+    from analytics.parity import build_parity_rows as build_strategy_parity_rows
     from analytics.repository import (
+        StrategyAlertsDailyRepository,
         StrategyAttributionDailyRepository,
         StrategyAnalyticsSummaryRepository,
         StrategyFunnelDailyRepository,
+        StrategyParityDailyRepository,
         StrategyRejectReasonDailyRepository,
         TradeMarkoutRepository,
     )
@@ -21,12 +26,17 @@ try:
     from config import settings
     from db.mysql import get_db_manager
 except ImportError:
+    from kis_trend_atr_trading.analytics.alerts import build_alert_rows as build_strategy_alert_rows
+    from kis_trend_atr_trading.analytics.diagnostics import build_diagnostics_report
     from kis_trend_atr_trading.analytics.attribution import build_attribution_rows
     from kis_trend_atr_trading.analytics.event_logger import load_strategy_events
+    from kis_trend_atr_trading.analytics.parity import build_parity_rows as build_strategy_parity_rows
     from kis_trend_atr_trading.analytics.repository import (
+        StrategyAlertsDailyRepository,
         StrategyAttributionDailyRepository,
         StrategyAnalyticsSummaryRepository,
         StrategyFunnelDailyRepository,
+        StrategyParityDailyRepository,
         StrategyRejectReasonDailyRepository,
         TradeMarkoutRepository,
     )
@@ -85,7 +95,12 @@ class StrategyAnalyticsMaterializer:
         self._reject_repo = StrategyRejectReasonDailyRepository(self._db)
         self._funnel_repo = StrategyFunnelDailyRepository(self._db)
         self._attribution_repo = StrategyAttributionDailyRepository(self._db)
+        self._alerts_repo = StrategyAlertsDailyRepository(self._db)
+        self._parity_repo = StrategyParityDailyRepository(self._db)
         self._markout_repo = TradeMarkoutRepository(self._db)
+
+    def _db_enabled_for_analytics(self) -> bool:
+        return bool(getattr(settings, "DB_ENABLED", False)) and bool(getattr(self._db.config, "enabled", False))
 
     def _load_events(self, trade_date: str) -> List[Dict[str, Any]]:
         return load_strategy_events(event_dir=self._event_dir, trade_date=trade_date)
@@ -299,6 +314,144 @@ class StrategyAnalyticsMaterializer:
     def build_attribution_rows(self, trade_date: str, events: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return build_attribution_rows(trade_date, events)
 
+    def _baseline_days(self) -> int:
+        return max(int(getattr(settings, "STRATEGY_ALERT_BASELINE_DAYS", 5) or 5), 0)
+
+    def load_baseline_summary_rows(self, trade_date: str, baseline_days: Optional[int] = None) -> List[Dict[str, Any]]:
+        days = self._baseline_days() if baseline_days is None else max(int(baseline_days), 0)
+        if days <= 0 or not self._db_enabled_for_analytics():
+            return []
+        try:
+            return self._summary_repo.list_recent_before_trade_date(trade_date, limit=days * 8)
+        except Exception:
+            return []
+
+    def load_baseline_attribution_rows(self, trade_date: str, baseline_days: Optional[int] = None) -> List[Dict[str, Any]]:
+        days = self._baseline_days() if baseline_days is None else max(int(baseline_days), 0)
+        if days <= 0 or not self._db_enabled_for_analytics():
+            return []
+        try:
+            return self._attribution_repo.list_recent_before_trade_date(trade_date, limit=days * 64)
+        except Exception:
+            return []
+
+    def build_diagnostics_report(
+        self,
+        *,
+        trade_date: str,
+        analytics_payload: Dict[str, Any],
+        alert_rows: Optional[Iterable[Dict[str, Any]]] = None,
+        parity_rows: Optional[Iterable[Dict[str, Any]]] = None,
+        top_n: int = 5,
+    ) -> Dict[str, Any]:
+        return build_diagnostics_report(
+            trade_date=trade_date,
+            analytics_payload=analytics_payload,
+            alert_rows=alert_rows,
+            parity_rows=parity_rows,
+            top_n=top_n,
+        )
+
+    def build_alert_rows(
+        self,
+        *,
+        trade_date: str,
+        analytics_payload: Dict[str, Any],
+        baseline_summary_rows: Optional[Iterable[Dict[str, Any]]] = None,
+        baseline_attribution_rows: Optional[Iterable[Dict[str, Any]]] = None,
+        parity_rows: Optional[Iterable[Dict[str, Any]]] = None,
+        thresholds: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        summary_rows = (
+            list(baseline_summary_rows)
+            if baseline_summary_rows is not None
+            else self.load_baseline_summary_rows(trade_date)
+        )
+        attribution_rows = (
+            list(baseline_attribution_rows)
+            if baseline_attribution_rows is not None
+            else self.load_baseline_attribution_rows(trade_date)
+        )
+        return build_strategy_alert_rows(
+            trade_date,
+            analytics_payload,
+            baseline_summary_rows=summary_rows,
+            baseline_attribution_rows=attribution_rows,
+            parity_rows=parity_rows,
+            thresholds=thresholds,
+        )
+
+    def build_parity_rows(
+        self,
+        *,
+        trade_date: str,
+        live_payload: Dict[str, Any],
+        replay_payload: Dict[str, Any],
+        thresholds: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        return build_strategy_parity_rows(
+            trade_date,
+            live_payload,
+            replay_payload,
+            thresholds=thresholds,
+        )
+
+    def materialize_alerts_trade_date(
+        self,
+        *,
+        trade_date: str,
+        analytics_payload: Optional[Dict[str, Any]] = None,
+        parity_rows: Optional[Iterable[Dict[str, Any]]] = None,
+        baseline_summary_rows: Optional[Iterable[Dict[str, Any]]] = None,
+        baseline_attribution_rows: Optional[Iterable[Dict[str, Any]]] = None,
+        thresholds: Optional[Dict[str, Any]] = None,
+        persist: bool = True,
+    ) -> Dict[str, Any]:
+        payload = analytics_payload or self.materialize_trade_date(trade_date=trade_date, persist=False)
+        alert_rows = self.build_alert_rows(
+            trade_date=trade_date,
+            analytics_payload=payload,
+            baseline_summary_rows=baseline_summary_rows,
+            baseline_attribution_rows=baseline_attribution_rows,
+            parity_rows=parity_rows,
+            thresholds=thresholds,
+        )
+        result = {
+            "trade_date": trade_date,
+            "alert_count": len(alert_rows),
+            "alert_rows": alert_rows,
+        }
+        if persist and self._db_enabled_for_analytics():
+            self._alerts_repo.ensure_table()
+            self._alerts_repo.replace_for_trade_date(trade_date, alert_rows)
+        return result
+
+    def materialize_parity_trade_date(
+        self,
+        *,
+        trade_date: str,
+        live_payload: Dict[str, Any],
+        replay_payload: Dict[str, Any],
+        thresholds: Optional[Dict[str, Any]] = None,
+        persist: bool = True,
+    ) -> Dict[str, Any]:
+        parity_rows = self.build_parity_rows(
+            trade_date=trade_date,
+            live_payload=live_payload,
+            replay_payload=replay_payload,
+            thresholds=thresholds,
+        )
+        result = {
+            "trade_date": trade_date,
+            "parity_count": len(parity_rows),
+            "mismatch_count": sum(1 for row in parity_rows if bool(row.get("mismatch_flag"))),
+            "parity_rows": parity_rows,
+        }
+        if persist and self._db_enabled_for_analytics():
+            self._parity_repo.ensure_table()
+            self._parity_repo.replace_for_trade_date(trade_date, parity_rows)
+        return result
+
     def materialize_trade_date(
         self,
         *,
@@ -320,7 +473,7 @@ class StrategyAnalyticsMaterializer:
             "attribution_rows": attribution_rows,
             "markout_rows": markout_rows,
         }
-        if persist and bool(getattr(self._db.config, "enabled", False)):
+        if persist and self._db_enabled_for_analytics():
             self._summary_repo.ensure_table()
             self._reject_repo.ensure_table()
             self._funnel_repo.ensure_table()

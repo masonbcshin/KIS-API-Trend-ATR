@@ -102,6 +102,21 @@ class StrategyAnalyticsSummaryRepository:
             or []
         )
 
+    def list_recent_before_trade_date(self, trade_date: str, limit: int = 5) -> List[Dict[str, Any]]:
+        return list(
+            self._db.execute_query(
+                """
+                SELECT *
+                FROM strategy_daily_summary
+                WHERE trade_date < %s
+                ORDER BY trade_date DESC, strategy_tag
+                LIMIT %s
+                """,
+                (trade_date, max(int(limit or 0), 0)),
+            )
+            or []
+        )
+
 
 class StrategyRejectReasonDailyRepository:
     def __init__(self, db: MySQLManager) -> None:
@@ -318,6 +333,189 @@ class StrategyAttributionDailyRepository:
                 FROM strategy_attribution_daily
                 WHERE trade_date = %s
                 ORDER BY strategy_tag, slice_key, slice_value, count DESC, reason_group, reject_reason
+                """,
+                (trade_date,),
+            )
+            or []
+        )
+
+    def list_recent_before_trade_date(self, trade_date: str, limit: int = 25) -> List[Dict[str, Any]]:
+        return list(
+            self._db.execute_query(
+                """
+                SELECT *
+                FROM strategy_attribution_daily
+                WHERE trade_date < %s
+                ORDER BY trade_date DESC, strategy_tag, slice_key, slice_value, count DESC
+                LIMIT %s
+                """,
+                (trade_date, max(int(limit or 0), 0)),
+            )
+            or []
+        )
+
+
+class StrategyAlertsDailyRepository:
+    def __init__(self, db: MySQLManager) -> None:
+        self._db = db
+
+    def ensure_table(self) -> None:
+        self._db.execute_command(
+            """
+            CREATE TABLE IF NOT EXISTS strategy_alerts_daily (
+                trade_date DATE NOT NULL,
+                strategy_tag VARCHAR(64) NOT NULL,
+                alert_type VARCHAR(64) NOT NULL,
+                alert_key VARCHAR(64) NOT NULL,
+                severity VARCHAR(16) NOT NULL,
+                slice_key VARCHAR(32) NOT NULL,
+                slice_value VARCHAR(64) NOT NULL,
+                metric_name VARCHAR(64) NOT NULL,
+                metric_value DOUBLE NULL,
+                baseline_value DOUBLE NULL,
+                threshold_value DOUBLE NULL,
+                message TEXT NOT NULL,
+                payload_json LONGTEXT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (trade_date, strategy_tag, alert_type, alert_key, slice_key, slice_value)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+
+    def replace_for_trade_date(self, trade_date: str, rows: Iterable[Dict[str, Any]]) -> None:
+        prepared = list(rows or [])
+        with self._db.transaction() as cursor:
+            cursor.execute("DELETE FROM strategy_alerts_daily WHERE trade_date = %s", (trade_date,))
+            if not prepared:
+                return
+            cursor.executemany(
+                """
+                INSERT INTO strategy_alerts_daily (
+                    trade_date,
+                    strategy_tag,
+                    alert_type,
+                    alert_key,
+                    severity,
+                    slice_key,
+                    slice_value,
+                    metric_name,
+                    metric_value,
+                    baseline_value,
+                    threshold_value,
+                    message,
+                    payload_json
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                [
+                    (
+                        trade_date,
+                        str(row.get("strategy_tag") or ""),
+                        str(row.get("alert_type") or ""),
+                        str(row.get("alert_key") or ""),
+                        str(row.get("severity") or ""),
+                        str(row.get("slice_key") or ""),
+                        str(row.get("slice_value") or ""),
+                        str(row.get("metric_name") or ""),
+                        row.get("metric_value"),
+                        row.get("baseline_value"),
+                        row.get("threshold_value"),
+                        str(row.get("message") or ""),
+                        json.dumps(row.get("payload_json") or {}, ensure_ascii=True, separators=(",", ":")),
+                    )
+                    for row in prepared
+                ],
+            )
+
+    def list_for_trade_date(self, trade_date: str) -> List[Dict[str, Any]]:
+        return list(
+            self._db.execute_query(
+                """
+                SELECT *
+                FROM strategy_alerts_daily
+                WHERE trade_date = %s
+                ORDER BY strategy_tag, severity DESC, alert_type, alert_key
+                """,
+                (trade_date,),
+            )
+            or []
+        )
+
+
+class StrategyParityDailyRepository:
+    def __init__(self, db: MySQLManager) -> None:
+        self._db = db
+
+    def ensure_table(self) -> None:
+        self._db.execute_command(
+            """
+            CREATE TABLE IF NOT EXISTS strategy_parity_daily (
+                trade_date DATE NOT NULL,
+                strategy_tag VARCHAR(64) NOT NULL,
+                slice_key VARCHAR(32) NOT NULL,
+                slice_value VARCHAR(64) NOT NULL,
+                metric_name VARCHAR(64) NOT NULL,
+                live_value DOUBLE NULL,
+                replay_value DOUBLE NULL,
+                diff_abs DOUBLE NULL,
+                diff_ratio DOUBLE NULL,
+                mismatch_flag TINYINT(1) NOT NULL DEFAULT 0,
+                mismatch_reason VARCHAR(128) NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (trade_date, strategy_tag, slice_key, slice_value, metric_name)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+
+    def replace_for_trade_date(self, trade_date: str, rows: Iterable[Dict[str, Any]]) -> None:
+        prepared = list(rows or [])
+        with self._db.transaction() as cursor:
+            cursor.execute("DELETE FROM strategy_parity_daily WHERE trade_date = %s", (trade_date,))
+            if not prepared:
+                return
+            cursor.executemany(
+                """
+                INSERT INTO strategy_parity_daily (
+                    trade_date,
+                    strategy_tag,
+                    slice_key,
+                    slice_value,
+                    metric_name,
+                    live_value,
+                    replay_value,
+                    diff_abs,
+                    diff_ratio,
+                    mismatch_flag,
+                    mismatch_reason
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                [
+                    (
+                        trade_date,
+                        str(row.get("strategy_tag") or ""),
+                        str(row.get("slice_key") or ""),
+                        str(row.get("slice_value") or ""),
+                        str(row.get("metric_name") or ""),
+                        row.get("live_value"),
+                        row.get("replay_value"),
+                        row.get("diff_abs"),
+                        row.get("diff_ratio"),
+                        int(bool(row.get("mismatch_flag"))),
+                        str(row.get("mismatch_reason") or ""),
+                    )
+                    for row in prepared
+                ],
+            )
+
+    def list_for_trade_date(self, trade_date: str) -> List[Dict[str, Any]]:
+        return list(
+            self._db.execute_query(
+                """
+                SELECT *
+                FROM strategy_parity_daily
+                WHERE trade_date = %s
+                ORDER BY strategy_tag, slice_key, slice_value, metric_name
                 """,
                 (trade_date,),
             )
