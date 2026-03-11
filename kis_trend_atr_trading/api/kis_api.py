@@ -52,6 +52,11 @@ class KISApi:
         access_token: OAuth 액세스 토큰
         token_expires_at: 토큰 만료 시간
     """
+
+    _shared_balance_payload_lock = threading.Condition(threading.Lock())
+    _shared_balance_payload_cache: Dict[str, Dict[str, Any]] = {}
+    _shared_balance_payload_cache_ts: Dict[str, float] = {}
+    _shared_balance_payload_inflight: set[str] = set()
     
     def __init__(
         self,
@@ -111,6 +116,11 @@ class KISApi:
         )
         self._balance_raw_cache: Optional[Dict[str, Any]] = None
         self._balance_raw_cache_ts: float = 0.0
+        self._holdings_cache: Optional[List[Dict[str, Any]]] = None
+        self._holdings_cache_ts: float = 0.0
+        self._holdings_cache_ttl_sec: float = float(
+            getattr(settings, "ACCOUNT_HOLDINGS_CACHE_TTL_SEC", self._balance_cache_ttl_sec)
+        )
         
         # 네트워크 상태 관리 (1분 이상 단절 시 거래 중단 판단)
         self._network_down_since: Optional[float] = None
@@ -484,7 +494,36 @@ class KISApi:
             self._balance_raw_cache is not None
             and (now_ts - self._balance_raw_cache_ts) < max(self._balance_cache_ttl_sec, 0.0)
         ):
+            logger.info(
+                "[KIS][BAL_RAW] 캐시 재사용: age=%.2fs",
+                now_ts - self._balance_raw_cache_ts,
+            )
             return deepcopy(self._balance_raw_cache)
+
+        cache_key = self._balance_payload_cache_key()
+        ttl_sec = max(self._balance_cache_ttl_sec, 0.0)
+        waited_for_inflight = False
+        while True:
+            with self.__class__._shared_balance_payload_lock:
+                shared_payload = self.__class__._shared_balance_payload_cache.get(cache_key)
+                shared_ts = self.__class__._shared_balance_payload_cache_ts.get(cache_key, 0.0)
+                shared_age_sec = max(now_ts - shared_ts, 0.0)
+                if shared_payload is not None and shared_age_sec < ttl_sec:
+                    self._balance_raw_cache = deepcopy(shared_payload)
+                    self._balance_raw_cache_ts = shared_ts
+                    logger.info(
+                        "[KIS][BAL_RAW] %s: age=%.2fs key=%s",
+                        "in-flight coalesced 재사용" if waited_for_inflight else "공유 캐시 재사용",
+                        shared_age_sec,
+                        cache_key,
+                    )
+                    return deepcopy(shared_payload)
+                if cache_key not in self.__class__._shared_balance_payload_inflight:
+                    self.__class__._shared_balance_payload_inflight.add(cache_key)
+                    break
+                waited_for_inflight = True
+                self.__class__._shared_balance_payload_lock.wait(timeout=max(ttl_sec, 0.1))
+                now_ts = time.time()
 
         url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
 
@@ -516,33 +555,53 @@ class KISApi:
 
         max_attempts = 3
         data: Dict[str, Any] = {}
-        for attempt in range(1, max_attempts + 1):
-            response = self._request_with_retry("GET", url, headers, params=params)
-            data = response.json()
-            rt_cd = str(data.get("rt_cd", ""))
-            if rt_cd == "0":
-                self._balance_raw_cache = deepcopy(data)
-                self._balance_raw_cache_ts = time.time()
-                return data
+        logger.info("[KIS][BAL_RAW] 실조회 수행: key=%s", cache_key)
+        try:
+            for attempt in range(1, max_attempts + 1):
+                response = self._request_with_retry("GET", url, headers, params=params)
+                data = response.json()
+                rt_cd = str(data.get("rt_cd", ""))
+                if rt_cd == "0":
+                    fetched_at = time.time()
+                    payload_copy = deepcopy(data)
+                    self._balance_raw_cache = payload_copy
+                    self._balance_raw_cache_ts = fetched_at
+                    with self.__class__._shared_balance_payload_lock:
+                        self.__class__._shared_balance_payload_cache[cache_key] = deepcopy(payload_copy)
+                        self.__class__._shared_balance_payload_cache_ts[cache_key] = fetched_at
+                    return data
 
-            msg = str(data.get("msg1", "Unknown error"))
-            should_retry_invalid_acno = (
-                "INVALID_CHECK_ACNO" in msg and attempt < max_attempts
-            )
-            if should_retry_invalid_acno:
-                logger.warning(
-                    "[KIS][BAL] 계좌 검증 오류 재시도(%s/%s): %s",
-                    attempt,
-                    max_attempts,
-                    msg,
+                msg = str(data.get("msg1", "Unknown error"))
+                should_retry_invalid_acno = (
+                    "INVALID_CHECK_ACNO" in msg and attempt < max_attempts
                 )
-                time.sleep(0.3 * attempt)
-                continue
+                if should_retry_invalid_acno:
+                    logger.warning(
+                        "[KIS][BAL] 계좌 검증 오류 재시도(%s/%s): %s",
+                        attempt,
+                        max_attempts,
+                        msg,
+                    )
+                    time.sleep(0.3 * attempt)
+                    continue
 
-            raise KISApiError(f"잔고 조회 실패: {msg}")
+                raise KISApiError(f"잔고 조회 실패: {msg}")
 
-        raise KISApiError(
-            f"잔고 조회 실패: {str(data.get('msg1', 'Unknown error'))}"
+            raise KISApiError(
+                f"잔고 조회 실패: {str(data.get('msg1', 'Unknown error'))}"
+            )
+        finally:
+            with self.__class__._shared_balance_payload_lock:
+                self.__class__._shared_balance_payload_inflight.discard(cache_key)
+                self.__class__._shared_balance_payload_lock.notify_all()
+
+    def _balance_payload_cache_key(self) -> str:
+        return ":".join(
+            [
+                "paper" if self.is_paper_trading else "real",
+                str(self.account_no or "").strip(),
+                str(self.account_product_code or "").strip(),
+            ]
         )
 
     def _is_token_usable(self, now_kst: Optional[datetime] = None) -> bool:
@@ -2216,6 +2275,17 @@ class KISApi:
         Returns:
             List[Dict]: [{"stock_code": str, "qty": int, "avg_price": Decimal, "stock_name": Optional[str]}]
         """
+        now_ts = time.time()
+        if (
+            self._holdings_cache is not None
+            and (now_ts - self._holdings_cache_ts) < max(self._holdings_cache_ttl_sec, 0.0)
+        ):
+            logger.info(
+                "[KIS][HOLDINGS] 캐시 재사용: age=%.2fs",
+                now_ts - self._holdings_cache_ts,
+            )
+            return deepcopy(self._holdings_cache)
+
         data = self._request_balance_payload()
 
         candidate_paths: List[Tuple[str, ...]] = [
@@ -2281,6 +2351,12 @@ class KISApi:
         logger.info(
             "[KIS][HOLDINGS] parsed path=%s count=%s",
             resolved_path,
+            len(holdings),
+        )
+        self._holdings_cache = deepcopy(holdings)
+        self._holdings_cache_ts = time.time()
+        logger.info(
+            "[KIS][HOLDINGS] 실조회 결과 캐시 갱신: count=%s",
             len(holdings),
         )
         return holdings

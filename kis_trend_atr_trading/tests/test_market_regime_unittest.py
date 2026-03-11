@@ -415,7 +415,7 @@ def test_multiple_buy_candidates_share_single_refresh_per_loop():
     assert refresh_calls["count"] == 1
 
 
-def test_refresh_budget_exceeded_reuses_previous_snapshot():
+def test_refresh_budget_exceeded_adopts_new_snapshot_when_build_succeeds():
     now_kst = _kst_dt(2026, 3, 2, 10, 0)
     previous_snapshot = _make_shared_snapshot(
         market_regime.MarketRegime.NEUTRAL,
@@ -438,10 +438,11 @@ def test_refresh_budget_exceeded_reuses_previous_snapshot():
             budget_sec=1.5,
         )
 
-    assert outcome.refreshed is False
+    assert outcome.refreshed is True
     assert outcome.budget_exceeded is True
-    assert outcome.snapshot.as_of == previous_snapshot.as_of
-    assert outcome.using_previous_snapshot is True
+    assert outcome.snapshot.as_of == now_kst
+    assert outcome.snapshot.reason == "new_snapshot"
+    assert outcome.using_previous_snapshot is False
     assert outcome.previous_as_of == previous_snapshot.as_of.isoformat()
 
 
@@ -468,7 +469,7 @@ def test_first_snapshot_bootstrap_budget_allows_initial_snapshot_without_previou
     assert outcome.effective_budget_sec == 3.0
 
 
-def test_first_snapshot_bootstrap_budget_exceeded_keeps_snapshot_empty():
+def test_first_snapshot_bootstrap_budget_exceeded_keeps_valid_initial_snapshot():
     now_kst = _kst_dt(2026, 3, 2, 9, 1)
 
     with patch.object(market_regime, "monotonic", side_effect=[0.0, 4.0]):
@@ -484,11 +485,41 @@ def test_first_snapshot_bootstrap_budget_exceeded_keeps_snapshot_empty():
             budget_sec=1.5,
         )
 
-    assert outcome.refreshed is False
+    assert outcome.refreshed is True
     assert outcome.budget_exceeded is True
-    assert outcome.snapshot is None
+    assert outcome.snapshot is not None
+    assert outcome.snapshot.as_of == now_kst
     assert outcome.using_previous_snapshot is False
     assert outcome.previous_as_of is None
+
+
+def test_budget_exceeded_bootstrap_snapshot_suppresses_no_snapshot_yet_warning(caplog):
+    now_kst = _kst_dt(2026, 3, 2, 9, 1)
+    observation_state = market_regime.MarketRegimeObservationState(startup_monotonic=0.0)
+
+    with patch.object(market_regime, "monotonic", side_effect=[0.0, 4.0, 4.0]):
+        outcome = market_regime.refresh_shared_market_regime_snapshot(
+            current_snapshot=None,
+            refresh_fn=lambda refresh_now: _make_shared_snapshot(
+                market_regime.MarketRegime.GOOD,
+                "bootstrap_snapshot",
+                as_of=refresh_now,
+            ),
+            check_time=now_kst,
+            loop_context=market_regime.MarketRegimeLoopContext(),
+            budget_sec=1.5,
+        )
+        market_regime.observe_market_regime_snapshot(
+            observation_state=observation_state,
+            snapshot=outcome.snapshot,
+            now_kst=now_kst,
+            in_session=True,
+            filter_enabled=True,
+        )
+
+    assert outcome.snapshot is not None
+    assert "first_snapshot_created" in caplog.text
+    assert "no_snapshot_yet" not in caplog.text
 
 
 def test_observe_market_regime_snapshot_logs_first_snapshot_created(caplog):
@@ -562,6 +593,48 @@ def test_budget_exceeded_log_includes_elapsed_breakdown_fields(caplog):
     assert "daily_fetch_elapsed_sec=1.100" in caplog.text
     assert "intraday_fetch_elapsed_sec=0.900" in caplog.text
     assert "classify_elapsed_sec=0.200" in caplog.text
+
+
+def test_budget_exceeded_log_still_warns_when_new_snapshot_is_adopted(caplog):
+    now_kst = _kst_dt(2026, 3, 2, 9, 5)
+    snapshot = _make_shared_snapshot(
+        market_regime.MarketRegime.GOOD,
+        "budgeted_update",
+        as_of=now_kst,
+    )
+    outcome = market_regime.MarketRegimeRefreshOutcome(
+        snapshot=snapshot,
+        refreshed=True,
+        refresh_attempted=True,
+        elapsed_sec=2.345,
+        budget_exceeded=True,
+        daily_fetch_elapsed_sec=1.100,
+        intraday_fetch_elapsed_sec=0.900,
+        classify_elapsed_sec=0.200,
+        effective_budget_sec=1.500,
+        previous_as_of=(now_kst - timedelta(minutes=1)).isoformat(),
+        using_previous_snapshot=False,
+    )
+
+    market_regime.log_market_regime_refresh_outcome(outcome, snapshot)
+
+    assert "snapshot_updated" in caplog.text
+    assert "budget_exceeded=true" in caplog.text
+    assert "snapshot_refresh_budget_exceeded" in caplog.text
+    assert f"adopted_as_of={now_kst.isoformat()}" in caplog.text
+
+
+def test_market_regime_build_log_uses_snapshot_built_label(caplog):
+    snapshot = _make_shared_snapshot(
+        market_regime.MarketRegime.GOOD,
+        "both_above_ma_and_stable_3d",
+        as_of=_kst_dt(2026, 3, 2, 9, 5),
+    )
+
+    market_regime.MarketRegimeService(api=SimpleNamespace())._log_snapshot(snapshot)
+
+    assert "snapshot_built" in caplog.text
+    assert "snapshot_updated" not in caplog.text
 
 
 def test_observe_market_regime_snapshot_logs_no_snapshot_yet_warning(caplog):
@@ -657,5 +730,38 @@ def test_execute_buy_keeps_existing_behavior_when_filter_is_off():
     with _executor_settings(ENABLE_MARKET_REGIME_FILTER=False):
         result = ex.execute_buy(_make_buy_signal())
 
+    assert result["success"] is True
+    assert submitted["count"] == 1
+
+
+def test_execute_buy_allows_after_budget_exceeded_refresh_advances_snapshot():
+    ex, submitted = _make_executor_for_buy()
+    now_kst = datetime.now(KST)
+    previous_snapshot = _make_shared_snapshot(
+        market_regime.MarketRegime.GOOD,
+        "previous",
+        as_of=now_kst - timedelta(minutes=5),
+        expires_after_sec=60,
+        stale_after_sec=180,
+    )
+
+    with patch.object(market_regime, "monotonic", side_effect=[0.0, 2.0]):
+        outcome = market_regime.refresh_shared_market_regime_snapshot(
+            current_snapshot=previous_snapshot,
+            refresh_fn=lambda refresh_now: _make_shared_snapshot(
+                market_regime.MarketRegime.GOOD,
+                "advanced_on_budget_exceeded",
+                as_of=refresh_now,
+            ),
+            check_time=now_kst,
+            loop_context=market_regime.MarketRegimeLoopContext(),
+            budget_sec=1.5,
+        )
+    ex.market_regime_snapshot = outcome.snapshot
+
+    with _executor_settings(MARKET_REGIME_FAIL_MODE="closed"):
+        result = ex.execute_buy(_make_buy_signal())
+
+    assert outcome.budget_exceeded is True
     assert result["success"] is True
     assert submitted["count"] == 1

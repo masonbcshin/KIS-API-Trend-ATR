@@ -768,19 +768,33 @@ class MultidayExecutor:
         for key, value in snapshot.items():
             if value is not None:
                 merged[key] = value
-        merged.setdefault("stock_code", str(self.stock_code).zfill(6))
+        normalized_stock_code = self._normalize_pullback_refresh_symbol(self.stock_code)
+        if normalized_stock_code:
+            merged.setdefault("stock_code", normalized_stock_code)
         self._pullback_latest_quote_snapshot = merged
 
     def get_cached_pullback_quote_snapshot(self) -> Dict[str, Any]:
         return dict(getattr(self, "_pullback_latest_quote_snapshot", {}) or {})
 
+    @staticmethod
+    def _normalize_pullback_refresh_symbol(raw_symbol: Any) -> str:
+        symbol = str(raw_symbol or "").strip()
+        if not symbol:
+            return ""
+        if symbol == "000000":
+            return ""
+        if not symbol.isdigit():
+            return ""
+        normalized = symbol.zfill(6)
+        return "" if normalized == "000000" else normalized
+
     def get_pullback_daily_refresh_symbols(self) -> List[str]:
         symbols: List[str] = []
-        primary = str(self.stock_code or "").zfill(6)
+        primary = self._normalize_pullback_refresh_symbol(self.stock_code)
         if primary:
             symbols.append(primary)
         position = getattr(self.strategy, "position", None)
-        held_symbol = str(getattr(position, "symbol", "") or "").zfill(6)
+        held_symbol = self._normalize_pullback_refresh_symbol(getattr(position, "symbol", ""))
         if held_symbol and held_symbol not in symbols:
             symbols.append(held_symbol)
         return symbols

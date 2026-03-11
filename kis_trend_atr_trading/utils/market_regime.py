@@ -219,10 +219,22 @@ def refresh_shared_market_regime_snapshot(
         )
 
     elapsed_sec = monotonic() - started_at
-    build_result = coerce_market_regime_build_result(
-        refreshed_result,
-        fallback_total_elapsed_sec=elapsed_sec,
-    )
+    try:
+        build_result = coerce_market_regime_build_result(
+            refreshed_result,
+            fallback_total_elapsed_sec=elapsed_sec,
+        )
+        next_snapshot = materialize_market_regime_snapshot(build_result.snapshot, now_kst)
+    except Exception as exc:
+        return MarketRegimeRefreshOutcome(
+            snapshot=current_snapshot,
+            refreshed=False,
+            refresh_attempted=True,
+            elapsed_sec=elapsed_sec,
+            error=str(exc),
+            previous_as_of=(current_snapshot.as_of.isoformat() if current_snapshot is not None else None),
+            using_previous_snapshot=(current_snapshot is not None),
+        )
     total_refresh_elapsed_sec = max(
         elapsed_sec,
         float(build_result.total_refresh_elapsed_sec or 0.0),
@@ -239,8 +251,8 @@ def refresh_shared_market_regime_snapshot(
     using_previous_snapshot = current_snapshot is not None
     if effective_budget_sec > 0 and total_refresh_elapsed_sec > effective_budget_sec:
         return MarketRegimeRefreshOutcome(
-            snapshot=current_snapshot,
-            refreshed=False,
+            snapshot=next_snapshot,
+            refreshed=(next_snapshot is not None),
             refresh_attempted=True,
             elapsed_sec=total_refresh_elapsed_sec,
             budget_exceeded=True,
@@ -251,11 +263,11 @@ def refresh_shared_market_regime_snapshot(
             bootstrap_budget_sec=bootstrap_budget_sec,
             used_bootstrap_budget=used_bootstrap_budget,
             previous_as_of=previous_as_of,
-            using_previous_snapshot=using_previous_snapshot,
+            using_previous_snapshot=(next_snapshot is None and using_previous_snapshot),
         )
 
     return MarketRegimeRefreshOutcome(
-        snapshot=materialize_market_regime_snapshot(build_result.snapshot, now_kst),
+        snapshot=next_snapshot,
         refreshed=True,
         refresh_attempted=True,
         elapsed_sec=total_refresh_elapsed_sec,
@@ -499,11 +511,13 @@ class MarketRegimeService:
 
     def _log_snapshot(self, snapshot: MarketRegimeSnapshot) -> None:
         logger.info(
-            "[MARKET_REGIME] regime=%s reason=%s kospi_symbol=%s kosdaq_symbol=%s "
-            "kospi_close=%.6f kospi_ma20=%.6f kosdaq_close=%.6f kosdaq_ma20=%.6f "
-            "kospi_3d_return_pct=%.6f kosdaq_3d_return_pct=%.6f",
+            "[MARKET_REGIME] snapshot_built regime=%s reason=%s as_of=%s "
+            "kospi_symbol=%s kosdaq_symbol=%s kospi_close=%.6f kospi_ma20=%.6f "
+            "kosdaq_close=%.6f kosdaq_ma20=%.6f kospi_3d_return_pct=%.6f "
+            "kosdaq_3d_return_pct=%.6f",
             snapshot.regime.value,
             snapshot.reason,
+            snapshot.as_of.isoformat(),
             snapshot.kospi_symbol,
             snapshot.kosdaq_symbol,
             snapshot.kospi_close,
@@ -563,17 +577,19 @@ def log_market_regime_refresh_outcome(
     if outcome.refreshed and snapshot is not None:
         ttl_sec = max((snapshot.expires_at - snapshot.as_of).total_seconds(), 0.0)
         logger.info(
-            "[MARKET_REGIME] snapshot_updated regime=%s reason=%s as_of=%s "
-            "expires_at=%s ttl_sec=%.1f source=%s kospi_symbol=%s kosdaq_symbol=%s "
-            "kospi_close=%.6f kospi_ma=%.6f kosdaq_close=%.6f kosdaq_ma=%.6f "
-            "total_refresh_elapsed_sec=%.3f daily_fetch_elapsed_sec=%.3f "
-            "intraday_fetch_elapsed_sec=%.3f classify_elapsed_sec=%.3f",
+                "[MARKET_REGIME] snapshot_updated regime=%s reason=%s as_of=%s "
+            "expires_at=%s ttl_sec=%.1f source=%s budget_exceeded=%s "
+            "kospi_symbol=%s kosdaq_symbol=%s kospi_close=%.6f kospi_ma=%.6f "
+            "kosdaq_close=%.6f kosdaq_ma=%.6f total_refresh_elapsed_sec=%.3f "
+            "daily_fetch_elapsed_sec=%.3f intraday_fetch_elapsed_sec=%.3f "
+            "classify_elapsed_sec=%.3f",
             snapshot.regime.value,
             snapshot.reason,
             snapshot.as_of.isoformat(),
             snapshot.expires_at.isoformat(),
             ttl_sec,
             snapshot.source,
+            str(bool(outcome.budget_exceeded)).lower(),
             snapshot.kospi_symbol,
             snapshot.kosdaq_symbol,
             snapshot.kospi_close,
@@ -585,14 +601,13 @@ def log_market_regime_refresh_outcome(
             max(float(outcome.intraday_fetch_elapsed_sec or 0.0), 0.0),
             max(float(outcome.classify_elapsed_sec or 0.0), 0.0),
         )
-        return
 
     if outcome.budget_exceeded:
         logger.warning(
             "[MARKET_REGIME] snapshot_refresh_budget_exceeded budget_sec=%.3f "
             "total_refresh_elapsed_sec=%.3f daily_fetch_elapsed_sec=%.3f "
             "intraday_fetch_elapsed_sec=%.3f classify_elapsed_sec=%.3f "
-            "using_previous_snapshot=%s previous_as_of=%s",
+            "using_previous_snapshot=%s previous_as_of=%s adopted_as_of=%s",
             max(float(outcome.effective_budget_sec or 0.0), 0.0),
             outcome.total_refresh_elapsed_sec,
             max(float(outcome.daily_fetch_elapsed_sec or 0.0), 0.0),
@@ -600,6 +615,7 @@ def log_market_regime_refresh_outcome(
             max(float(outcome.classify_elapsed_sec or 0.0), 0.0),
             str(bool(outcome.using_previous_snapshot)).lower(),
             outcome.previous_as_of or "none",
+            snapshot.as_of.isoformat() if snapshot is not None else "none",
         )
 
 

@@ -255,6 +255,10 @@ TOKEN_REFRESH_MARGIN_MINUTES: int = int(os.getenv("TOKEN_REFRESH_MARGIN_MINUTES"
 TOKEN_PREWARM_HOUR: int = int(os.getenv("TOKEN_PREWARM_HOUR", "8"))
 TOKEN_PREWARM_MINUTE: int = int(os.getenv("TOKEN_PREWARM_MINUTE", "0"))
 
+# 계좌/보유 조회 단기 캐시 (burst 완화용)
+ACCOUNT_BALANCE_CACHE_TTL_SEC: float = float(os.getenv("ACCOUNT_BALANCE_CACHE_TTL_SEC", "2.0"))
+ACCOUNT_HOLDINGS_CACHE_TTL_SEC: float = float(os.getenv("ACCOUNT_HOLDINGS_CACHE_TTL_SEC", "2.0"))
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 실행 주기 설정

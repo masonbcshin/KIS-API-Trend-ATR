@@ -212,6 +212,21 @@ def test_executor_builds_protected_limit_plan_using_orb_reference_price_and_cap(
     assert round(plan["extension_pct_at_order"], 6) == round((50900.0 / 50750.0) - 1.0, 6)
 
 
+def test_pullback_daily_refresh_symbols_filter_blank_and_placeholder_codes():
+    executor = _make_executor()
+    executor.strategy = SimpleNamespace(position=SimpleNamespace(symbol="000000"))
+    executor.stock_code = ""
+
+    assert executor.get_pullback_daily_refresh_symbols() == []
+
+    executor.stock_code = "5930"
+    executor.strategy.position = SimpleNamespace(symbol=None)
+    assert executor.get_pullback_daily_refresh_symbols() == ["005930"]
+
+    executor.strategy.position = SimpleNamespace(symbol="000000")
+    assert executor.get_pullback_daily_refresh_symbols() == ["005930"]
+
+
 class _OrderWorkerStrategyStub:
     def __init__(self):
         self.has_position = False
