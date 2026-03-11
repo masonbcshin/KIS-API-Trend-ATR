@@ -418,6 +418,9 @@ class MultidayExecutor:
         self._pullback_quote_unsubscribe: Optional[Any] = None
         self._strategy_pipeline_registry: Optional[Any] = None
         self._strategy_pipeline_enabled_tags: tuple[str, ...] = ()
+        self._strategy_shadow_state_lock = threading.Lock()
+        self._strategy_shadow_candidates: Dict[str, Any] = {}
+        self._strategy_shadow_intents: Dict[str, Any] = {}
         self._pullback_threaded_context_version: str = ""
         self._pullback_daily_context_version: str = ""
         self._pullback_latest_quote_snapshot: Dict[str, Any] = {}
@@ -437,6 +440,7 @@ class MultidayExecutor:
         self._intent_queue_depth_by_strategy: Dict[str, int] = {}
         self._strategy_end_to_end_latency_ms: float = 0.0
         self._strategy_regime_snapshot_state_used: str = "absent"
+        self._trend_atr_adapter_path_used: bool = False
         self._risk_snapshot_refresh_ms: float = 0.0
         self._risk_snapshot_refresh_count: int = 0
         self._holdings_snapshot_refresh_count: int = 0
@@ -548,6 +552,57 @@ class MultidayExecutor:
                 tags.append(normalized)
         return tuple(tags)
 
+    @staticmethod
+    def _strategy_shadow_key(strategy_tag: str, symbol: str) -> str:
+        return f"{str(strategy_tag or '').strip()}:{str(symbol or '').zfill(6)}"
+
+    def upsert_strategy_shadow_candidate(self, strategy_tag: str, symbol: str, candidate: Any) -> None:
+        key = self._strategy_shadow_key(strategy_tag, symbol)
+        with self._strategy_shadow_state_lock:
+            self._strategy_shadow_candidates[key] = candidate
+
+    def get_strategy_shadow_candidate(self, strategy_tag: str, symbol: str) -> Optional[Any]:
+        key = self._strategy_shadow_key(strategy_tag, symbol)
+        with self._strategy_shadow_state_lock:
+            return self._strategy_shadow_candidates.get(key)
+
+    def remove_strategy_shadow_candidate(self, strategy_tag: str, symbol: str) -> Optional[Any]:
+        key = self._strategy_shadow_key(strategy_tag, symbol)
+        with self._strategy_shadow_state_lock:
+            return self._strategy_shadow_candidates.pop(key, None)
+
+    def upsert_strategy_shadow_intent(self, strategy_tag: str, symbol: str, intent: Any) -> None:
+        key = self._strategy_shadow_key(strategy_tag, symbol)
+        with self._strategy_shadow_state_lock:
+            self._strategy_shadow_intents[key] = intent
+
+    def get_strategy_shadow_intent(self, strategy_tag: str, symbol: str) -> Optional[Any]:
+        key = self._strategy_shadow_key(strategy_tag, symbol)
+        with self._strategy_shadow_state_lock:
+            return self._strategy_shadow_intents.get(key)
+
+    def remove_strategy_shadow_intent(self, strategy_tag: str, symbol: str) -> Optional[Any]:
+        key = self._strategy_shadow_key(strategy_tag, symbol)
+        with self._strategy_shadow_state_lock:
+            return self._strategy_shadow_intents.pop(key, None)
+
+    def clear_strategy_shadow_state(self) -> None:
+        with self._strategy_shadow_state_lock:
+            self._strategy_shadow_candidates.clear()
+            self._strategy_shadow_intents.clear()
+
+    def get_strategy_shadow_counts(self) -> Dict[str, Dict[str, int]]:
+        with self._strategy_shadow_state_lock:
+            candidate_counts: Dict[str, int] = {}
+            intent_counts: Dict[str, int] = {}
+            for key in self._strategy_shadow_candidates.keys():
+                strategy_tag = key.split(":", 1)[0]
+                candidate_counts[strategy_tag] = candidate_counts.get(strategy_tag, 0) + 1
+            for key in self._strategy_shadow_intents.keys():
+                strategy_tag = key.split(":", 1)[0]
+                intent_counts[strategy_tag] = intent_counts.get(strategy_tag, 0) + 1
+        return {"candidates": candidate_counts, "intents": intent_counts}
+
     def _is_multi_strategy_threaded_pipeline_enabled(self) -> bool:
         if not bool(getattr(settings, "ENABLE_MULTI_STRATEGY_THREADED_PIPELINE", False)):
             return False
@@ -633,7 +688,8 @@ class MultidayExecutor:
         self._strategy_pipeline_registry = None
         if self._is_multi_strategy_threaded_pipeline_enabled():
             self._strategy_pipeline_registry = build_default_strategy_registry(
-                pullback_strategy=self.strategy.pullback_strategy
+                pullback_strategy=self.strategy.pullback_strategy,
+                trend_atr_strategy=self.strategy,
             )
         if self._is_pullback_daily_refresh_enabled():
             self._pullback_daily_refresh_worker = DailyRefreshThread(
@@ -751,10 +807,12 @@ class MultidayExecutor:
         self._pullback_account_risk_store = None
         self._strategy_pipeline_registry = None
         self._strategy_pipeline_enabled_tags = ()
+        self.clear_strategy_shadow_state()
         self._candidate_store_size_by_strategy = {}
         self._intent_queue_depth_by_strategy = {}
         self._pullback_threaded_context_version = ""
         self._pullback_daily_context_version = ""
+        self._trend_atr_adapter_path_used = False
 
     def fetch_cached_intraday_bars_if_available(self, n: int = 120) -> list[dict]:
         provider = getattr(self, "market_data_provider", None)
@@ -785,6 +843,15 @@ class MultidayExecutor:
         return normalized
 
     def _pullback_pipeline_metrics(self) -> Dict[str, Any]:
+        shadow_counts = self.get_strategy_shadow_counts()
+        candidate_counts = dict(getattr(self, "_candidate_store_size_by_strategy", {}) or {})
+        candidate_counts.update(dict(shadow_counts.get("candidates") or {}))
+        if self._pullback_candidate_store is not None:
+            candidate_counts["pullback_rebreakout"] = int(self._pullback_candidate_store.size())
+        intent_counts = dict(getattr(self, "_intent_queue_depth_by_strategy", {}) or {})
+        intent_counts.update(dict(shadow_counts.get("intents") or {}))
+        if self._pullback_entry_queue is not None:
+            intent_counts["pullback_rebreakout"] = int(self._pullback_entry_queue.qsize())
         return {
             "daily_context_refresh_ms": float(getattr(self, "_daily_context_refresh_ms", 0.0) or 0.0),
             "daily_context_refresh_count": int(getattr(self, "_daily_context_refresh_count", 0) or 0),
@@ -796,26 +863,19 @@ class MultidayExecutor:
             "pullback_end_to_end_latency_ms": float(
                 getattr(self, "_pullback_end_to_end_latency_ms", 0.0) or 0.0
             ),
-            "pullback_candidate_store_size": (
-                int(self._pullback_candidate_store.size())
-                if self._pullback_candidate_store is not None
-                else 0
-            ),
+            "pullback_candidate_store_size": int(candidate_counts.get("pullback_rebreakout", 0) or 0),
             "pullback_timing_skip_reason": str(getattr(self, "_pullback_timing_skip_reason", "") or ""),
             "strategy_setup_eval_ms": float(getattr(self, "_strategy_setup_eval_ms", 0.0) or 0.0),
             "strategy_timing_eval_ms": float(getattr(self, "_strategy_timing_eval_ms", 0.0) or 0.0),
-            "candidate_store_size_by_strategy": dict(
-                getattr(self, "_candidate_store_size_by_strategy", {}) or {}
-            ),
-            "intent_queue_depth_by_strategy": dict(
-                getattr(self, "_intent_queue_depth_by_strategy", {}) or {}
-            ),
+            "candidate_store_size_by_strategy": candidate_counts,
+            "intent_queue_depth_by_strategy": intent_counts,
             "strategy_end_to_end_latency_ms": float(
                 getattr(self, "_strategy_end_to_end_latency_ms", 0.0) or 0.0
             ),
             "strategy_regime_snapshot_state_used": str(
                 getattr(self, "_strategy_regime_snapshot_state_used", "absent") or "absent"
             ),
+            "trend_atr_adapter_path_used": bool(getattr(self, "_trend_atr_adapter_path_used", False)),
             "risk_snapshot_refresh_ms": float(getattr(self, "_risk_snapshot_refresh_ms", 0.0) or 0.0),
             "risk_snapshot_refresh_count": int(getattr(self, "_risk_snapshot_refresh_count", 0) or 0),
             "holdings_snapshot_refresh_count": int(getattr(self, "_holdings_snapshot_refresh_count", 0) or 0),

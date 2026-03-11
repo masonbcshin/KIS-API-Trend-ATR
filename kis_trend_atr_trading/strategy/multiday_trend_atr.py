@@ -1013,6 +1013,81 @@ class MultidayTrendATRStrategy:
             trend=trend,
             meta=pullback_meta,
         )
+
+    def evaluate_trend_atr_setup_candidate(
+        self,
+        *,
+        df: pd.DataFrame,
+        current_price: float,
+        open_price: Optional[float] = None,
+        stock_code: str = "",
+        stock_name: str = "",
+        check_time: Optional[datetime] = None,
+        market_regime_snapshot: Optional[object] = None,
+    ) -> Dict[str, Any]:
+        df_with_indicators = self.add_indicators(df) if not {
+            "atr", "ma", "ma20", "adx", "trend", "prev_high", "prev_close"
+        }.issubset(set(df.columns)) else df.copy()
+        if df_with_indicators.empty:
+            return {
+                "can_enter": False,
+                "reason": "데이터 없음",
+                "atr": 0.0,
+                "meta": {},
+                "df_with_indicators": df_with_indicators,
+                "trend": TrendType.SIDEWAYS,
+                "current_atr": 0.0,
+                "market_regime_snapshot": market_regime_snapshot,
+            }
+        latest = df_with_indicators.iloc[-1]
+        current_atr = latest.get("atr", 0) if not pd.isna(latest.get("atr", 0)) else 0
+        trend = self.get_trend(df_with_indicators)
+        can_enter, entry_reason, entry_atr, entry_meta = self.check_entry_conditions(
+            df_with_indicators,
+            current_price,
+            open_price=open_price,
+            stock_code=stock_code,
+            stock_name=stock_name,
+            check_time=check_time,
+        )
+        entry_meta = dict(entry_meta or {})
+        entry_meta.setdefault("strategy_tag", "trend_atr")
+        return {
+            "can_enter": bool(can_enter),
+            "reason": str(entry_reason or ""),
+            "atr": float(entry_atr or 0.0),
+            "meta": entry_meta,
+            "df_with_indicators": df_with_indicators,
+            "trend": trend,
+            "current_atr": float(current_atr or 0.0),
+            "market_regime_snapshot": market_regime_snapshot,
+        }
+
+    def build_trend_atr_buy_signal(
+        self,
+        *,
+        current_price: float,
+        entry_reason: str,
+        entry_atr: float,
+        entry_meta: Dict[str, Any],
+        df_with_indicators: pd.DataFrame,
+    ) -> TradingSignal:
+        trend = self.get_trend(df_with_indicators)
+        stop_loss = self.calculate_stop_loss(current_price, entry_atr)
+        take_profit = self.calculate_take_profit(current_price, entry_atr)
+        signal_meta = dict(entry_meta or {})
+        signal_meta.setdefault("strategy_tag", "trend_atr")
+        return TradingSignal(
+            signal_type=SignalType.BUY,
+            price=current_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            trailing_stop=stop_loss,
+            reason=entry_reason,
+            atr=entry_atr,
+            trend=trend,
+            meta=signal_meta,
+        )
     
     # ════════════════════════════════════════════════════════════════
     # 시그널 생성 (메인 로직)
@@ -1295,38 +1370,33 @@ class MultidayTrendATRStrategy:
                 meta=orb_meta,
             )
 
-        can_enter, entry_reason, entry_atr, entry_meta = self.check_entry_conditions(
-            df_with_indicators,
-            current_price,
+        trend_atr_setup = self.evaluate_trend_atr_setup_candidate(
+            df=df_with_indicators,
+            current_price=current_price,
             open_price=open_price,
             stock_code=stock_code,
             stock_name=stock_name,
             check_time=check_time,
+            market_regime_snapshot=market_regime_snapshot,
         )
+        can_enter = bool(trend_atr_setup.get("can_enter", False))
+        entry_reason = str(trend_atr_setup.get("reason") or "")
+        entry_atr = float(trend_atr_setup.get("atr", 0.0) or 0.0)
+        entry_meta = dict(trend_atr_setup.get("meta") or {})
 
         if can_enter:
-            stop_loss = self.calculate_stop_loss(current_price, entry_atr)
-            take_profit = self.calculate_take_profit(current_price, entry_atr)
-            entry_meta = dict(entry_meta or {})
-            entry_meta.setdefault("strategy_tag", "trend_atr")
-            
             trade_logger.log_signal(
                 signal_type="BUY",
                 stock_code=stock_code,
                 price=current_price,
                 reason=entry_reason
             )
-            
-            return TradingSignal(
-                signal_type=SignalType.BUY,
-                price=current_price,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                trailing_stop=stop_loss,  # 초기 트레일링 = 손절가
-                reason=entry_reason,
-                atr=entry_atr,
-                trend=trend,
-                meta=entry_meta,
+            return self.build_trend_atr_buy_signal(
+                current_price=current_price,
+                entry_reason=entry_reason,
+                entry_atr=entry_atr,
+                entry_meta=entry_meta,
+                df_with_indicators=df_with_indicators,
             )
         
         # Entry 조건 미충족 → HOLD

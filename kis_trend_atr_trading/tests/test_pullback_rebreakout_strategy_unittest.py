@@ -37,6 +37,7 @@ from engine.pullback_pipeline_workers import (
     PullbackTimingWorker,
     RiskSnapshotThread,
 )
+from engine.multiday_executor import MultidayExecutor
 from engine.strategy_pipeline_registry import build_default_strategy_registry
 from strategy.multiday_trend_atr import MultidayTrendATRStrategy, SignalType
 from strategy.pullback_rebreakout import PullbackDecision, PullbackRebreakoutStrategy
@@ -93,6 +94,7 @@ def _patch_pullback_enabled():
         multiday_trend_atr.settings,
         ENABLE_PULLBACK_REBREAKOUT_STRATEGY=True,
         ENABLE_THREADED_PULLBACK_PIPELINE=True,
+        ENABLE_MULTI_STRATEGY_THREADED_PIPELINE=False,
         ENABLE_PULLBACK_DAILY_REFRESH_THREAD=False,
         PULLBACK_LOOKBACK_BARS=12,
         PULLBACK_SWING_LOOKBACK_BARS=15,
@@ -113,6 +115,21 @@ def _patch_pullback_enabled():
         ENABLE_OPENING_NO_ENTRY_GUARD=False,
         ENABLE_BREAKOUT_EXTENSION_CAP=False,
         ENABLE_ENTRY_GAP_FILTER=False,
+    )
+
+
+def _patch_multi_strategy_registry_enabled():
+    return patch.multiple(
+        multiday_trend_atr.settings,
+        ENABLE_PULLBACK_REBREAKOUT_STRATEGY=True,
+        ENABLE_MULTI_STRATEGY_THREADED_PIPELINE=True,
+        THREADED_PIPELINE_ENABLED_STRATEGIES="pullback_rebreakout,trend_atr",
+        STRATEGY_CANDIDATE_MAX_AGE_SEC=300,
+        ENABLE_PULLBACK_DAILY_REFRESH_THREAD=False,
+        ENABLE_OPENING_RANGE_BREAKOUT_STRATEGY=False,
+        ENABLE_BREAKOUT_EXTENSION_CAP=False,
+        ENABLE_ENTRY_GAP_FILTER=False,
+        ENABLE_OPENING_NO_ENTRY_GUARD=False,
     )
 
 
@@ -1059,6 +1076,7 @@ def test_pullback_registry_setup_parity_matches_native_candidate_and_skip_semant
             daily_df=prepared_df,
             daily_context=None,
             current_price=175.2,
+            open_price=173.4,
             stock_code="005930",
             stock_name="삼성전자",
             check_time=_kst_dt(2026, 2, 20, 10, 30),
@@ -1081,6 +1099,7 @@ def test_pullback_registry_setup_parity_matches_native_candidate_and_skip_semant
             daily_df=prepared_df,
             daily_context=None,
             current_price=170.0,
+            open_price=173.4,
             stock_code="005930",
             stock_name="삼성전자",
             check_time=_kst_dt(2026, 2, 20, 10, 30),
@@ -1168,3 +1187,238 @@ def test_registry_path_uses_market_regime_read_only_without_sync_refresh():
 
     assert setup_worker._candidate_store.get("005930") is not None
     assert executor.fetch_market_data_called == 0
+
+
+def test_trend_atr_registry_lookup_returns_adapter_when_provided(sample_uptrend_df):
+    strategy = MultidayTrendATRStrategy()
+    registry = build_default_strategy_registry(
+        pullback_strategy=strategy.pullback_strategy,
+        trend_atr_strategy=strategy,
+    )
+
+    entry = registry.get("trend_atr")
+
+    assert entry is not None
+    assert entry.strategy_tag == "trend_atr"
+    assert entry.capabilities.market_regime_mode == "read_only"
+    assert registry.strategy_tags() == ("pullback_rebreakout", "trend_atr")
+
+
+def test_trend_atr_registry_adapter_parity_matches_legacy_buy_semantics(sample_uptrend_df):
+    strategy = MultidayTrendATRStrategy()
+    registry = build_default_strategy_registry(
+        pullback_strategy=strategy.pullback_strategy,
+        trend_atr_strategy=strategy,
+    )
+    entry = registry.get("trend_atr")
+    prepared_df = strategy.add_indicators(sample_uptrend_df)
+    prev_high = float(prepared_df.iloc[-1]["prev_high"])
+    prev_close = float(prepared_df.iloc[-1]["prev_close"])
+    current_price = prev_high * 1.002
+    open_price = prev_close * 1.001
+
+    with patch.object(multiday_trend_atr.settings, "ENABLE_PULLBACK_REBREAKOUT_STRATEGY", False), \
+         patch.object(multiday_trend_atr.settings, "ENABLE_OPENING_RANGE_BREAKOUT_STRATEGY", False), \
+         patch.object(multiday_trend_atr.settings, "ENABLE_BREAKOUT_EXTENSION_CAP", False), \
+         patch.object(multiday_trend_atr.settings, "ENABLE_ENTRY_GAP_FILTER", False), \
+         patch.object(multiday_trend_atr.settings, "ENABLE_OPENING_NO_ENTRY_GUARD", False):
+        legacy_signal = strategy.generate_signal(
+            df=sample_uptrend_df,
+            current_price=current_price,
+            open_price=open_price,
+            stock_code="005930",
+            stock_name="삼성전자",
+            check_time=_kst_dt(2026, 2, 20, 10, 30),
+        )
+        evaluation = entry.setup_evaluator.evaluate_setup(
+            daily_df=sample_uptrend_df,
+            daily_context=None,
+            current_price=current_price,
+            open_price=open_price,
+            stock_code="005930",
+            stock_name="삼성전자",
+            check_time=_kst_dt(2026, 2, 20, 10, 30),
+            market_phase=VenueMarketPhase.KRX_CONTINUOUS,
+            market_venue="KRX",
+            has_existing_position=False,
+            has_pending_order=False,
+            market_regime_snapshot=None,
+        )
+        decision = entry.timing_evaluator.evaluate_timing(
+            candidate=evaluation.candidate,
+            native_candidate=evaluation.native_candidate,
+            current_price=current_price,
+            stock_code="005930",
+            check_time=_kst_dt(2026, 2, 20, 10, 30),
+            market_phase=VenueMarketPhase.KRX_CONTINUOUS,
+            market_venue="KRX",
+            intraday_bars=[],
+            has_existing_position=False,
+            has_pending_order=False,
+            current_context_version=None,
+        )
+
+    assert legacy_signal.signal_type == SignalType.BUY
+    assert evaluation.candidate is not None
+    assert decision.should_emit_intent is True
+    assert evaluation.candidate.entry_reference_price == legacy_signal.meta["entry_reference_price"]
+    assert evaluation.candidate.entry_reference_label == legacy_signal.meta["entry_reference_label"]
+    assert round(evaluation.candidate.meta["entry_meta"]["extension_pct"], 6) == round(
+        legacy_signal.meta["extension_pct"], 6
+    )
+    assert evaluation.candidate.meta["entry_meta"]["strategy_tag"] == legacy_signal.meta["strategy_tag"]
+
+
+def test_trend_atr_registry_adapter_blocked_setup_matches_legacy_hold_semantics(sample_uptrend_df):
+    strategy = MultidayTrendATRStrategy()
+    registry = build_default_strategy_registry(
+        pullback_strategy=strategy.pullback_strategy,
+        trend_atr_strategy=strategy,
+    )
+    entry = registry.get("trend_atr")
+    prepared_df = strategy.add_indicators(sample_uptrend_df)
+    prev_high = float(prepared_df.iloc[-1]["prev_high"])
+    prev_close = float(prepared_df.iloc[-1]["prev_close"])
+
+    with patch.object(multiday_trend_atr.settings, "ENABLE_PULLBACK_REBREAKOUT_STRATEGY", False), \
+         patch.object(multiday_trend_atr.settings, "ENABLE_OPENING_RANGE_BREAKOUT_STRATEGY", False), \
+         patch.object(multiday_trend_atr.settings, "ENABLE_BREAKOUT_EXTENSION_CAP", False), \
+         patch.object(multiday_trend_atr.settings, "ENABLE_ENTRY_GAP_FILTER", False), \
+         patch.object(multiday_trend_atr.settings, "ENABLE_OPENING_NO_ENTRY_GUARD", False):
+        legacy_signal = strategy.generate_signal(
+            df=sample_uptrend_df,
+            current_price=prev_high,
+            open_price=prev_close,
+            stock_code="005930",
+            stock_name="삼성전자",
+            check_time=_kst_dt(2026, 2, 20, 10, 30),
+        )
+        evaluation = entry.setup_evaluator.evaluate_setup(
+            daily_df=sample_uptrend_df,
+            daily_context=None,
+            current_price=prev_high,
+            open_price=prev_close,
+            stock_code="005930",
+            stock_name="삼성전자",
+            check_time=_kst_dt(2026, 2, 20, 10, 30),
+            market_phase=VenueMarketPhase.KRX_CONTINUOUS,
+            market_venue="KRX",
+            has_existing_position=False,
+            has_pending_order=False,
+            market_regime_snapshot=None,
+        )
+
+    assert legacy_signal.signal_type == SignalType.HOLD
+    assert evaluation.candidate is None
+    assert "돌파" in legacy_signal.reason
+    assert "돌파" in evaluation.skip_reason
+
+
+def test_trend_atr_registry_shadow_routing_keeps_order_path_legacy_and_read_only():
+    executor = MultidayExecutor.__new__(MultidayExecutor)
+    executor.stock_code = "005930"
+    executor.strategy = MultidayTrendATRStrategy()
+    executor.market_phase_context = VenueMarketPhase.KRX_CONTINUOUS
+    executor.market_venue_context = "KRX"
+    executor.market_regime_snapshot = object()
+    executor._market_regime_worker_error_state = ""
+    executor._strategy_shadow_state_lock = threading.Lock()
+    executor._strategy_shadow_candidates = {}
+    executor._strategy_shadow_intents = {}
+    executor._trend_atr_adapter_path_used = False
+    executor._pullback_threaded_context_version = ""
+    executor._pullback_daily_context_version = ""
+    executor._pullback_setup_skip_reason = ""
+    executor._pullback_timing_skip_reason = ""
+    executor._candidate_store_size_by_strategy = {}
+    executor._intent_queue_depth_by_strategy = {}
+    executor._pullback_latest_quote_snapshot = {
+        "stock_code": "005930",
+        "stock_name": "삼성전자",
+        "current_price": 177.0,
+        "open_price": 173.4,
+        "received_at": _kst_dt(2026, 2, 20, 10, 30),
+    }
+    executor.fetch_quote_snapshot = lambda: dict(executor._pullback_latest_quote_snapshot)
+    executor.get_cached_pullback_quote_snapshot = lambda: dict(executor._pullback_latest_quote_snapshot)
+    executor.fetch_market_data = lambda: _make_pullback_indicator_df().copy()
+    executor.fetch_cached_intraday_bars_if_available = lambda n=120: []
+    executor._has_active_pending_buy_order = lambda: False
+    executor.cached_account_has_holding = lambda _symbol: False
+    executor.refresh_shared_market_regime_snapshot = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("trend_atr registry path must not sync refresh market regime")
+    )
+    candidate_store = ArmedCandidateStore()
+    dirty = DirtySymbolSet()
+    entry_queue = EntryIntentQueue(maxsize=8)
+    registry = build_default_strategy_registry(
+        pullback_strategy=executor.strategy.pullback_strategy,
+        trend_atr_strategy=executor.strategy,
+    )
+    setup_worker = PullbackSetupWorker(
+        executor=executor,
+        candidate_store=candidate_store,
+        daily_context_store=None,
+        dirty_symbols=dirty,
+        strategy_registry=registry,
+        enabled_strategy_tags=("pullback_rebreakout", "trend_atr"),
+        stop_event=threading.Event(),
+        on_error=lambda *_args: None,
+    )
+    timing_worker = PullbackTimingWorker(
+        executor=executor,
+        candidate_store=candidate_store,
+        dirty_symbols=dirty,
+        entry_queue=entry_queue,
+        strategy_registry=registry,
+        enabled_strategy_tags=("pullback_rebreakout", "trend_atr"),
+        stop_event=threading.Event(),
+        on_error=lambda *_args: None,
+    )
+
+    with _patch_pullback_enabled(), \
+         patch.object(multiday_trend_atr.settings, "ENABLE_MULTI_STRATEGY_THREADED_PIPELINE", True), \
+         patch.object(multiday_trend_atr.settings, "THREADED_PIPELINE_ENABLED_STRATEGIES", "pullback_rebreakout,trend_atr"), \
+         patch.object(multiday_trend_atr.settings, "STRATEGY_CANDIDATE_MAX_AGE_SEC", 300), \
+         patch.object(multiday_trend_atr.settings, "ENABLE_OPENING_RANGE_BREAKOUT_STRATEGY", False):
+        setup_worker._run_cycle()
+        timing_worker._process_symbol("005930")
+
+    pullback_candidate = candidate_store.get("005930")
+    trend_candidate = executor.get_strategy_shadow_candidate("trend_atr", "005930")
+    trend_intent = executor.get_strategy_shadow_intent("trend_atr", "005930")
+
+    assert pullback_candidate is not None
+    assert trend_candidate is not None
+    assert trend_candidate.strategy_tag == "trend_atr"
+    assert trend_intent is not None
+    assert trend_intent.strategy_tag == "trend_atr"
+    assert entry_queue.qsize() == 1
+    assert executor._trend_atr_adapter_path_used is True
+
+
+def test_strategy_candidate_max_age_does_not_change_legacy_trend_atr_signal(sample_uptrend_df):
+    strategy = MultidayTrendATRStrategy()
+    prepared_df = strategy.add_indicators(sample_uptrend_df)
+    prev_high = float(prepared_df.iloc[-1]["prev_high"])
+    prev_close = float(prepared_df.iloc[-1]["prev_close"])
+    current_price = prev_high * 1.002
+    open_price = prev_close * 1.001
+
+    with patch.object(multiday_trend_atr.settings, "ENABLE_PULLBACK_REBREAKOUT_STRATEGY", False), \
+         patch.object(multiday_trend_atr.settings, "ENABLE_OPENING_RANGE_BREAKOUT_STRATEGY", False), \
+         patch.object(multiday_trend_atr.settings, "ENABLE_BREAKOUT_EXTENSION_CAP", False), \
+         patch.object(multiday_trend_atr.settings, "ENABLE_ENTRY_GAP_FILTER", False), \
+         patch.object(multiday_trend_atr.settings, "ENABLE_OPENING_NO_ENTRY_GUARD", False), \
+         patch.object(multiday_trend_atr.settings, "STRATEGY_CANDIDATE_MAX_AGE_SEC", 1):
+        signal = strategy.generate_signal(
+            df=sample_uptrend_df,
+            current_price=current_price,
+            open_price=open_price,
+            stock_code="005930",
+            stock_name="삼성전자",
+            check_time=_kst_dt(2026, 2, 20, 10, 30),
+        )
+
+    assert signal.signal_type == SignalType.BUY
+    assert signal.meta["strategy_tag"] == "trend_atr"

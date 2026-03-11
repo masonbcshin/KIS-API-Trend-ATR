@@ -15,6 +15,7 @@ try:
         DailyContext,
         PullbackEntryIntent,
         PullbackSetupCandidate,
+        StrategyEntryIntent,
         pullback_timing_decision_from_strategy,
         strategy_setup_candidate_from_pullback,
     )
@@ -36,6 +37,7 @@ except ImportError:
         DailyContext,
         PullbackEntryIntent,
         PullbackSetupCandidate,
+        StrategyEntryIntent,
         pullback_timing_decision_from_strategy,
         strategy_setup_candidate_from_pullback,
     )
@@ -364,9 +366,63 @@ class PullbackSetupWorker(threading.Thread):
             return None
         return self._strategy_registry.get("pullback_rebreakout")
 
+    def _process_shadow_strategy_setup(
+        self,
+        *,
+        strategy_tag: str,
+        daily_df: Optional[pd.DataFrame],
+        daily_context: Optional[DailyContext],
+        current_price: float,
+        open_price: Optional[float],
+        stock_name: str,
+        decision_time: datetime,
+        has_pending_order: bool,
+    ) -> None:
+        if self._strategy_registry is None or strategy_tag not in self._enabled_strategy_tags:
+            return
+        if strategy_tag == "pullback_rebreakout":
+            return
+        upsert_shadow_candidate = getattr(self._executor, "upsert_strategy_shadow_candidate", None)
+        remove_shadow_candidate = getattr(self._executor, "remove_strategy_shadow_candidate", None)
+        if not callable(upsert_shadow_candidate) or not callable(remove_shadow_candidate):
+            return
+        registry_entry = self._strategy_registry.get(strategy_tag)
+        if registry_entry is None:
+            return
+        evaluation = registry_entry.setup_evaluator.evaluate_setup(
+            daily_df=daily_df,
+            daily_context=daily_context,
+            current_price=current_price,
+            open_price=open_price,
+            stock_code=self._executor.stock_code,
+            stock_name=stock_name,
+            check_time=decision_time,
+            market_phase=getattr(self._executor, "market_phase_context", None),
+            market_venue=getattr(self._executor, "market_venue_context", "KRX"),
+            has_existing_position=self._executor.strategy.has_position,
+            has_pending_order=has_pending_order,
+            market_regime_snapshot=getattr(self._executor, "market_regime_snapshot", None),
+        )
+        setattr(self._executor, "_trend_atr_adapter_path_used", strategy_tag == "trend_atr")
+        if evaluation.candidate is None:
+            remove_shadow_candidate(strategy_tag, self._executor.stock_code)
+            remove_shadow_intent = getattr(self._executor, "remove_strategy_shadow_intent", None)
+            if callable(remove_shadow_intent):
+                remove_shadow_intent(strategy_tag, self._executor.stock_code)
+            return
+        upsert_shadow_candidate(
+            strategy_tag,
+            self._executor.stock_code,
+            evaluation.candidate,
+        )
+
     def _record_setup_metrics(self, elapsed_ms: float) -> None:
         setattr(self._executor, "_strategy_setup_eval_ms", elapsed_ms)
-        setattr(self._executor, "_candidate_store_size_by_strategy", {"pullback_rebreakout": self._candidate_store.size()})
+        get_shadow_counts = getattr(self._executor, "get_strategy_shadow_counts", None)
+        shadow_counts = get_shadow_counts() if callable(get_shadow_counts) else {"candidates": {}, "intents": {}}
+        candidate_counts = {"pullback_rebreakout": self._candidate_store.size()}
+        candidate_counts.update(dict(shadow_counts.get("candidates") or {}))
+        setattr(self._executor, "_candidate_store_size_by_strategy", candidate_counts)
         setattr(self._executor, "_strategy_regime_snapshot_state_used", self._resolve_regime_snapshot_state())
 
     def run(self) -> None:
@@ -416,6 +472,7 @@ class PullbackSetupWorker(threading.Thread):
                 daily_df=df,
                 daily_context=None,
                 current_price=current_price,
+                open_price=float(quote_snapshot.get("open_price", 0.0) or 0.0),
                 stock_code=self._executor.stock_code,
                 stock_name=str(quote_snapshot.get("stock_name") or ""),
                 check_time=datetime.now(KST),
@@ -447,6 +504,16 @@ class PullbackSetupWorker(threading.Thread):
                 market_regime_snapshot=getattr(self._executor, "market_regime_snapshot", None),
             )
         if candidate is None:
+            self._process_shadow_strategy_setup(
+                strategy_tag="trend_atr",
+                daily_df=df,
+                daily_context=None,
+                current_price=current_price,
+                open_price=float(quote_snapshot.get("open_price", 0.0) or 0.0),
+                stock_name=str(quote_snapshot.get("stock_name") or ""),
+                decision_time=datetime.now(KST),
+                has_pending_order=has_pending_order,
+            )
             self._candidate_store.remove(self._executor.stock_code)
             if terminal is not None:
                 setattr(self._executor, "_pullback_threaded_context_version", "")
@@ -455,6 +522,16 @@ class PullbackSetupWorker(threading.Thread):
         setattr(self._executor, "_pullback_threaded_context_version", candidate.context_version)
         setattr(self._executor, "_pullback_setup_skip_reason", "")
         self._candidate_store.upsert(candidate)
+        self._process_shadow_strategy_setup(
+            strategy_tag="trend_atr",
+            daily_df=df,
+            daily_context=None,
+            current_price=current_price,
+            open_price=float(quote_snapshot.get("open_price", 0.0) or 0.0),
+            stock_name=str(quote_snapshot.get("stock_name") or ""),
+            decision_time=datetime.now(KST),
+            has_pending_order=has_pending_order,
+        )
         self._dirty_symbols.mark(candidate.symbol)
 
     def _run_cycle_from_daily_context(self) -> None:
@@ -502,6 +579,7 @@ class PullbackSetupWorker(threading.Thread):
                 daily_df=None,
                 daily_context=context,
                 current_price=current_price,
+                open_price=float(quote_snapshot.get("open_price", 0.0) or 0.0),
                 stock_code=self._executor.stock_code,
                 stock_name=str(quote_snapshot.get("stock_name") or ""),
                 check_time=decision_time,
@@ -533,6 +611,16 @@ class PullbackSetupWorker(threading.Thread):
                 market_regime_snapshot=getattr(self._executor, "market_regime_snapshot", None),
             )
         if candidate is None:
+            self._process_shadow_strategy_setup(
+                strategy_tag="trend_atr",
+                daily_df=None,
+                daily_context=context,
+                current_price=current_price,
+                open_price=float(quote_snapshot.get("open_price", 0.0) or 0.0),
+                stock_name=str(quote_snapshot.get("stock_name") or ""),
+                decision_time=decision_time,
+                has_pending_order=has_pending_order,
+            )
             self._candidate_store.remove(self._executor.stock_code)
             if terminal is not None:
                 setattr(self._executor, "_pullback_threaded_context_version", "")
@@ -541,6 +629,16 @@ class PullbackSetupWorker(threading.Thread):
         setattr(self._executor, "_pullback_threaded_context_version", context.context_version)
         setattr(self._executor, "_pullback_setup_skip_reason", "")
         self._candidate_store.upsert(candidate)
+        self._process_shadow_strategy_setup(
+            strategy_tag="trend_atr",
+            daily_df=None,
+            daily_context=context,
+            current_price=current_price,
+            open_price=float(quote_snapshot.get("open_price", 0.0) or 0.0),
+            stock_name=str(quote_snapshot.get("stock_name") or ""),
+            decision_time=decision_time,
+            has_pending_order=has_pending_order,
+        )
         self._dirty_symbols.mark(candidate.symbol)
 
 
@@ -594,9 +692,84 @@ class PullbackTimingWorker(threading.Thread):
             return None
         return self._strategy_registry.get("pullback_rebreakout")
 
+    def _process_shadow_strategy_timing(
+        self,
+        *,
+        strategy_tag: str,
+        symbol: str,
+        current_price: float,
+        quote_snapshot: dict,
+        intraday_bars: list[dict],
+        has_pending_order: bool,
+    ) -> None:
+        if self._strategy_registry is None or strategy_tag not in self._enabled_strategy_tags:
+            return
+        if strategy_tag == "pullback_rebreakout":
+            return
+        get_shadow_candidate = getattr(self._executor, "get_strategy_shadow_candidate", None)
+        upsert_shadow_intent = getattr(self._executor, "upsert_strategy_shadow_intent", None)
+        remove_shadow_intent = getattr(self._executor, "remove_strategy_shadow_intent", None)
+        if not callable(get_shadow_candidate) or not callable(upsert_shadow_intent) or not callable(remove_shadow_intent):
+            return
+        candidate = get_shadow_candidate(strategy_tag, symbol)
+        if candidate is None:
+            remove_shadow_intent(strategy_tag, symbol)
+            return
+        if self._executor.strategy.has_position or has_pending_order:
+            remove_shadow_intent(strategy_tag, symbol)
+            return
+        registry_entry = self._strategy_registry.get(strategy_tag)
+        if registry_entry is None:
+            return
+        decision = registry_entry.timing_evaluator.evaluate_timing(
+            candidate=candidate,
+            native_candidate=None,
+            current_price=current_price,
+            stock_code=symbol,
+            check_time=quote_snapshot.get("received_at") if isinstance(quote_snapshot.get("received_at"), datetime) else datetime.now(KST),
+            market_phase=getattr(self._executor, "market_phase_context", None),
+            market_venue=getattr(self._executor, "market_venue_context", "KRX"),
+            intraday_bars=intraday_bars,
+            has_existing_position=False,
+            has_pending_order=has_pending_order,
+            current_context_version=None,
+        )
+        if not bool(decision.should_emit_intent):
+            remove_shadow_intent(strategy_tag, symbol)
+            return
+        intent = StrategyEntryIntent(
+            strategy_tag=strategy_tag,
+            symbol=str(symbol).zfill(6),
+            created_at=datetime.now(KST),
+            expires_at=decision.expires_at,
+            trade_date=str(decision.trade_date or ""),
+            entry_reference_price=float(decision.entry_reference_price or 0.0),
+            entry_reference_label=str(decision.entry_reference_label or "prev_high"),
+            meta=dict(decision.meta or {}),
+        )
+        upsert_shadow_intent(strategy_tag, symbol, intent)
+
     def _process_symbol(self, symbol: str) -> None:
         candidate = self._candidate_store.get(symbol)
+        quote_snapshot = self._executor.get_cached_pullback_quote_snapshot()
         if candidate is None:
+            if quote_snapshot:
+                current_price = float(quote_snapshot.get("current_price", 0.0) or 0.0)
+                if current_price > 0.0:
+                    intraday_bars = self._executor.fetch_cached_intraday_bars_if_available(
+                        n=max(int(getattr(settings, "PULLBACK_REBREAKOUT_LOOKBACK_BARS", 3) or 3) + 2, 5)
+                    )
+                    self._process_shadow_strategy_timing(
+                        strategy_tag="trend_atr",
+                        symbol=symbol,
+                        current_price=current_price,
+                        quote_snapshot=quote_snapshot,
+                        intraday_bars=intraday_bars,
+                        has_pending_order=self._executor._has_active_pending_buy_order(),
+                    )
+                    get_shadow_counts = getattr(self._executor, "get_strategy_shadow_counts", None)
+                    shadow_counts = get_shadow_counts() if callable(get_shadow_counts) else {"intents": {}}
+                    setattr(self._executor, "_intent_queue_depth_by_strategy", {"pullback_rebreakout": self._entry_queue.qsize(), **dict(shadow_counts.get("intents") or {})})
             setattr(self._executor, "_pullback_timing_skip_reason", "no_candidate")
             return
 
@@ -609,7 +782,6 @@ class PullbackTimingWorker(threading.Thread):
             setattr(self._executor, "_pullback_timing_skip_reason", "pending_order_precheck")
             return
 
-        quote_snapshot = self._executor.get_cached_pullback_quote_snapshot()
         if not quote_snapshot:
             setattr(self._executor, "_pullback_timing_skip_reason", "missing_quote")
             return
@@ -678,7 +850,17 @@ class PullbackTimingWorker(threading.Thread):
         )
         queued = self._entry_queue.put_if_absent(intent)
         setattr(self._executor, "_pullback_intent_queue_depth", self._entry_queue.qsize())
-        setattr(self._executor, "_intent_queue_depth_by_strategy", {"pullback_rebreakout": self._entry_queue.qsize()})
+        self._process_shadow_strategy_timing(
+            strategy_tag="trend_atr",
+            symbol=symbol,
+            current_price=current_price,
+            quote_snapshot=quote_snapshot,
+            intraday_bars=intraday_bars,
+            has_pending_order=has_pending_order,
+        )
+        get_shadow_counts = getattr(self._executor, "get_strategy_shadow_counts", None)
+        shadow_counts = get_shadow_counts() if callable(get_shadow_counts) else {"intents": {}}
+        setattr(self._executor, "_intent_queue_depth_by_strategy", {"pullback_rebreakout": self._entry_queue.qsize(), **dict(shadow_counts.get("intents") or {})})
         if not queued:
             setattr(self._executor, "_pullback_timing_skip_reason", "duplicate_or_queue_full")
             return

@@ -44,6 +44,7 @@ class StrategySetupEvaluator(Protocol):
         stock_code: str,
         stock_name: str,
         current_price: float,
+        open_price: Optional[float],
         check_time: Any,
         market_phase: Optional[Any],
         market_venue: Optional[Any],
