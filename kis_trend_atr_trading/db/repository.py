@@ -35,6 +35,7 @@ KIS Trend-ATR Trading System - 데이터 접근 계층 (Repository)
     open_positions = pos_repo.get_open_positions()
 """
 
+import builtins
 from datetime import datetime, date, timedelta
 from typing import Optional, Dict, List, Any, Tuple
 from dataclasses import dataclass
@@ -48,6 +49,18 @@ from utils.market_hours import KST, get_today
 from env import get_db_namespace_mode
 
 logger = get_logger("repository")
+
+
+def _get_repository_schema_state() -> Dict[str, Any]:
+    state = getattr(builtins, "_kis_repository_schema_state", None)
+    if state is None:
+        state = {
+            "lock": threading.Lock(),
+            "positions_schema_cache": {},
+            "repository_schema_introspection_count": 0,
+        }
+        setattr(builtins, "_kis_repository_schema_state", state)
+    return state
 
 
 def _get_namespace_mode() -> str:
@@ -262,6 +275,7 @@ class PositionRepository:
     
     _schema_compat_log_lock = threading.Lock()
     _schema_compat_logged_keys = set()
+    _repository_schema_introspection_count = 0
 
     def __init__(self, db: MySQLManager = None):
         """
@@ -270,17 +284,127 @@ class PositionRepository:
         """
         self.db = db or get_db_manager()
         self.mode = _get_namespace_mode()
-        self._positions_symbol_column = self._detect_positions_symbol_column()
-        self._position_id_required, self._position_id_is_numeric = self._detect_position_id_requirements()
-        self._positions_has_state_column = self._detect_positions_state_column()
-        self._positions_has_entry_date_column = self._detect_positions_entry_date_column()
-        self._positions_has_stop_loss_column = self._detect_positions_stop_loss_column()
-        self._positions_has_take_profit_column = self._detect_positions_take_profit_column()
-        self._positions_has_atr_value_column = self._detect_positions_atr_value_column()
-        self._positions_has_atr_column = self._detect_positions_atr_column()
-        self._positions_has_created_at_column = self._detect_positions_created_at_column()
-        self._positions_has_updated_at_column = self._detect_positions_updated_at_column()
+        schema_info = self._get_positions_schema_info()
+        self._positions_symbol_column = str(schema_info.get("symbol_column") or "symbol")
+        self._position_id_required = bool(schema_info.get("position_id_required"))
+        self._position_id_is_numeric = bool(schema_info.get("position_id_is_numeric"))
+        self._positions_has_state_column = bool(schema_info.get("has_state"))
+        self._positions_has_entry_date_column = bool(schema_info.get("has_entry_date"))
+        self._positions_has_stop_loss_column = bool(schema_info.get("has_stop_loss"))
+        self._positions_has_take_profit_column = bool(schema_info.get("has_take_profit"))
+        self._positions_has_atr_value_column = bool(schema_info.get("has_atr_value"))
+        self._positions_has_atr_column = bool(schema_info.get("has_atr"))
+        self._positions_has_created_at_column = bool(schema_info.get("has_created_at"))
+        self._positions_has_updated_at_column = bool(schema_info.get("has_updated_at"))
         self._log_schema_compat_summary_once()
+
+    @classmethod
+    def clear_schema_cache_for_tests(cls) -> None:
+        state = _get_repository_schema_state()
+        with state["lock"]:
+            state["positions_schema_cache"].clear()
+            state["repository_schema_introspection_count"] = 0
+        cls._repository_schema_introspection_count = 0
+
+    def _get_positions_schema_info(self, *, refresh: bool = False) -> Dict[str, Any]:
+        database_name = str(getattr(getattr(self.db, "config", None), "database", "") or "")
+        default_info = {
+            "symbol_column": "symbol",
+            "position_id_required": False,
+            "position_id_is_numeric": False,
+            "columns": set(),
+            "has_state": False,
+            "has_entry_date": False,
+            "has_stop_loss": False,
+            "has_take_profit": False,
+            "has_atr_value": False,
+            "has_atr": False,
+            "has_created_at": False,
+            "has_updated_at": False,
+        }
+        if not database_name:
+            return dict(default_info)
+
+        state = _get_repository_schema_state()
+        with state["lock"]:
+            cached = state["positions_schema_cache"].get(database_name)
+            if cached is not None and not refresh:
+                self.__class__._repository_schema_introspection_count = int(
+                    state["repository_schema_introspection_count"]
+                )
+                return dict(cached)
+
+            try:
+                rows = self.db.execute_query(
+                    """
+                    SELECT column_name, data_type, is_nullable, column_default, extra
+                    FROM information_schema.columns
+                    WHERE table_schema = %s
+                      AND table_name = 'positions'
+                    """,
+                    (database_name,),
+                ) or []
+            except Exception as e:
+                logger.warning(f"[REPO] positions 스키마 introspection 실패: {e}")
+                if cached is not None:
+                    return dict(cached)
+                return dict(default_info)
+
+            columns: Dict[str, Dict[str, Any]] = {}
+            for raw in rows:
+                column_name = str(raw.get("column_name") or raw.get("COLUMN_NAME") or "").lower()
+                if not column_name:
+                    continue
+                columns[column_name] = {
+                    "data_type": str(raw.get("data_type") or raw.get("DATA_TYPE") or "").lower(),
+                    "is_nullable": str(raw.get("is_nullable") or raw.get("IS_NULLABLE") or "").upper(),
+                    "column_default": raw.get("column_default")
+                    if "column_default" in raw
+                    else raw.get("COLUMN_DEFAULT"),
+                    "extra": str(raw.get("extra") or raw.get("EXTRA") or "").lower(),
+                }
+
+            position_id_meta = columns.get("position_id") or {}
+            is_numeric = str(position_id_meta.get("data_type") or "").lower() in {
+                "tinyint",
+                "smallint",
+                "mediumint",
+                "int",
+                "integer",
+                "bigint",
+            }
+            is_required = (
+                str(position_id_meta.get("is_nullable") or "").upper() == "NO"
+                and position_id_meta.get("column_default") is None
+                and "auto_increment" not in str(position_id_meta.get("extra") or "").lower()
+            )
+
+            info = {
+                "symbol_column": "symbol" if "symbol" in columns else ("stock_code" if "stock_code" in columns else "symbol"),
+                "position_id_required": is_required,
+                "position_id_is_numeric": is_numeric,
+                "columns": set(columns.keys()),
+                "has_state": "state" in columns,
+                "has_entry_date": "entry_date" in columns,
+                "has_stop_loss": "stop_loss" in columns,
+                "has_take_profit": "take_profit" in columns,
+                "has_atr_value": "atr_value" in columns,
+                "has_atr": "atr" in columns,
+                "has_created_at": "created_at" in columns,
+                "has_updated_at": "updated_at" in columns,
+            }
+            state["positions_schema_cache"][database_name] = dict(info)
+            state["repository_schema_introspection_count"] = int(state["repository_schema_introspection_count"]) + 1
+            self.__class__._repository_schema_introspection_count = int(
+                state["repository_schema_introspection_count"]
+            )
+            logger.info(
+                "[REPO] positions schema cache populated: database=%s repository_schema_introspection_count=%s columns=%s",
+                database_name,
+                self.__class__._repository_schema_introspection_count,
+                ",".join(sorted(info["columns"])) or "(none)",
+            )
+            return dict(info)
 
     def _schema_compat_tokens(self) -> List[str]:
         """현재 positions 호환 활성화 항목을 토큰 리스트로 반환합니다."""
@@ -331,35 +455,13 @@ class PositionRepository:
             1) symbol (현행)
             2) stock_code (구스키마 호환)
         """
-        default_col = "symbol"
         try:
-            database_name = getattr(getattr(self.db, "config", None), "database", None)
-            if not database_name:
-                return default_col
-
-            rows = self.db.execute_query(
-                """
-                SELECT column_name
-                FROM information_schema.columns
-                WHERE table_schema = %s
-                  AND table_name = 'positions'
-                  AND column_name IN ('symbol', 'stock_code')
-                """,
-                (database_name,),
-            )
-            names = {
-                str(row.get("column_name") or row.get("COLUMN_NAME")).lower()
-                for row in (rows or [])
-            }
-            if "symbol" in names:
-                return "symbol"
-            if "stock_code" in names:
-                return "stock_code"
+            return str(self._get_positions_schema_info().get("symbol_column") or "symbol")
         except Exception as e:
             logger.warning(f"[REPO] positions 컬럼 탐지 실패(기본 symbol 사용): {e}")
-        return default_col
+            return "symbol"
 
-    def _detect_position_id_requirements(self) -> Tuple[bool, bool]:
+    def _detect_position_id_requirements(self, *, refresh: bool = False) -> Tuple[bool, bool]:
         """
         position_id 컬럼의 필수 입력 여부를 탐지합니다.
 
@@ -367,37 +469,8 @@ class PositionRepository:
             (is_required, is_numeric)
         """
         try:
-            database_name = getattr(getattr(self.db, "config", None), "database", None)
-            if not database_name:
-                return False, False
-            row = self.db.execute_query(
-                """
-                SELECT data_type, is_nullable, column_default, extra
-                FROM information_schema.columns
-                WHERE table_schema = %s
-                  AND table_name = 'positions'
-                  AND column_name = 'position_id'
-                LIMIT 1
-                """,
-                (database_name,),
-                fetch_one=True,
-            )
-            if not row:
-                return False, False
-            data_type = str(row.get("data_type") or row.get("DATA_TYPE") or "").lower()
-            is_nullable = str(row.get("is_nullable") or row.get("IS_NULLABLE") or "").upper()
-            column_default = (
-                row.get("column_default")
-                if "column_default" in row
-                else row.get("COLUMN_DEFAULT")
-            )
-            extra = str(row.get("extra") or row.get("EXTRA") or "").lower()
-
-            is_numeric = data_type in {
-                "tinyint", "smallint", "mediumint", "int", "integer", "bigint"
-            }
-            is_required = is_nullable == "NO" and column_default is None and "auto_increment" not in extra
-            return is_required, is_numeric
+            info = self._get_positions_schema_info(refresh=refresh)
+            return bool(info.get("position_id_required")), bool(info.get("position_id_is_numeric"))
         except Exception as e:
             logger.warning(f"[REPO] position_id 컬럼 탐지 실패: {e}")
             return False, False
@@ -461,25 +534,8 @@ class PositionRepository:
     def _detect_positions_legacy_column(self, column_name: str, _found_log: str) -> bool:
         """positions 테이블의 특정 레거시 컬럼 존재 여부를 탐지합니다."""
         try:
-            database_name = getattr(getattr(self.db, "config", None), "database", None)
-            if not database_name:
-                return False
-            row = self.db.execute_query(
-                """
-                SELECT COUNT(*) AS cnt
-                FROM information_schema.columns
-                WHERE table_schema = %s
-                  AND table_name = 'positions'
-                  AND column_name = %s
-                """,
-                (database_name, column_name),
-                fetch_one=True,
-            )
-            cnt = 0
-            if row:
-                cnt = row.get("cnt", row.get("CNT", 0)) or 0
-            has_column = int(cnt) > 0
-            return has_column
+            columns = set(self._get_positions_schema_info().get("columns") or set())
+            return str(column_name or "").lower() in columns
         except Exception as e:
             logger.warning(f"[REPO] positions.{column_name} 컬럼 탐지 실패: {e}")
             return False
@@ -776,7 +832,7 @@ class PositionRepository:
                 return None
             except QueryError as e:
                 if attempt == 0 and self._is_position_id_required_error(e):
-                    _, is_numeric = self._detect_position_id_requirements()
+                    _, is_numeric = self._detect_position_id_requirements(refresh=True)
                     self._position_id_required = True
                     self._position_id_is_numeric = is_numeric
                     logger.warning("[REPO] position_id 필수 스키마 감지, save 재시도")
@@ -838,7 +894,7 @@ class PositionRepository:
                 return self.get_by_symbol(symbol)
             except QueryError as e:
                 if attempt == 0 and self._is_position_id_required_error(e):
-                    _, is_numeric = self._detect_position_id_requirements()
+                    _, is_numeric = self._detect_position_id_requirements(refresh=True)
                     self._position_id_required = True
                     self._position_id_is_numeric = is_numeric
                     logger.warning("[REPO] position_id 필수 스키마 감지, upsert 재시도")

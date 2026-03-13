@@ -15,12 +15,14 @@ KIS Trend-ATR Trading System - 주문 동기화 및 안전장치 모듈
 작성일: 2026-01-29
 """
 
+import builtins
 import os
 import sys
 import time
 import fcntl
 import atexit
 import hashlib
+import threading
 from pathlib import Path
 from datetime import datetime, time as dt_time, timedelta
 from decimal import Decimal
@@ -49,6 +51,8 @@ LOCK_FILE_PATH = Path(__file__).parent.parent / "data" / "instance.lock"
 LOCK_STALE_TIMEOUT_SECONDS = int(os.getenv("INSTANCE_LOCK_STALE_TIMEOUT", "3600"))
 PENDING_ORDER_STALE_MINUTES = int(os.getenv("PENDING_ORDER_STALE_MINUTES", "240"))
 PENDING_NO_ORDER_STALE_MINUTES = int(os.getenv("PENDING_NO_ORDER_STALE_MINUTES", "15"))
+PENDING_ORDER_GUARD_DB_TTL_SEC = float(os.getenv("PENDING_ORDER_GUARD_DB_TTL_SEC", "5"))
+PENDING_ORDER_GUARD_ERROR_BACKOFF_SEC = float(os.getenv("PENDING_ORDER_GUARD_ERROR_BACKOFF_SEC", "10"))
 
 # 한국 주식시장 시간
 MARKET_OPEN = dt_time(9, 0, 0)
@@ -419,6 +423,41 @@ class SynchronizedOrderResult:
         }
 
 
+@dataclass(frozen=True)
+class PendingOrderGuardSnapshot:
+    symbol: str
+    side: str
+    state: str
+    source: str
+    decision: str
+    status: str = ""
+    error: str = ""
+    cache_hit: bool = False
+
+    @property
+    def should_block_entry(self) -> bool:
+        return self.decision in ("block", "unknown_block")
+
+    @property
+    def is_unknown(self) -> bool:
+        return self.state == "unknown"
+
+
+def _get_pending_guard_store() -> Dict[str, Any]:
+    state = getattr(builtins, "_kis_pending_guard_store", None)
+    if state is None:
+        state = {
+            "lock": threading.Lock(),
+            "entries": {},
+            "schema_ready": {},
+            "pending_guard_unknown_count": 0,
+            "pending_guard_db_error_count": 0,
+            "pending_guard_blocked_due_to_unknown": 0,
+        }
+        setattr(builtins, "_kis_pending_guard_store", state)
+    return state
+
+
 class OrderSynchronizer:
     """
     주문 동기화 클래스
@@ -464,6 +503,248 @@ class OrderSynchronizer:
         self._db = get_db_manager() if get_db_manager else None
         self._schema_checked = False
 
+    @classmethod
+    def _reset_shared_pending_guard_state_for_tests(cls) -> None:
+        store = _get_pending_guard_store()
+        with store["lock"]:
+            store["entries"].clear()
+            store["schema_ready"].clear()
+            store["pending_guard_unknown_count"] = 0
+            store["pending_guard_db_error_count"] = 0
+            store["pending_guard_blocked_due_to_unknown"] = 0
+
+    @staticmethod
+    def _normalize_guard_symbol(stock_code: str) -> str:
+        return str(stock_code or "").strip().zfill(6)
+
+    @staticmethod
+    def _normalize_guard_side(side: str) -> str:
+        return str(side or "").strip().upper()
+
+    def _guard_db_key(self) -> str:
+        database = str(getattr(getattr(self._db, "config", None), "database", "") or "")
+        return f"{database}:{self.mode}"
+
+    def _guard_state_key(self, stock_code: str, side: str) -> Tuple[str, str, str]:
+        return (
+            self._guard_db_key(),
+            self._normalize_guard_symbol(stock_code),
+            self._normalize_guard_side(side),
+        )
+
+    def _update_shared_pending_state(
+        self,
+        *,
+        stock_code: str,
+        side: str,
+        status: str,
+        state: str,
+        has_open_order: bool,
+        source: str,
+        ttl_sec: Optional[float] = None,
+        error: str = "",
+    ) -> None:
+        symbol = self._normalize_guard_symbol(stock_code)
+        normalized_side = self._normalize_guard_side(side)
+        if not symbol:
+            return
+        expires_at = None
+        if ttl_sec is not None and float(ttl_sec) > 0:
+            expires_at = time.monotonic() + float(ttl_sec)
+        store = _get_pending_guard_store()
+        with store["lock"]:
+            store["entries"][self._guard_state_key(symbol, normalized_side)] = {
+                "state": str(state or "clear"),
+                "has_open_order": bool(has_open_order),
+                "status": str(status or "").upper(),
+                "source": str(source or "shared_memory"),
+                "updated_monotonic": time.monotonic(),
+                "expires_at": expires_at,
+                "error": str(error or ""),
+            }
+
+    def _apply_shared_pending_status(self, *, stock_code: str, side: str, status: str, source: str) -> None:
+        normalized_status = str(status or "").upper()
+        has_open_order = normalized_status in {"PENDING", "SUBMITTED", "PARTIAL"}
+        self._update_shared_pending_state(
+            stock_code=stock_code,
+            side=side,
+            status=normalized_status,
+            state="open" if has_open_order else "clear",
+            has_open_order=has_open_order,
+            source=source,
+        )
+
+    def _get_cached_pending_state(self, stock_code: str, side: str) -> Optional[Dict[str, Any]]:
+        symbol = self._normalize_guard_symbol(stock_code)
+        normalized_side = self._normalize_guard_side(side)
+        if not symbol:
+            return None
+        store = _get_pending_guard_store()
+        with store["lock"]:
+            keys = [self._guard_state_key(symbol, normalized_side)]
+            if not normalized_side:
+                keys = [
+                    key
+                    for key in list(store["entries"].keys())
+                    if isinstance(key, tuple) and len(key) == 3 and key[0] == self._guard_db_key() and key[1] == symbol
+                ]
+            now_mono = time.monotonic()
+            latest_closed: Optional[Dict[str, Any]] = None
+            for key in list(keys):
+                entry = store["entries"].get(key)
+                if entry is None:
+                    continue
+                expires_at = entry.get("expires_at")
+                if expires_at is not None and float(expires_at) <= now_mono:
+                    store["entries"].pop(key, None)
+                    continue
+                if bool(entry.get("has_open_order")):
+                    return dict(entry)
+                latest_closed = dict(entry)
+            return latest_closed
+
+    def _record_pending_guard_unknown(self, error: str = "") -> None:
+        store = _get_pending_guard_store()
+        with store["lock"]:
+            store["pending_guard_unknown_count"] = int(store["pending_guard_unknown_count"]) + 1
+            if error:
+                store["pending_guard_db_error_count"] = int(store["pending_guard_db_error_count"]) + 1
+            store["pending_guard_blocked_due_to_unknown"] = int(store["pending_guard_blocked_due_to_unknown"]) + 1
+
+    def _pending_guard_counters(self) -> Dict[str, int]:
+        store = _get_pending_guard_store()
+        with store["lock"]:
+            return {
+                "pending_guard_unknown_count": int(store["pending_guard_unknown_count"]),
+                "pending_guard_db_error_count": int(store["pending_guard_db_error_count"]),
+                "pending_guard_blocked_due_to_unknown": int(store["pending_guard_blocked_due_to_unknown"]),
+            }
+
+    def get_pending_order_guard_state(self, stock_code: str, side: str = "") -> PendingOrderGuardSnapshot:
+        symbol = self._normalize_guard_symbol(stock_code)
+        normalized_side = self._normalize_guard_side(side)
+        cached = self._get_cached_pending_state(symbol, normalized_side)
+        if cached is not None:
+            cached_state = str(cached.get("state") or ("open" if bool(cached.get("has_open_order")) else "clear"))
+            if cached_state == "unknown":
+                self._record_pending_guard_unknown()
+            cached_source = str(cached.get("source") or "shared_memory")
+            return PendingOrderGuardSnapshot(
+                symbol=symbol,
+                side=normalized_side,
+                state=cached_state,
+                source=(
+                    "unknown"
+                    if cached_state == "unknown"
+                    else "shared_memory"
+                ),
+                decision=(
+                    "unknown_block"
+                    if cached_state == "unknown"
+                    else ("block" if bool(cached.get("has_open_order")) else "allow")
+                ),
+                status=str(cached.get("status") or ""),
+                error=str(cached.get("error") or ""),
+                cache_hit=True,
+            )
+
+        if not self._db or not bool(getattr(getattr(self._db, "config", None), "enabled", False)):
+            return PendingOrderGuardSnapshot(
+                symbol=symbol,
+                side=normalized_side,
+                state="clear",
+                source="shared_memory",
+                decision="allow",
+                status="NO_DB_MEMORY_ONLY",
+                cache_hit=True,
+            )
+
+        self._ensure_order_state_table()
+        try:
+            if normalized_side:
+                row = self._db.execute_query(
+                    """
+                    SELECT status
+                      FROM order_state
+                     WHERE mode = %s
+                       AND symbol = %s
+                       AND side = %s
+                       AND status IN ('PENDING','SUBMITTED','PARTIAL')
+                     LIMIT 1
+                    """,
+                    (self.mode, symbol, normalized_side),
+                    fetch_one=True,
+                )
+            else:
+                row = self._db.execute_query(
+                    """
+                    SELECT status
+                      FROM order_state
+                     WHERE mode = %s
+                       AND symbol = %s
+                       AND status IN ('PENDING','SUBMITTED','PARTIAL')
+                     LIMIT 1
+                    """,
+                    (self.mode, symbol),
+                    fetch_one=True,
+                )
+            has_open_order = row is not None
+            status = str((row or {}).get("status") or (row or {}).get("STATUS") or ("CLEAR" if not has_open_order else "PENDING"))
+            self._update_shared_pending_state(
+                stock_code=symbol,
+                side=normalized_side,
+                status=status,
+                state="open" if has_open_order else "clear",
+                has_open_order=has_open_order,
+                source="db_cache",
+                ttl_sec=PENDING_ORDER_GUARD_DB_TTL_SEC,
+            )
+            return PendingOrderGuardSnapshot(
+                symbol=symbol,
+                side=normalized_side,
+                state="open" if has_open_order else "clear",
+                source="db",
+                decision="block" if has_open_order else "allow",
+                status=status,
+                cache_hit=False,
+            )
+        except Exception as e:
+            error = str(e)
+            self._update_shared_pending_state(
+                stock_code=symbol,
+                side=normalized_side,
+                status="UNKNOWN",
+                state="unknown",
+                has_open_order=False,
+                source="unknown_backoff",
+                ttl_sec=PENDING_ORDER_GUARD_ERROR_BACKOFF_SEC,
+                error=error,
+            )
+            self._record_pending_guard_unknown(error=error)
+            counters = self._pending_guard_counters()
+            logger.warning(
+                "[SYNC] pending guard fallback source=unknown decision=unknown_block symbol=%s side=%s "
+                "pending_guard_unknown_count=%s pending_guard_db_error_count=%s "
+                "pending_guard_blocked_due_to_unknown=%s err=%s",
+                symbol,
+                normalized_side or "*",
+                counters["pending_guard_unknown_count"],
+                counters["pending_guard_db_error_count"],
+                counters["pending_guard_blocked_due_to_unknown"],
+                error,
+            )
+            return PendingOrderGuardSnapshot(
+                symbol=symbol,
+                side=normalized_side,
+                state="unknown",
+                source="unknown",
+                decision="unknown_block",
+                status="UNKNOWN",
+                error=error,
+                cache_hit=False,
+            )
+
     def _ensure_order_state_table(self) -> bool:
         """
         order_state 테이블 존재를 보장합니다.
@@ -472,6 +753,11 @@ class OrderSynchronizer:
         """
         if not self._db:
             return False
+        schema_key = self._guard_db_key()
+        store = _get_pending_guard_store()
+        with store["lock"]:
+            if bool(store["schema_ready"].get(schema_key)):
+                self._schema_checked = True
         if self._schema_checked:
             return True
 
@@ -483,6 +769,8 @@ class OrderSynchronizer:
                 logger.warning("[SYNC] order_state 테이블 없음 - 스키마 초기화 시도")
                 self._db.initialize_schema()
             self._schema_checked = True
+            with store["lock"]:
+                store["schema_ready"][schema_key] = True
             return True
         except Exception as e:
             logger.warning(f"[SYNC] order_state 스키마 확인/생성 실패: {e}")
@@ -651,6 +939,12 @@ class OrderSynchronizer:
         filled_qty: int = 0,
         remaining_qty: int = 0
     ) -> None:
+        self._apply_shared_pending_status(
+            stock_code=stock_code,
+            side=side,
+            status=status,
+            source="shared_memory_writer",
+        )
         if not self._db:
             return
         self._ensure_order_state_table()
@@ -695,42 +989,20 @@ class OrderSynchronizer:
             return None
 
     def has_open_order_for_symbol(self, stock_code: str, side: str = "") -> bool:
-        if not self._db:
-            return False
-        self._ensure_order_state_table()
-        normalized_side = str(side or "").strip().upper()
-        try:
-            if normalized_side:
-                row = self._db.execute_query(
-                    """
-                    SELECT 1
-                      FROM order_state
-                     WHERE mode = %s
-                       AND symbol = %s
-                       AND side = %s
-                       AND status IN ('PENDING','SUBMITTED','PARTIAL')
-                     LIMIT 1
-                    """,
-                    (self.mode, stock_code, normalized_side),
-                    fetch_one=True,
-                )
-            else:
-                row = self._db.execute_query(
-                    """
-                    SELECT 1
-                      FROM order_state
-                     WHERE mode = %s
-                       AND symbol = %s
-                       AND status IN ('PENDING','SUBMITTED','PARTIAL')
-                     LIMIT 1
-                    """,
-                    (self.mode, stock_code),
-                    fetch_one=True,
-                )
-            return row is not None
-        except Exception as e:
-            logger.warning(f"[SYNC] open order 조회 실패: {e}")
-            return False
+        snapshot = self.get_pending_order_guard_state(stock_code=stock_code, side=side)
+        if snapshot.decision != "allow" or snapshot.source != "shared_memory":
+            log_fn = logger.warning if snapshot.decision != "allow" else logger.info
+            log_fn(
+                "[SYNC] pending guard source=%s decision=%s symbol=%s side=%s status=%s cache_hit=%s error=%s",
+                snapshot.source,
+                snapshot.decision,
+                snapshot.symbol,
+                snapshot.side or "*",
+                snapshot.status,
+                snapshot.cache_hit,
+                snapshot.error,
+            )
+        return snapshot.should_block_entry
 
     def recover_pending_orders(self) -> List[Dict[str, Any]]:
         """
@@ -753,6 +1025,13 @@ class OrderSynchronizer:
                 """,
                 (self.mode,)
             ) or []
+            for row in rows:
+                self._apply_shared_pending_status(
+                    stock_code=str(row.get("symbol") or row.get("stock_code") or ""),
+                    side=str(row.get("side") or ""),
+                    status=str(row.get("status") or ""),
+                    source="shared_memory_recovery",
+                )
             return rows
         except Exception as e:
             logger.warning(f"[SYNC] pending 주문 복구 조회 실패: {e}")
@@ -827,6 +1106,26 @@ class OrderSynchronizer:
                     result_type=OrderExecutionResult.MARKET_CLOSED,
                     message=reason
                 )
+
+        pending_guard = self.get_pending_order_guard_state(stock_code=stock_code, side="BUY")
+        if pending_guard.should_block_entry:
+            logger.warning(
+                "[SYNC] buy pending guard blocked: source=%s decision=%s symbol=%s side=%s status=%s error=%s",
+                pending_guard.source,
+                pending_guard.decision,
+                pending_guard.symbol,
+                pending_guard.side or "BUY",
+                pending_guard.status,
+                pending_guard.error,
+            )
+            return SynchronizedOrderResult(
+                success=False,
+                result_type=OrderExecutionResult.FAILED,
+                message=(
+                    "신규 매수 차단("
+                    f"source={pending_guard.source}, decision={pending_guard.decision}, status={pending_guard.status})"
+                ),
+            )
         
         idempotency_key = self._build_idempotency_key("BUY", stock_code, quantity, signal_id)
         existing = self._get_order_state(idempotency_key)

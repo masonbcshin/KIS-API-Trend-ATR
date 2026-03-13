@@ -85,7 +85,20 @@ class _DummyDb:
         return self.affected
 
 
+class _PendingLookupDb:
+    def __init__(self):
+        self.config = types.SimpleNamespace(enabled=True, database="kis_trading")
+        self.query_calls = 0
+
+    def execute_query(self, command, params=None, fetch_one=False):
+        self.query_calls += 1
+        return None if fetch_one else []
+
+
 class TestOrderSynchronizerStaleCleanup(unittest.TestCase):
+    def setUp(self):
+        OrderSynchronizer._reset_shared_pending_guard_state_for_tests()
+
     def test_cleanup_stale_pending_orders_updates_cancelled(self):
         syncer = OrderSynchronizer(api=_DummyApi())
         syncer._db = _DummyDb(affected=2)
@@ -95,6 +108,21 @@ class TestOrderSynchronizerStaleCleanup(unittest.TestCase):
         self.assertEqual(affected, 2)
         self.assertIn("UPDATE order_state", syncer._db.last_command)
         self.assertEqual(syncer._db.last_params[0], "PAPER")
+
+    def test_pending_guard_reuses_db_result_without_repolling(self):
+        syncer = OrderSynchronizer(api=_DummyApi())
+        syncer._db = _PendingLookupDb()
+        syncer.mode = "PAPER"
+        syncer._ensure_order_state_table = lambda: True
+
+        first = syncer.get_pending_order_guard_state("005930", side="BUY")
+        second = syncer.get_pending_order_guard_state("005930", side="BUY")
+
+        self.assertEqual(first.source, "db")
+        self.assertEqual(first.decision, "allow")
+        self.assertEqual(second.source, "shared_memory")
+        self.assertEqual(second.decision, "allow")
+        self.assertEqual(syncer._db.query_calls, 1)
 
 
 if __name__ == "__main__":

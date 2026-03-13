@@ -68,7 +68,11 @@ from engine.order_synchronizer import OrderSynchronizer, OrderExecutionResult  #
 
 
 class _FailingApi:
+    def __init__(self):
+        self.sell_calls = 0
+
     def place_sell_order(self, *args, **kwargs):
+        self.sell_calls += 1
         return {"success": False, "message": "모의투자 장종료 입니다."}
 
 
@@ -97,7 +101,18 @@ class _BuyTimeoutWithHoldingIncreaseApi:
         }
 
 
+class _GuardFailingDb:
+    def __init__(self):
+        self.config = types.SimpleNamespace(enabled=True, database="kis_trading")
+
+    def execute_query(self, *args, **kwargs):
+        raise RuntimeError("Failed getting connection; pool exhausted")
+
+
 class TestOrderSynchronizerFailedState(unittest.TestCase):
+    def setUp(self):
+        OrderSynchronizer._reset_shared_pending_guard_state_for_tests()
+
     def test_sell_send_failure_marks_failed_state(self):
         syncer = OrderSynchronizer(api=_FailingApi())
         statuses = []
@@ -122,6 +137,7 @@ class TestOrderSynchronizerFailedState(unittest.TestCase):
     def test_buy_timeout_reconciles_from_holdings_delta(self):
         syncer = OrderSynchronizer(api=_BuyTimeoutWithHoldingIncreaseApi())
         syncer.mode = "PAPER"
+        syncer._db = None
         statuses = []
 
         syncer._get_order_state = lambda _k: None  # type: ignore
@@ -145,9 +161,47 @@ class TestOrderSynchronizerFailedState(unittest.TestCase):
         self.assertIn("보유수량 변동", result.message)
         self.assertEqual(statuses, ["PENDING", "SUBMITTED", "FILLED"])
 
+    def test_buy_pending_guard_db_failure_blocks_fail_safe(self):
+        syncer = OrderSynchronizer(api=_BuyTimeoutWithHoldingIncreaseApi())
+        syncer._db = _GuardFailingDb()
+        syncer._ensure_order_state_table = lambda: True
+
+        result = syncer.execute_buy_order(
+            stock_code="024060",
+            quantity=1,
+            signal_id="unit-test-pending-guard-fail-safe",
+            skip_market_check=True,
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.result_type, OrderExecutionResult.FAILED)
+        self.assertIn("unknown_block", result.message)
+
+    def test_sell_path_is_not_blocked_by_pending_guard_unknown(self):
+        api = _FailingApi()
+        syncer = OrderSynchronizer(api=api)
+        syncer._db = _GuardFailingDb()
+        statuses = []
+
+        syncer._get_order_state = lambda _k: None  # type: ignore
+        syncer._upsert_order_state = lambda **kwargs: statuses.append(kwargs.get("status"))  # type: ignore
+
+        result = syncer.execute_sell_order(
+            stock_code="005930",
+            quantity=1,
+            signal_id="unit-test-sell-no-pending-guard-block",
+            skip_market_check=True,
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.result_type, OrderExecutionResult.FAILED)
+        self.assertEqual(api.sell_calls, 1)
+        self.assertEqual(statuses, ["PENDING", "FAILED"])
+
     def test_buy_timeout_reconciles_from_holdings_delta_in_real_mode(self):
         syncer = OrderSynchronizer(api=_BuyTimeoutWithHoldingIncreaseApi())
         syncer.mode = "REAL"
+        syncer._db = None
         statuses = []
 
         syncer._get_order_state = lambda _k: None  # type: ignore

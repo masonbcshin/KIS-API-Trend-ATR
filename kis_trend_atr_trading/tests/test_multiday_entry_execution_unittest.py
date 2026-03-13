@@ -907,3 +907,22 @@ def test_mixed_strategy_authoritative_queue_uses_deterministic_tiebreak_and_cons
     assert queue.mixed_strategy_tiebreak_count() == 1
     assert executor._mixed_strategy_dedupe_count >= 1
     assert executor._authoritative_intent_reject_reason == "existing_position"
+
+
+def test_executor_pending_guard_unknown_blocks_new_entry_path():
+    executor = _make_executor()
+    executor.order_synchronizer = SimpleNamespace(
+        get_pending_order_guard_state=lambda stock_code, side="BUY": SimpleNamespace(
+            state="unknown",
+            source="unknown",
+            decision="unknown_block",
+            status="UNKNOWN",
+            error="pool exhausted",
+        )
+    )
+
+    blocked = MultidayExecutor._has_active_pending_buy_order(executor)
+
+    assert blocked is True
+    assert executor._last_pending_buy_guard_snapshot["source"] == "unknown"
+    assert executor._last_pending_buy_guard_snapshot["decision"] == "unknown_block"

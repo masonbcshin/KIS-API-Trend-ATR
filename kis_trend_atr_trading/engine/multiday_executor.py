@@ -389,6 +389,13 @@ class MultidayExecutor:
             30,
         )
         self._last_report_snapshot_at: Optional[datetime] = None
+        self._last_pending_buy_guard_snapshot: Dict[str, Any] = {
+            "state": "clear",
+            "source": "shared_memory",
+            "decision": "allow",
+            "status": "",
+            "error": "",
+        }
         self._risk_start_capital_sync_date: Optional[str] = None
         self._risk_start_capital_synced: bool = False
         
@@ -3337,17 +3344,79 @@ class MultidayExecutor:
         }
         self._log_entry_event("[ENTRY_TRACE]", **base)
 
-    def _has_active_pending_buy_order(self) -> bool:
+    def _get_pending_buy_guard_snapshot(self) -> Dict[str, Any]:
         syncer = getattr(self, "order_synchronizer", None)
         if syncer is None:
-            return False
-        checker = getattr(syncer, "has_open_order_for_symbol", None)
+            snapshot = {
+                "state": "clear",
+                "source": "shared_memory",
+                "decision": "allow",
+                "status": "SYNCER_ABSENT",
+                "error": "",
+            }
+            setattr(self, "_last_pending_buy_guard_snapshot", snapshot)
+            return snapshot
+        checker = getattr(syncer, "get_pending_order_guard_state", None)
         if callable(checker):
             try:
-                return bool(checker(self.stock_code, side="BUY"))
+                guard = checker(self.stock_code, side="BUY")
+                snapshot = {
+                    "state": str(getattr(guard, "state", "clear") or "clear"),
+                    "source": str(getattr(guard, "source", "shared_memory") or "shared_memory"),
+                    "decision": str(getattr(guard, "decision", "allow") or "allow"),
+                    "status": str(getattr(guard, "status", "") or ""),
+                    "error": str(getattr(guard, "error", "") or ""),
+                }
+                setattr(self, "_last_pending_buy_guard_snapshot", snapshot)
+                return snapshot
             except Exception as exc:
-                logger.debug("[SYNC] pending buy order check failed: symbol=%s err=%s", self.stock_code, exc)
-        return False
+                logger.warning("[SYNC] pending buy order guard unknown_block: symbol=%s err=%s", self.stock_code, exc)
+                snapshot = {
+                    "state": "unknown",
+                    "source": "unknown",
+                    "decision": "unknown_block",
+                    "status": "CHECK_FAILED",
+                    "error": str(exc),
+                }
+                setattr(self, "_last_pending_buy_guard_snapshot", snapshot)
+                return snapshot
+        fallback_checker = getattr(syncer, "has_open_order_for_symbol", None)
+        if callable(fallback_checker):
+            try:
+                blocked = bool(fallback_checker(self.stock_code, side="BUY"))
+                snapshot = {
+                    "state": "open" if blocked else "clear",
+                    "source": "shared_memory",
+                    "decision": "block" if blocked else "allow",
+                    "status": "LEGACY_BOOL",
+                    "error": "",
+                }
+                setattr(self, "_last_pending_buy_guard_snapshot", snapshot)
+                return snapshot
+            except Exception as exc:
+                logger.warning("[SYNC] legacy pending buy order guard unknown_block: symbol=%s err=%s", self.stock_code, exc)
+                snapshot = {
+                    "state": "unknown",
+                    "source": "unknown",
+                    "decision": "unknown_block",
+                    "status": "LEGACY_CHECK_FAILED",
+                    "error": str(exc),
+                }
+                setattr(self, "_last_pending_buy_guard_snapshot", snapshot)
+                return snapshot
+        snapshot = {
+            "state": "clear",
+            "source": "shared_memory",
+            "decision": "allow",
+            "status": "NO_CHECKER",
+            "error": "",
+        }
+        setattr(self, "_last_pending_buy_guard_snapshot", snapshot)
+        return snapshot
+
+    def _has_active_pending_buy_order(self) -> bool:
+        snapshot = self._get_pending_buy_guard_snapshot()
+        return str(snapshot.get("decision") or "") in {"block", "unknown_block"}
 
     def _resolve_holdings_snapshot_for_final_validation(self) -> tuple[Optional[HoldingsRiskSnapshot], str]:
         report_mode = str(getattr(self, "_report_mode", "PAPER")).upper()
@@ -3976,16 +4045,24 @@ class MultidayExecutor:
             and bool(getattr(settings, "PULLBACK_BLOCK_IF_PENDING_ORDER", True))
             and self._has_active_pending_buy_order()
         ):
+            pending_guard = dict(getattr(self, "_last_pending_buy_guard_snapshot", {}) or {})
             self._log_entry_event(
                 "[ENTRY_BLOCK]",
                 reason="pullback_pending_order",
                 symbol=self.stock_code,
                 strategy_tag=strategy_tag,
+                pending_guard_source=pending_guard.get("source"),
+                pending_guard_decision=pending_guard.get("decision"),
+                pending_guard_status=pending_guard.get("status"),
             )
             return {
                 "success": False,
                 "skipped": True,
-                "message": "미종결 주문 존재 - Pullback 신규 진입 차단",
+                "message": (
+                    "미종결 주문 존재 - Pullback 신규 진입 차단 "
+                    f"(source={pending_guard.get('source', 'shared_memory')}, "
+                    f"decision={pending_guard.get('decision', 'block')})"
+                ),
             }
 
         final_validation = self._run_order_final_validation(signal)

@@ -12,6 +12,7 @@ KIS Trend-ATR Trading System - 데이터베이스 모듈 테스트
 """
 
 import os
+import importlib
 import pytest
 from datetime import datetime, date
 from unittest.mock import Mock, patch, MagicMock
@@ -19,7 +20,7 @@ from unittest.mock import Mock, patch, MagicMock
 # DB_ENABLED를 false로 설정하여 실제 연결 방지
 os.environ["DB_ENABLED"] = "false"
 
-from db.mysql import DatabaseConfig, MySQLManager, get_db_manager, QueryError
+from db.mysql import DatabaseConfig, MySQLManager, get_db_manager, close_db_manager, QueryError
 from db.repository import (
     PositionRepository,
     TradeRepository,
@@ -195,30 +196,59 @@ class TestPositionRecord:
 class TestPositionRepositoryCompatibility:
     """positions symbol/stock_code 호환 테스트"""
 
+    def _build_positions_schema_rows(
+        self,
+        *,
+        symbol_column: str = "stock_code",
+        position_id_meta: dict | None = None,
+        state: bool = False,
+        entry_date: bool = False,
+        stop_loss: bool = False,
+        take_profit: bool = False,
+        atr_value: bool = False,
+        atr: bool = False,
+        created_at: bool = False,
+        updated_at: bool = False,
+    ):
+        rows = [{"column_name": symbol_column}]
+        if position_id_meta is not None:
+            row = {"column_name": "position_id"}
+            row.update(position_id_meta)
+            rows.append(row)
+        optional_columns = {
+            "state": state,
+            "entry_date": entry_date,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "atr_value": atr_value,
+            "atr": atr,
+            "created_at": created_at,
+            "updated_at": updated_at,
+        }
+        for column_name, enabled in optional_columns.items():
+            if enabled:
+                rows.append({"column_name": column_name})
+        return rows
+
     def _build_schema_probe_mock_db(self):
         mock_db = Mock()
         mock_db.config = Mock(database="kis_trading")
         mock_db.execute_query.side_effect = [
-            [{"column_name": "stock_code"}],  # 컬럼 탐지
-            {  # position_id 메타(필수, 문자열)
-                "data_type": "varchar",
-                "is_nullable": "NO",
-                "column_default": None,
-                "extra": "",
-            },
-            {"cnt": 0},  # state 컬럼 미존재
-            {"cnt": 0},  # entry_date 컬럼 미존재
-            {"cnt": 0},  # stop_loss 컬럼 미존재
-            {"cnt": 0},  # take_profit 컬럼 미존재
-            {"cnt": 0},  # atr_value 컬럼 미존재
-            {"cnt": 0},  # atr 컬럼 미존재
-            {"cnt": 0},  # created_at 컬럼 미존재
-            {"cnt": 0},  # updated_at 컬럼 미존재
+            self._build_positions_schema_rows(
+                symbol_column="stock_code",
+                position_id_meta={
+                    "data_type": "varchar",
+                    "is_nullable": "NO",
+                    "column_default": None,
+                    "extra": "",
+                },
+            )
         ]
         return mock_db
 
     @patch("db.repository.logger.warning")
     def test_schema_compat_warning_is_summarized_once(self, mock_warning):
+        PositionRepository.clear_schema_cache_for_tests()
         PositionRepository._schema_compat_logged_keys.clear()
 
         repo1 = PositionRepository(db=self._build_schema_probe_mock_db())
@@ -230,19 +260,11 @@ class TestPositionRepositoryCompatibility:
         assert "positions 스키마 호환 모드 활성화" in mock_warning.call_args_list[0][0][0]
 
     def test_upsert_uses_stock_code_when_symbol_missing(self):
+        PositionRepository.clear_schema_cache_for_tests()
         mock_db = Mock()
         mock_db.config = Mock(database="kis_trading")
         mock_db.execute_query.side_effect = [
-            [{"column_name": "stock_code"}],  # 컬럼 탐지
-            None,  # position_id 메타(없음)
-            {"cnt": 0},  # state 컬럼 미존재
-            {"cnt": 0},  # entry_date 컬럼 미존재
-            {"cnt": 0},  # stop_loss 컬럼 미존재
-            {"cnt": 0},  # take_profit 컬럼 미존재
-            {"cnt": 0},  # atr_value 컬럼 미존재
-            {"cnt": 0},  # atr 컬럼 미존재
-            {"cnt": 0},  # created_at 컬럼 미존재
-            {"cnt": 0},  # updated_at 컬럼 미존재
+            self._build_positions_schema_rows(symbol_column="stock_code"),
             {
                 "stock_code": "005930",
                 "entry_price": 70000,
@@ -280,24 +302,20 @@ class TestPositionRepositoryCompatibility:
         assert "`stock_code`" in select_sql
 
     def test_upsert_generates_position_id_when_required(self):
+        PositionRepository.clear_schema_cache_for_tests()
         mock_db = Mock()
         mock_db.config = Mock(database="kis_trading")
         mock_db.execute_query.side_effect = [
-            [{"column_name": "stock_code"}],  # 컬럼 탐지
-            {  # position_id 메타(필수, 문자열)
-                "data_type": "varchar",
-                "is_nullable": "NO",
-                "column_default": None,
-                "extra": "",
-            },
-            {"cnt": 1},  # state 컬럼 존재
-            {"cnt": 0},  # entry_date 컬럼 미존재
-            {"cnt": 0},  # stop_loss 컬럼 미존재
-            {"cnt": 0},  # take_profit 컬럼 미존재
-            {"cnt": 0},  # atr_value 컬럼 미존재
-            {"cnt": 0},  # atr 컬럼 미존재
-            {"cnt": 0},  # created_at 컬럼 미존재
-            {"cnt": 0},  # updated_at 컬럼 미존재
+            self._build_positions_schema_rows(
+                symbol_column="stock_code",
+                position_id_meta={
+                    "data_type": "varchar",
+                    "is_nullable": "NO",
+                    "column_default": None,
+                    "extra": "",
+                },
+                state=True,
+            ),
             None,  # existing 조회: 없음
             {  # 최종 get_by_symbol 결과
                 "position_id": "P20250115093000000000_005930",
@@ -338,24 +356,26 @@ class TestPositionRepositoryCompatibility:
         assert insert_params[-1] == "ENTERED"
 
     def test_upsert_includes_detected_legacy_required_columns(self):
+        PositionRepository.clear_schema_cache_for_tests()
         mock_db = Mock()
         mock_db.config = Mock(database="kis_trading")
         mock_db.execute_query.side_effect = [
-            [{"column_name": "stock_code"}],  # 컬럼 탐지
-            {  # position_id 메타(필수, 문자열)
-                "data_type": "varchar",
-                "is_nullable": "NO",
-                "column_default": None,
-                "extra": "",
-            },
-            {"cnt": 1},  # state 컬럼 존재
-            {"cnt": 1},  # entry_date 컬럼 존재
-            {"cnt": 1},  # stop_loss 컬럼 존재
-            {"cnt": 1},  # take_profit 컬럼 존재
-            {"cnt": 1},  # atr_value 컬럼 존재
-            {"cnt": 0},  # atr 컬럼 미존재
-            {"cnt": 1},  # created_at 컬럼 존재
-            {"cnt": 1},  # updated_at 컬럼 존재
+            self._build_positions_schema_rows(
+                symbol_column="stock_code",
+                position_id_meta={
+                    "data_type": "varchar",
+                    "is_nullable": "NO",
+                    "column_default": None,
+                    "extra": "",
+                },
+                state=True,
+                entry_date=True,
+                stop_loss=True,
+                take_profit=True,
+                atr_value=True,
+                created_at=True,
+                updated_at=True,
+            ),
             None,  # existing 조회: 없음
             {  # 최종 get_by_symbol 결과
                 "position_id": "P20250115093000000000_005930",
@@ -402,24 +422,19 @@ class TestPositionRepositoryCompatibility:
         assert "ENTERED" in insert_params
 
     def test_detect_position_id_requirement_with_uppercase_metadata(self):
+        PositionRepository.clear_schema_cache_for_tests()
         mock_db = Mock()
         mock_db.config = Mock(database="kis_trading")
         mock_db.execute_query.side_effect = [
-            [{"column_name": "stock_code"}],  # 컬럼 탐지
-            {
-                "DATA_TYPE": "varchar",
-                "IS_NULLABLE": "NO",
-                "COLUMN_DEFAULT": None,
-                "EXTRA": "",
-            },
-            {"cnt": 0},
-            {"cnt": 0},
-            {"cnt": 0},
-            {"cnt": 0},
-            {"cnt": 0},
-            {"cnt": 0},
-            {"cnt": 0},
-            {"cnt": 0},
+            self._build_positions_schema_rows(
+                symbol_column="stock_code",
+                position_id_meta={
+                    "DATA_TYPE": "varchar",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": None,
+                    "EXTRA": "",
+                },
+            ),
         ]
 
         repo = PositionRepository(db=mock_db)
@@ -427,25 +442,20 @@ class TestPositionRepositoryCompatibility:
         assert repo._position_id_is_numeric is False
 
     def test_upsert_retries_when_position_id_default_error_occurs(self):
+        PositionRepository.clear_schema_cache_for_tests()
         mock_db = Mock()
         mock_db.config = Mock(database="kis_trading")
         mock_db.execute_query.side_effect = [
-            [{"column_name": "stock_code"}],  # __init__: symbol 컬럼 탐지
-            None,  # __init__: position_id 메타 탐지 실패(미탐지)
-            {"cnt": 0},  # __init__: state 컬럼 미존재
-            {"cnt": 0},  # __init__: entry_date 컬럼 미존재
-            {"cnt": 0},  # __init__: stop_loss 컬럼 미존재
-            {"cnt": 0},  # __init__: take_profit 컬럼 미존재
-            {"cnt": 0},  # __init__: atr_value 컬럼 미존재
-            {"cnt": 0},  # __init__: atr 컬럼 미존재
-            {"cnt": 0},  # __init__: created_at 컬럼 미존재
-            {"cnt": 0},  # __init__: updated_at 컬럼 미존재
-            {  # retry 시 position_id 메타 탐지(대문자 키)
-                "DATA_TYPE": "varchar",
-                "IS_NULLABLE": "NO",
-                "COLUMN_DEFAULT": None,
-                "EXTRA": "",
-            },
+            self._build_positions_schema_rows(symbol_column="stock_code"),
+            self._build_positions_schema_rows(
+                symbol_column="stock_code",
+                position_id_meta={
+                    "DATA_TYPE": "varchar",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": None,
+                    "EXTRA": "",
+                },
+            ),
             None,  # retry attempt: existing 조회
             {  # 최종 get_by_symbol
                 "position_id": "P20250115093000000000_005930",
@@ -484,6 +494,22 @@ class TestPositionRepositoryCompatibility:
         assert mock_db.execute_command.call_count == 2
         second_sql = mock_db.execute_command.call_args_list[1][0][0]
         assert "position_id" in second_sql
+
+    def test_positions_schema_introspection_is_cached_process_globally(self):
+        PositionRepository.clear_schema_cache_for_tests()
+        mock_db1 = Mock()
+        mock_db1.config = Mock(database="kis_trading")
+        mock_db1.execute_query.return_value = self._build_positions_schema_rows(symbol_column="stock_code")
+        mock_db2 = Mock()
+        mock_db2.config = Mock(database="kis_trading")
+        mock_db2.execute_query.return_value = self._build_positions_schema_rows(symbol_column="stock_code")
+
+        PositionRepository(db=mock_db1)
+        PositionRepository(db=mock_db2)
+
+        assert mock_db1.execute_query.call_count == 1
+        assert mock_db2.execute_query.call_count == 0
+        assert PositionRepository._repository_schema_introspection_count == 1
 
 
 class TestTradeRecord:
@@ -694,6 +720,18 @@ class TestMySQLSpecificFeatures:
         
         assert pool_config["pool_size"] == 10
         assert pool_config["pool_name"] == "test_pool"
+
+    def test_mixed_import_paths_share_same_db_singleton(self):
+        close_db_manager()
+        legacy_mysql = importlib.import_module("db.mysql")
+        canonical_mysql = importlib.import_module("kis_trend_atr_trading.db.mysql")
+
+        manager1 = legacy_mysql.get_db_manager(DatabaseConfig(database="legacy_db"))
+        manager2 = canonical_mysql.get_db_manager(DatabaseConfig(database="canonical_db"))
+
+        assert legacy_mysql is canonical_mysql
+        assert manager1 is manager2
+        assert legacy_mysql.CANONICAL_DB_MODULE_PATH == "kis_trend_atr_trading.db.mysql"
     
     def test_charset_config(self):
         """문자셋 설정 테스트"""

@@ -39,7 +39,9 @@ Oracle Cloud Infrastructure Free Tier MySQL 호환.
         cursor.execute("UPDATE positions ...")
 """
 
+import builtins
 import os
+import sys
 import time
 from datetime import datetime
 from typing import Optional, Dict, List, Any, Tuple, Generator
@@ -58,6 +60,54 @@ except ImportError:
 from utils.logger import get_logger
 
 logger = get_logger("mysql")
+
+CANONICAL_DB_MODULE_PATH = "kis_trend_atr_trading.db.mysql"
+LEGACY_DB_MODULE_PATH = "db.mysql"
+_MAX_DB_POOL_SIZE = 32
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in ("true", "1", "yes", "on")
+
+
+def _alias_mysql_module_names() -> None:
+    module = sys.modules.get(__name__)
+    if module is None:
+        return
+    sys.modules.setdefault(CANONICAL_DB_MODULE_PATH, module)
+    sys.modules.setdefault(LEGACY_DB_MODULE_PATH, module)
+
+
+def _get_mysql_singleton_state() -> Dict[str, Any]:
+    state = getattr(builtins, "_kis_mysql_singleton_state", None)
+    if state is None:
+        state = {
+            "lock": threading.Lock(),
+            "manager": None,
+            "schema_init_attempted": False,
+            "config_signature": None,
+            "singleton_logged": False,
+        }
+        setattr(builtins, "_kis_mysql_singleton_state", state)
+    return state
+
+
+def _build_config_signature(config: "DatabaseConfig") -> Tuple[Any, ...]:
+    return (
+        bool(config.enabled),
+        str(config.db_type),
+        str(config.host),
+        int(config.port),
+        str(config.database),
+        str(config.user),
+        str(config.pool_name),
+        int(config.pool_size),
+        bool(config.pool_reset_session),
+        int(config.connect_timeout),
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -124,8 +174,10 @@ class DatabaseConfig:
         
         env_enabled = os.getenv("DB_ENABLED", "true").lower()
         self.enabled = env_enabled in ("true", "1", "yes")
-        # e2-micro 메모리 제약 대응: 커넥션 풀 상한 5 고정
-        self.pool_size = min(max(int(self.pool_size), 1), 5)
+        self.pool_size = int(os.getenv("DB_POOL_SIZE", str(self.pool_size or 5)))
+        self.pool_reset_session = _env_bool("DB_POOL_RESET_SESSION", self.pool_reset_session)
+        self.connect_timeout = int(os.getenv("DB_CONNECT_TIMEOUT_SEC", str(self.connect_timeout or 10)))
+        self.pool_size = min(max(int(self.pool_size), 1), _MAX_DB_POOL_SIZE)
     
     def to_dict(self) -> Dict[str, Any]:
         """딕셔너리로 변환 (mysql.connector.connect용)"""
@@ -225,6 +277,10 @@ class MySQLManager:
         self._pool: Optional[pooling.MySQLConnectionPool] = None
         self._lock = threading.Lock()
         self._connected = False
+        self._checkout_failure_count = 0
+        self._query_error_count = 0
+        self._command_error_count = 0
+        self._pool_bootstrap_logged = False
         
         logger.info(f"[DB] MySQL 관리자 초기화: {self.config}")
     
@@ -255,6 +311,18 @@ class MySQLManager:
         
         with self._lock:
             try:
+                if not self._pool_bootstrap_logged:
+                    logger.info(
+                        "[DB] pool bootstrap canonical_import_path=%s import_name=%s manager_identity=%s "
+                        "effective_db_pool_size=%s connect_timeout_sec=%s pool_reset_session=%s",
+                        CANONICAL_DB_MODULE_PATH,
+                        __name__,
+                        id(self),
+                        self.config.pool_size,
+                        self.config.connect_timeout,
+                        self.config.pool_reset_session,
+                    )
+                    self._pool_bootstrap_logged = True
                 # 커넥션 풀 생성
                 self._pool = pooling.MySQLConnectionPool(
                     **self.config.to_pool_config()
@@ -270,7 +338,14 @@ class MySQLManager:
                 test_conn.close()
                 
                 self._connected = True
-                logger.info(f"[DB] MySQL 연결 성공: {self.config.host}:{self.config.port}")
+                logger.info(
+                    "[DB] MySQL 연결 성공: %s:%s manager_identity=%s pool_identity=%s effective_db_pool_size=%s",
+                    self.config.host,
+                    self.config.port,
+                    id(self),
+                    id(self._pool),
+                    self.config.pool_size,
+                )
                 
                 return True
                 
@@ -309,9 +384,23 @@ class MySQLManager:
         
         if not self._pool:
             raise ConnectionError("데이터베이스에 연결되어 있지 않습니다.")
-        
-        conn = self._pool.get_connection()
-        conn.ping(reconnect=True, attempts=1, delay=0)
+
+        try:
+            conn = self._pool.get_connection()
+            conn.ping(reconnect=True, attempts=1, delay=0)
+        except MySQLError as e:
+            self._checkout_failure_count += 1
+            logger.error(
+                "[DB] connection checkout failed: %s | manager_identity=%s pool_identity=%s "
+                "effective_db_pool_size=%s checkout_failure_count=%s canonical_import_path=%s",
+                e,
+                id(self),
+                id(self._pool) if self._pool is not None else 0,
+                self.config.pool_size,
+                self._checkout_failure_count,
+                CANONICAL_DB_MODULE_PATH,
+            )
+            raise ConnectionError(f"커넥션 풀 checkout 실패: {e}")
 
         # 세션 타임존을 KST로 고정하여 CURDATE/NOW 등 DB 날짜 함수의 기준을 일치시킵니다.
         try:
@@ -381,6 +470,7 @@ class MySQLManager:
                     
         except MySQLError as e:
             logger.error(f"[DB] 쿼리 실행 실패: {e}\nQuery: {query}")
+            self._query_error_count += 1
             raise QueryError(f"쿼리 실행 실패: {e}")
         finally:
             conn.close()
@@ -425,6 +515,7 @@ class MySQLManager:
         except MySQLError as e:
             conn.rollback()
             logger.error(f"[DB] 명령 실행 실패 (롤백됨): {e}\nCommand: {command}")
+            self._command_error_count += 1
             raise QueryError(f"명령 실행 실패: {e}")
         finally:
             conn.close()
@@ -469,6 +560,7 @@ class MySQLManager:
         except MySQLError as e:
             conn.rollback()
             logger.error(f"[DB] INSERT 실행 실패 (롤백됨): {e}\nCommand: {command}")
+            self._command_error_count += 1
             raise QueryError(f"INSERT 실행 실패: {e}")
         finally:
             conn.close()
@@ -515,6 +607,7 @@ class MySQLManager:
         except MySQLError as e:
             conn.rollback()
             logger.error(f"[DB] 일괄 명령 실행 실패 (롤백됨): {e}")
+            self._command_error_count += 1
             raise QueryError(f"일괄 명령 실행 실패: {e}")
         finally:
             conn.close()
@@ -1014,7 +1107,16 @@ class MySQLManager:
             "type": "mysql",
             "host": self.config.host,
             "database": self.config.database,
-            "tables": []
+            "tables": [],
+            "manager_identity": id(self),
+            "pool_identity": id(self._pool) if self._pool is not None else 0,
+            "canonical_import_path": CANONICAL_DB_MODULE_PATH,
+            "effective_db_pool_size": int(self.config.pool_size),
+            "connect_timeout_sec": int(self.config.connect_timeout),
+            "pool_reset_session": bool(self.config.pool_reset_session),
+            "checkout_failure_count": int(self._checkout_failure_count),
+            "query_error_count": int(self._query_error_count),
+            "command_error_count": int(self._command_error_count),
         }
         
         if self.is_connected():
@@ -1047,9 +1149,7 @@ class MySQLManager:
 # ═══════════════════════════════════════════════════════════════════════════════
 # 싱글톤 인스턴스
 # ═══════════════════════════════════════════════════════════════════════════════
-
-_db_manager: Optional[MySQLManager] = None
-_db_schema_init_attempted: bool = False
+_alias_mysql_module_names()
 
 
 def get_db_manager(config: DatabaseConfig = None) -> MySQLManager:
@@ -1064,29 +1164,55 @@ def get_db_manager(config: DatabaseConfig = None) -> MySQLManager:
     Returns:
         MySQLManager: DB 관리자 인스턴스
     """
-    global _db_manager
-    global _db_schema_init_attempted
-    
-    if _db_manager is None:
-        _db_manager = MySQLManager(config)
+    state = _get_mysql_singleton_state()
+    resolved_config = config or DatabaseConfig()
+    requested_signature = _build_config_signature(resolved_config)
+
+    with state["lock"]:
+        manager = state["manager"]
+        if manager is None:
+            manager = MySQLManager(resolved_config)
+            state["manager"] = manager
+            state["config_signature"] = requested_signature
+        elif state.get("config_signature") not in (None, requested_signature):
+            logger.warning(
+                "[DB] singleton config mismatch ignored: canonical_import_path=%s manager_identity=%s "
+                "existing=%s requested=%s",
+                CANONICAL_DB_MODULE_PATH,
+                id(manager),
+                state.get("config_signature"),
+                requested_signature,
+            )
+        if not state["singleton_logged"]:
+            logger.info(
+                "[DB] singleton ready canonical_import_path=%s import_name=%s db_manager_singleton_identity=%s "
+                "effective_db_pool_size=%s",
+                CANONICAL_DB_MODULE_PATH,
+                __name__,
+                id(manager),
+                manager.config.pool_size,
+            )
+            state["singleton_logged"] = True
 
     # 런타임 구버전 스키마(예: positions.status 누락) 자동 보정
-    if not _db_schema_init_attempted:
-        _db_schema_init_attempted = True
+    if not state["schema_init_attempted"]:
+        state["schema_init_attempted"] = True
         try:
-            _db_manager.initialize_schema()
+            manager.initialize_schema()
         except Exception as e:
             logger.warning(f"[DB] 초기 스키마 보정 실패(계속 진행): {e}")
     
-    return _db_manager
+    return manager
 
 
 def close_db_manager() -> None:
     """싱글톤 DB 관리자 연결 종료"""
-    global _db_manager
-    global _db_schema_init_attempted
-    
-    if _db_manager is not None:
-        _db_manager.close()
-        _db_manager = None
-        _db_schema_init_attempted = False
+    state = _get_mysql_singleton_state()
+    with state["lock"]:
+        manager = state["manager"]
+        if manager is not None:
+            manager.close()
+        state["manager"] = None
+        state["schema_init_attempted"] = False
+        state["config_signature"] = None
+        state["singleton_logged"] = False

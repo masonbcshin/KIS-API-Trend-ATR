@@ -995,6 +995,11 @@ DB_PORT: int = int(os.getenv("DB_PORT", "3306"))
 DB_NAME: str = os.getenv("DB_NAME", "kis_trading")
 DB_USER: str = os.getenv("DB_USER", "")
 DB_PASSWORD: str = os.getenv("DB_PASSWORD", "")
+DB_POOL_SIZE: int = int(os.getenv("DB_POOL_SIZE", "5"))
+DB_CONNECT_TIMEOUT_SEC: int = int(os.getenv("DB_CONNECT_TIMEOUT_SEC", "10"))
+DB_POOL_RESET_SESSION: bool = os.getenv(
+    "DB_POOL_RESET_SESSION", "true"
+).lower() in ("true", "1", "yes")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
