@@ -54,18 +54,20 @@ class ArmedCandidateStore:
         with self._lock:
             return dict(self._candidates)
 
-    def cleanup_expired(self, now: Optional[datetime] = None) -> int:
+    def pop_expired(self, now: Optional[datetime] = None) -> List[PullbackSetupCandidate]:
         current_now = now or datetime.now()
-        removed = 0
+        removed: List[PullbackSetupCandidate] = []
         with self._lock:
             for symbol, candidate in list(self._candidates.items()):
                 expires_at = getattr(candidate, "expires_at", None)
                 if not isinstance(expires_at, datetime):
                     continue
                 if expires_at <= current_now:
-                    self._candidates.pop(symbol, None)
-                    removed += 1
+                    removed.append(self._candidates.pop(symbol))
         return removed
+
+    def cleanup_expired(self, now: Optional[datetime] = None) -> int:
+        return len(self.pop_expired(now))
 
 
 class DailyContextStore:
