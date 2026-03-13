@@ -27,6 +27,18 @@ def _project_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def resolve_strategy_event_dir(event_dir: Optional[str] = None) -> Path:
+    configured_dir = str(
+        event_dir
+        or getattr(settings, "STRATEGY_ANALYTICS_EVENT_DIR", "data/analytics")
+        or "data/analytics"
+    ).strip()
+    base_dir = Path(configured_dir)
+    if not base_dir.is_absolute():
+        base_dir = _project_root() / base_dir
+    return base_dir
+
+
 def _json_ready(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
@@ -129,15 +141,7 @@ class StrategyAnalyticsEventLogger:
         enabled: bool = False,
         flush_each_write: bool = False,
     ) -> None:
-        configured_dir = str(
-            event_dir
-            or getattr(settings, "STRATEGY_ANALYTICS_EVENT_DIR", "data/analytics")
-            or "data/analytics"
-        ).strip()
-        base_dir = Path(configured_dir)
-        if not base_dir.is_absolute():
-            base_dir = _project_root() / base_dir
-        self._event_dir = base_dir
+        self._event_dir = resolve_strategy_event_dir(event_dir)
         self._enabled = bool(enabled)
         self._flush_each_write = bool(flush_each_write)
         self._lock = threading.Lock()
@@ -276,14 +280,7 @@ def load_strategy_events(
     event_dir: Optional[str] = None,
     trade_date: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    configured_dir = str(
-        event_dir
-        or getattr(settings, "STRATEGY_ANALYTICS_EVENT_DIR", "data/analytics")
-        or "data/analytics"
-    ).strip()
-    base_dir = Path(configured_dir)
-    if not base_dir.is_absolute():
-        base_dir = _project_root() / base_dir
+    base_dir = resolve_strategy_event_dir(event_dir)
     if not base_dir.exists():
         return []
     paths: Iterable[Path]
@@ -311,6 +308,52 @@ def load_strategy_events(
                 events.append(payload)
     events.sort(key=lambda item: (str(item.get("event_ts") or ""), int(item.get("_line_index", 0) or 0)))
     return events
+
+
+def inspect_strategy_event_input(
+    *,
+    event_dir: Optional[str] = None,
+    trade_date: Optional[str] = None,
+) -> Dict[str, Any]:
+    base_dir = resolve_strategy_event_dir(event_dir)
+    diagnostics: Dict[str, Any] = {
+        "configured_event_dir": str(
+            event_dir
+            or getattr(settings, "STRATEGY_ANALYTICS_EVENT_DIR", "data/analytics")
+            or "data/analytics"
+        ).strip(),
+        "resolved_event_dir": str(base_dir),
+        "trade_date": str(trade_date or ""),
+        "event_dir_exists": bool(base_dir.exists()),
+        "event_file": "",
+        "event_file_exists": False,
+        "event_file_size_bytes": 0,
+        "available_event_file_count": 0,
+        "missing_input_state": "ok",
+    }
+    if base_dir.exists():
+        diagnostics["available_event_file_count"] = len(list(base_dir.glob("strategy_events_*.jsonl")))
+    if trade_date:
+        target_file = base_dir / f"strategy_events_{str(trade_date).strip()}.jsonl"
+        diagnostics["event_file"] = str(target_file)
+        diagnostics["event_file_exists"] = bool(target_file.exists())
+        if target_file.exists():
+            try:
+                diagnostics["event_file_size_bytes"] = int(target_file.stat().st_size)
+            except OSError:
+                diagnostics["event_file_size_bytes"] = 0
+
+    if not diagnostics["event_dir_exists"]:
+        diagnostics["missing_input_state"] = "event_dir_missing"
+    elif trade_date:
+        if not diagnostics["event_file_exists"]:
+            diagnostics["missing_input_state"] = "trade_date_file_missing"
+        elif int(diagnostics["event_file_size_bytes"] or 0) <= 0:
+            diagnostics["missing_input_state"] = "trade_date_file_empty"
+    elif int(diagnostics["available_event_file_count"] or 0) <= 0:
+        diagnostics["missing_input_state"] = "event_dir_empty"
+
+    return diagnostics
 
 
 def analytics_events_from_replay_report(

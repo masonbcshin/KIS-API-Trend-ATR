@@ -11,7 +11,7 @@ try:
     from analytics.alerts import build_alert_rows as build_strategy_alert_rows
     from analytics.diagnostics import build_diagnostics_report
     from analytics.attribution import build_attribution_rows
-    from analytics.event_logger import load_strategy_events
+    from analytics.event_logger import inspect_strategy_event_input, load_strategy_events, resolve_strategy_event_dir
     from analytics.parity import build_parity_rows as build_strategy_parity_rows
     from analytics.repository import (
         StrategyAlertsDailyRepository,
@@ -25,11 +25,16 @@ try:
     from analytics.summary_drilldown import build_funnel_rows
     from config import settings
     from db.mysql import get_db_manager
+    from utils.logger import get_logger
 except ImportError:
     from kis_trend_atr_trading.analytics.alerts import build_alert_rows as build_strategy_alert_rows
     from kis_trend_atr_trading.analytics.diagnostics import build_diagnostics_report
     from kis_trend_atr_trading.analytics.attribution import build_attribution_rows
-    from kis_trend_atr_trading.analytics.event_logger import load_strategy_events
+    from kis_trend_atr_trading.analytics.event_logger import (
+        inspect_strategy_event_input,
+        load_strategy_events,
+        resolve_strategy_event_dir,
+    )
     from kis_trend_atr_trading.analytics.parity import build_parity_rows as build_strategy_parity_rows
     from kis_trend_atr_trading.analytics.repository import (
         StrategyAlertsDailyRepository,
@@ -43,6 +48,10 @@ except ImportError:
     from kis_trend_atr_trading.analytics.summary_drilldown import build_funnel_rows
     from kis_trend_atr_trading.config import settings
     from kis_trend_atr_trading.db.mysql import get_db_manager
+    from kis_trend_atr_trading.utils.logger import get_logger
+
+
+logger = get_logger("strategy_analytics")
 
 
 def _parse_ts(raw: Any) -> Optional[datetime]:
@@ -82,6 +91,7 @@ class StrategyAnalyticsMaterializer:
     ) -> None:
         self._event_dir = event_dir
         self._db = db_manager if db_manager is not None else get_db_manager()
+        self._last_event_input_diagnostics: Dict[str, Any] = {}
         self._enable_markouts = (
             bool(enable_markouts)
             if enable_markouts is not None
@@ -102,7 +112,53 @@ class StrategyAnalyticsMaterializer:
     def _db_enabled_for_analytics(self) -> bool:
         return bool(getattr(settings, "DB_ENABLED", False)) and bool(getattr(self._db.config, "enabled", False))
 
+    def _resolve_event_input_diagnostics(self, trade_date: str) -> Dict[str, Any]:
+        diagnostics = inspect_strategy_event_input(event_dir=self._event_dir, trade_date=trade_date)
+        configured_live_dir = resolve_strategy_event_dir(None)
+        diagnostics["configured_live_event_dir"] = str(configured_live_dir)
+        diagnostics["live_writer_expected"] = bool(
+            getattr(settings, "ENABLE_STRATEGY_ANALYTICS", False)
+        ) and str(diagnostics.get("resolved_event_dir") or "") == str(configured_live_dir)
+        missing_state = str(diagnostics.get("missing_input_state") or "ok")
+        likely_cause = ""
+        if missing_state == "event_dir_missing":
+            likely_cause = (
+                "writer_never_initialized_or_live_emit_unwired"
+                if bool(diagnostics.get("live_writer_expected"))
+                else "event_dir_missing"
+            )
+        elif missing_state == "trade_date_file_missing":
+            likely_cause = (
+                "live_writer_attached_but_no_events_emitted_or_wiring_missing"
+                if bool(diagnostics.get("live_writer_expected"))
+                else "trade_date_file_missing"
+            )
+        elif missing_state == "trade_date_file_empty":
+            likely_cause = "event_file_created_but_no_events_appended"
+        elif missing_state == "event_dir_empty":
+            likely_cause = "event_dir_exists_but_has_no_strategy_event_files"
+        diagnostics["likely_cause"] = likely_cause
+        return diagnostics
+
+    def _log_event_input_diagnostics(self, diagnostics: Dict[str, Any]) -> None:
+        missing_state = str(diagnostics.get("missing_input_state") or "ok")
+        if missing_state == "ok":
+            return
+        logger.warning(
+            "[STRATEGY_ANALYTICS][INPUT_DIAGNOSTICS] state=%s trade_date=%s event_dir=%s event_file=%s "
+            "live_writer_expected=%s likely_cause=%s",
+            missing_state,
+            diagnostics.get("trade_date"),
+            diagnostics.get("resolved_event_dir"),
+            diagnostics.get("event_file"),
+            bool(diagnostics.get("live_writer_expected")),
+            diagnostics.get("likely_cause") or "",
+        )
+
     def _load_events(self, trade_date: str) -> List[Dict[str, Any]]:
+        diagnostics = self._resolve_event_input_diagnostics(trade_date)
+        self._last_event_input_diagnostics = diagnostics
+        self._log_event_input_diagnostics(diagnostics)
         return load_strategy_events(event_dir=self._event_dir, trade_date=trade_date)
 
     def _extract_price_observation(self, event: Dict[str, Any]) -> Optional[PriceObservation]:
@@ -420,6 +476,7 @@ class StrategyAnalyticsMaterializer:
             "trade_date": trade_date,
             "alert_count": len(alert_rows),
             "alert_rows": alert_rows,
+            "analytics_input_diagnostics": dict(payload.get("event_input_diagnostics") or {}),
         }
         if persist and self._db_enabled_for_analytics():
             self._alerts_repo.ensure_table()
@@ -446,6 +503,8 @@ class StrategyAnalyticsMaterializer:
             "parity_count": len(parity_rows),
             "mismatch_count": sum(1 for row in parity_rows if bool(row.get("mismatch_flag"))),
             "parity_rows": parity_rows,
+            "live_input_diagnostics": dict(live_payload.get("event_input_diagnostics") or {}),
+            "replay_input_diagnostics": dict(replay_payload.get("event_input_diagnostics") or {}),
         }
         if persist and self._db_enabled_for_analytics():
             self._parity_repo.ensure_table()
@@ -467,6 +526,7 @@ class StrategyAnalyticsMaterializer:
         payload = {
             "trade_date": trade_date,
             "event_count": len(events),
+            "event_input_diagnostics": dict(self._last_event_input_diagnostics or {}),
             "summary_rows": summary_rows,
             "reject_rows": reject_rows,
             "funnel_rows": funnel_rows,

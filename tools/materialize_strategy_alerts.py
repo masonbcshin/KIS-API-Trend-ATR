@@ -65,6 +65,12 @@ def main() -> int:
     )
     result = {
         "trade_date": args.date,
+        "analytics_input_diagnostics": dict(analytics_payload.get("event_input_diagnostics") or {}),
+        "replay_input_diagnostics": (
+            dict(replay_payload.get("event_input_diagnostics") or {})
+            if args.replay_event_dir and replay_payload is not None
+            else {}
+        ),
         "alerts": alerts_payload,
         "parity": parity_payload,
     }

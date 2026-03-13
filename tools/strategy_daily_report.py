@@ -93,6 +93,17 @@ def main() -> int:
     funnel_index = _funnel_index(result.get("funnel_rows", []))
     attribution_rows = result.get("attribution_rows", [])
     print(f"[STRATEGY_ANALYTICS] trade_date={args.date} events={result['event_count']}")
+    input_diagnostics = dict(result.get("event_input_diagnostics") or {})
+    missing_state = str(input_diagnostics.get("missing_input_state") or "ok")
+    if missing_state != "ok":
+        print(
+            "[STRATEGY_ANALYTICS_INPUT] "
+            f"state={missing_state} "
+            f"event_dir={input_diagnostics.get('resolved_event_dir')} "
+            f"event_file={input_diagnostics.get('event_file')} "
+            f"live_writer_expected={bool(input_diagnostics.get('live_writer_expected'))} "
+            f"likely_cause={input_diagnostics.get('likely_cause') or ''}"
+        )
     for row in result.get("summary_rows", []):
         strategy_tag = str(row["strategy_tag"])
         strategy_funnel = funnel_index.get(strategy_tag, {})

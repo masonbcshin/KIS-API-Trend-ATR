@@ -149,6 +149,7 @@ def build_diagnostics_report(
     return {
         "trade_date": trade_date,
         "event_count": int(analytics_payload.get("event_count", 0) or 0),
+        "input_diagnostics": dict(analytics_payload.get("event_input_diagnostics") or {}),
         "strategy_count": len(strategies),
         "strategies": strategies,
     }
@@ -158,6 +159,27 @@ def render_diagnostics_text(report: Dict[str, Any]) -> str:
     lines = [
         f"[STRATEGY_DIAGNOSTICS] trade_date={report.get('trade_date')} events={report.get('event_count')} strategies={report.get('strategy_count')}"
     ]
+    input_diagnostics = dict(report.get("input_diagnostics") or {})
+    missing_state = str(input_diagnostics.get("missing_input_state") or "ok")
+    if missing_state != "ok":
+        lines.append(
+            "[STRATEGY_DIAGNOSTICS_INPUT] "
+            f"state={missing_state} "
+            f"event_dir={input_diagnostics.get('resolved_event_dir')} "
+            f"event_file={input_diagnostics.get('event_file')} "
+            f"live_writer_expected={bool(input_diagnostics.get('live_writer_expected'))} "
+            f"likely_cause={input_diagnostics.get('likely_cause') or ''}"
+        )
+    replay_input_diagnostics = dict(report.get("replay_input_diagnostics") or {})
+    replay_missing_state = str(replay_input_diagnostics.get("missing_input_state") or "ok")
+    if replay_missing_state != "ok":
+        lines.append(
+            "[STRATEGY_DIAGNOSTICS_REPLAY_INPUT] "
+            f"state={replay_missing_state} "
+            f"event_dir={replay_input_diagnostics.get('resolved_event_dir')} "
+            f"event_file={replay_input_diagnostics.get('event_file')} "
+            f"likely_cause={replay_input_diagnostics.get('likely_cause') or ''}"
+        )
     for strategy in list(report.get("strategies") or []):
         summary = dict(strategy.get("summary") or {})
         funnel = {str(item.get("stage_name") or ""): dict(item) for item in list(strategy.get("funnel") or [])}

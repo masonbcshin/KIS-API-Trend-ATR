@@ -25,6 +25,7 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Dict, Optional, Any, List
 import pandas as pd
 
@@ -586,6 +587,7 @@ class MultidayExecutor:
 
         # 리스크 매니저 상태 출력 (공유 매니저 기준 1회만 출력)
         self._maybe_print_risk_status()
+        self._log_strategy_analytics_startup_state()
 
     def _maybe_print_risk_status(self) -> None:
         """공유 RiskManager 인스턴스 기준으로 상태를 1회만 출력합니다."""
@@ -770,18 +772,62 @@ class MultidayExecutor:
     def _is_strategy_analytics_enabled(self) -> bool:
         return bool(getattr(settings, "ENABLE_STRATEGY_ANALYTICS", False))
 
+    @staticmethod
+    def _resolve_strategy_analytics_event_dir() -> str:
+        configured_dir = str(
+            getattr(settings, "STRATEGY_ANALYTICS_EVENT_DIR", "data/analytics")
+            or "data/analytics"
+        ).strip()
+        base_dir = Path(configured_dir)
+        if not base_dir.is_absolute():
+            base_dir = Path(__file__).resolve().parents[2] / base_dir
+        return str(base_dir)
+
+    @staticmethod
+    def _is_strategy_markout_enabled() -> bool:
+        return bool(getattr(settings, "ENABLE_STRATEGY_MARKOUTS", False))
+
     def _get_strategy_analytics_logger(self) -> Optional[StrategyAnalyticsEventLogger]:
         if not self._is_strategy_analytics_enabled():
             return None
         if self._strategy_analytics_logger is None:
-            self._strategy_analytics_logger = StrategyAnalyticsEventLogger(
-                event_dir=str(
-                    getattr(settings, "STRATEGY_ANALYTICS_EVENT_DIR", "data/analytics")
-                    or "data/analytics"
-                ),
-                enabled=True,
-            )
+            try:
+                self._strategy_analytics_logger = StrategyAnalyticsEventLogger(
+                    event_dir=self._resolve_strategy_analytics_event_dir(),
+                    enabled=True,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[STRATEGY_ANALYTICS][STARTUP] symbol=%s enabled=true effective_event_dir=%s "
+                    "live_writer_initialized=false live_runtime_emit_wiring_active=false error=%s",
+                    getattr(self, "stock_code", ""),
+                    self._resolve_strategy_analytics_event_dir(),
+                    exc,
+                )
+                self._strategy_analytics_logger = None
         return self._strategy_analytics_logger
+
+    def _log_strategy_analytics_startup_state(self) -> None:
+        enabled = self._is_strategy_analytics_enabled()
+        effective_event_dir = self._resolve_strategy_analytics_event_dir()
+        markout_enabled = self._is_strategy_markout_enabled()
+        live_runtime_emit_wiring_active = bool(enabled)
+        logger_obj = self._get_strategy_analytics_logger() if enabled else None
+        live_writer_initialized = bool(logger_obj is not None)
+        level = logger.info
+        if enabled and not live_writer_initialized:
+            level = logger.warning
+            live_runtime_emit_wiring_active = False
+        level(
+            "[STRATEGY_ANALYTICS][STARTUP] symbol=%s enabled=%s effective_event_dir=%s "
+            "live_writer_initialized=%s live_runtime_emit_wiring_active=%s markout_enabled=%s",
+            getattr(self, "stock_code", ""),
+            enabled,
+            effective_event_dir,
+            live_writer_initialized,
+            live_runtime_emit_wiring_active,
+            markout_enabled,
+        )
 
     def _close_strategy_analytics_logger(self) -> None:
         logger_obj = getattr(self, "_strategy_analytics_logger", None)
@@ -821,6 +867,8 @@ class MultidayExecutor:
         source_component: str = "",
         trade_date: str = "",
         queue_depth: Optional[int] = None,
+        intent_id_override: str = "",
+        candidate_id_override: str = "",
     ) -> Optional[Dict[str, Any]]:
         logger_obj = self._get_strategy_analytics_logger()
         if logger_obj is None:
@@ -831,7 +879,7 @@ class MultidayExecutor:
         resolved_queue_depth = queue_depth
         if resolved_queue_depth is None:
             resolved_queue_depth = int(getattr(self, "_authoritative_intent_queue_depth", 0) or 0)
-        candidate_id = ""
+        candidate_id = str(candidate_id_override or "").strip()
         if candidate is not None:
             try:
                 candidate_id = compute_candidate_id(candidate)
@@ -844,7 +892,7 @@ class MultidayExecutor:
                     candidate_id = str(carrier.get("candidate_id") or "").strip()
                     if candidate_id:
                         break
-        intent_id = ""
+        intent_id = str(intent_id_override or "").strip()
         if intent is not None:
             try:
                 intent_id = compute_intent_id(intent)
@@ -868,6 +916,183 @@ class MultidayExecutor:
             payload_schema_version="v1",
             source_component=str(source_component or ""),
             payload_json=dict(payload_json or {}),
+        )
+
+    @staticmethod
+    def _resolve_strategy_analytics_event_ts(
+        signal: Optional[TradingSignal],
+        fallback: Optional[datetime] = None,
+    ) -> datetime:
+        meta = dict(getattr(signal, "meta", {}) or {})
+        for key in ("signal_time", "decision_time"):
+            raw = meta.get(key)
+            if raw in (None, ""):
+                continue
+            try:
+                parsed = datetime.fromisoformat(str(raw))
+            except Exception:
+                continue
+            if parsed.tzinfo is None:
+                return KST.localize(parsed)
+            return parsed.astimezone(KST)
+        if fallback is not None:
+            if fallback.tzinfo is None:
+                return KST.localize(fallback)
+            return fallback.astimezone(KST)
+        return datetime.now(KST)
+
+    def _build_direct_strategy_analytics_ids(
+        self,
+        *,
+        signal: Optional[TradingSignal],
+        event_ts: datetime,
+    ) -> Dict[str, str]:
+        meta = dict(getattr(signal, "meta", {}) or {})
+        strategy_tag = self._strategy_tag(signal)
+        symbol = str(getattr(self, "stock_code", "") or "").zfill(6)
+        anchor_ts = self._resolve_strategy_analytics_event_ts(signal, event_ts)
+        digest_source = "|".join(
+            [
+                strategy_tag,
+                symbol,
+                anchor_ts.isoformat(),
+                str(getattr(signal, "reason_code", "") or ""),
+                str(meta.get("entry_reference_label") or meta.get("strategy_tag") or ""),
+                str(meta.get("entry_reference_price") or meta.get("prev_high") or getattr(signal, "price", 0.0) or 0.0),
+            ]
+        )
+        digest = hashlib.sha1(digest_source.encode("utf-8")).hexdigest()[:16]
+        return {
+            "candidate_id": f"{strategy_tag}:{symbol}:candidate:{digest}",
+            "intent_id": f"{strategy_tag}:{symbol}:intent:{digest}",
+        }
+
+    def _build_direct_strategy_analytics_payload(
+        self,
+        *,
+        signal: Optional[TradingSignal],
+        context: Optional[Any] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        meta = dict(getattr(signal, "meta", {}) or {})
+        payload = dict(meta)
+        if context is not None:
+            payload.setdefault("current_price", getattr(context, "current_price", None))
+            payload.setdefault("open_price", getattr(context, "open_price", None))
+            payload.setdefault("has_pending_order", getattr(context, "has_pending_order", None))
+            quote_snapshot = dict(getattr(context, "quote_snapshot", {}) or {})
+            payload.setdefault("quote_age_sec", quote_snapshot.get("quote_age_sec"))
+            payload.setdefault("data_feed_source", quote_snapshot.get("source"))
+        payload.setdefault("signal_reason", str(getattr(signal, "reason", "") or ""))
+        payload.setdefault("reason_code", str(getattr(signal, "reason_code", "") or ""))
+        if extra:
+            payload.update(dict(extra))
+        return payload
+
+    def _log_direct_strategy_signal_analytics(
+        self,
+        *,
+        signal: TradingSignal,
+        context: PreparedEvaluationContext,
+    ) -> None:
+        strategy_tag = self._strategy_tag(signal)
+        if not strategy_tag:
+            return
+        event_ts = self._resolve_strategy_analytics_event_ts(signal, context.decision_time)
+        ids = self._build_direct_strategy_analytics_ids(signal=signal, event_ts=event_ts)
+        payload = self._build_direct_strategy_analytics_payload(signal=signal, context=context)
+        self._log_strategy_analytics_event(
+            event_type="candidate_created",
+            stage="setup",
+            decision="accepted",
+            strategy_tag=strategy_tag,
+            symbol=self.stock_code,
+            event_ts=event_ts,
+            source_component="executor_direct",
+            candidate_id_override=ids["candidate_id"],
+            payload_json=payload,
+        )
+        self._log_strategy_analytics_event(
+            event_type="timing_confirmed",
+            stage="timing",
+            decision="accepted",
+            strategy_tag=strategy_tag,
+            symbol=self.stock_code,
+            event_ts=event_ts,
+            source_component="executor_direct",
+            candidate_id_override=ids["candidate_id"],
+            intent_id_override=ids["intent_id"],
+            payload_json=payload,
+        )
+        self._log_strategy_analytics_event(
+            event_type="intent_ingressed",
+            stage="ingress",
+            decision="accepted",
+            strategy_tag=strategy_tag,
+            symbol=self.stock_code,
+            event_ts=event_ts,
+            source_component="executor_direct",
+            candidate_id_override=ids["candidate_id"],
+            intent_id_override=ids["intent_id"],
+            payload_json=payload,
+        )
+
+    def _log_direct_strategy_timing_reject(
+        self,
+        *,
+        signal: TradingSignal,
+        context: PreparedEvaluationContext,
+    ) -> None:
+        reason_code = str(getattr(signal, "reason_code", "") or "").strip()
+        strategy_tag = self._strategy_tag(signal)
+        if not strategy_tag or not reason_code or reason_code == "pullback_threaded_deferred":
+            return
+        event_ts = self._resolve_strategy_analytics_event_ts(signal, context.decision_time)
+        ids = self._build_direct_strategy_analytics_ids(signal=signal, event_ts=event_ts)
+        self._log_strategy_analytics_event(
+            event_type="timing_rejected",
+            stage="timing",
+            decision="rejected",
+            reject_reason=reason_code,
+            strategy_tag=strategy_tag,
+            symbol=self.stock_code,
+            event_ts=event_ts,
+            source_component="executor_direct",
+            candidate_id_override=ids["candidate_id"],
+            intent_id_override=ids["intent_id"],
+            payload_json=self._build_direct_strategy_analytics_payload(signal=signal, context=context),
+        )
+
+    def _log_direct_strategy_execution_event(
+        self,
+        *,
+        signal: TradingSignal,
+        event_type: str,
+        stage: str,
+        decision: str,
+        reject_reason: str = "",
+        broker_order_id: str = "",
+        payload_json: Optional[Dict[str, Any]] = None,
+        event_ts: Optional[datetime] = None,
+    ) -> None:
+        strategy_tag = self._strategy_tag(signal)
+        if not strategy_tag:
+            return
+        resolved_event_ts = self._resolve_strategy_analytics_event_ts(signal, event_ts)
+        ids = self._build_direct_strategy_analytics_ids(signal=signal, event_ts=resolved_event_ts)
+        self._log_strategy_analytics_event(
+            event_type=event_type,
+            stage=stage,
+            decision=decision,
+            reject_reason=reject_reason,
+            strategy_tag=strategy_tag,
+            symbol=self.stock_code,
+            event_ts=resolved_event_ts,
+            source_component="executor_direct",
+            candidate_id_override=ids["candidate_id"],
+            intent_id_override=ids["intent_id"],
+            broker_order_id=broker_order_id,
+            payload_json=self._build_direct_strategy_analytics_payload(signal=signal, extra=payload_json),
         )
 
     def is_pipeline_degraded(self) -> bool:
@@ -3577,6 +3802,7 @@ class MultidayExecutor:
                     "limit_price": None,
                 },
             )
+            self._log_direct_strategy_signal_analytics(signal=signal, context=context)
 
         result["signal"] = {
             "type": signal_type_value,
@@ -3606,6 +3832,14 @@ class MultidayExecutor:
             if not self._entry_allowed:
                 block_msg = self._entry_block_reason or f"[ENTRY] blocked: symbol={self.stock_code}"
                 logger.info(block_msg)
+                self._log_direct_strategy_execution_event(
+                    signal=signal,
+                    event_type="precheck_rejected",
+                    stage="precheck",
+                    decision="rejected",
+                    reject_reason="entry_blocked",
+                    payload_json={"message": block_msg},
+                )
                 result["order_result"] = {
                     "success": False,
                     "skipped": True,
@@ -3616,6 +3850,8 @@ class MultidayExecutor:
         elif signal_type_value == SignalType.SELL.value:
             result["order_result"] = self._execute_exit_with_pending_control(signal)
         elif signal_type_value == SignalType.HOLD.value:
+            if not bool(getattr(self.strategy, "has_position", False)):
+                self._log_direct_strategy_timing_reject(signal=signal, context=context)
             self._check_and_send_alerts(signal, context.current_price)
 
         if self.strategy.has_position:
@@ -4032,12 +4268,28 @@ class MultidayExecutor:
         risk_check = self.risk_manager.check_order_allowed(is_closing_position=False)
         if not risk_check.passed:
             logger.warning(f"리스크 체크 실패: {risk_check.reason}")
+            self._log_direct_strategy_execution_event(
+                signal=signal,
+                event_type="precheck_rejected",
+                stage="precheck",
+                decision="rejected",
+                reject_reason="risk_check_failed",
+                payload_json={"message": str(risk_check.reason or "")},
+            )
             if risk_check.should_exit:
                 safe_exit_with_message(risk_check.reason)
             return {"success": False, "message": risk_check.reason}
         
         # 이미 포지션 보유
         if self.strategy.has_position:
+            self._log_direct_strategy_execution_event(
+                signal=signal,
+                event_type="precheck_rejected",
+                stage="precheck",
+                decision="rejected",
+                reject_reason="existing_position",
+                payload_json={"message": "이미 포지션 보유 중"},
+            )
             return {"success": False, "message": "이미 포지션 보유 중"}
 
         if (
@@ -4055,6 +4307,19 @@ class MultidayExecutor:
                 pending_guard_decision=pending_guard.get("decision"),
                 pending_guard_status=pending_guard.get("status"),
             )
+            self._log_direct_strategy_execution_event(
+                signal=signal,
+                event_type="precheck_rejected",
+                stage="precheck",
+                decision="rejected",
+                reject_reason="pending_order",
+                payload_json={
+                    "message": "미종결 주문 존재 - Pullback 신규 진입 차단",
+                    "pending_guard_source": pending_guard.get("source"),
+                    "pending_guard_decision": pending_guard.get("decision"),
+                    "pending_guard_status": pending_guard.get("status"),
+                },
+            )
             return {
                 "success": False,
                 "skipped": True,
@@ -4067,6 +4332,14 @@ class MultidayExecutor:
 
         final_validation = self._run_order_final_validation(signal)
         if not final_validation.get("allowed", True):
+            self._log_direct_strategy_execution_event(
+                signal=signal,
+                event_type="precheck_rejected",
+                stage="precheck",
+                decision="rejected",
+                reject_reason=str(final_validation.get("reason_code") or "final_validation_failed"),
+                payload_json={"message": final_validation.get("message")},
+            )
             return {
                 "success": False,
                 "skipped": True,
@@ -4078,6 +4351,14 @@ class MultidayExecutor:
             tradeable, reason = self.market_checker.is_tradeable()
             if not tradeable:
                 logger.warning(f"매수 불가: {reason}")
+                self._log_direct_strategy_execution_event(
+                    signal=signal,
+                    event_type="native_handoff_rejected",
+                    stage="handoff",
+                    decision="rejected",
+                    reject_reason="market_unavailable",
+                    payload_json={"message": str(reason or "")},
+                )
                 return {"success": False, "message": reason}
 
         market_regime_guard = self._apply_market_regime_guard(
@@ -4085,6 +4366,14 @@ class MultidayExecutor:
             check_time=datetime.now(KST),
         )
         if market_regime_guard.get("blocked"):
+            self._log_direct_strategy_execution_event(
+                signal=signal,
+                event_type="precheck_rejected",
+                stage="precheck",
+                decision="rejected",
+                reject_reason=str(market_regime_guard.get("reason_code") or "market_regime_guard"),
+                payload_json={"message": market_regime_guard.get("message")},
+            )
             return {
                 "success": False,
                 "skipped": True,
@@ -4133,6 +4422,14 @@ class MultidayExecutor:
             order_quote = self.fetch_quote_snapshot()
             guarded_signal = self._apply_stale_quote_guard(signal, order_quote)
             if self._signal_type_value(getattr(guarded_signal, "signal_type", SignalType.BUY.value)) != SignalType.BUY.value:
+                self._log_direct_strategy_execution_event(
+                    signal=signal,
+                    event_type="native_handoff_rejected",
+                    stage="handoff",
+                    decision="rejected",
+                    reject_reason=str(getattr(guarded_signal, "reason_code", "") or "stale_quote_guard"),
+                    payload_json={"message": guarded_signal.reason},
+                )
                 return {
                     "success": False,
                     "skipped": True,
@@ -4157,6 +4454,22 @@ class MultidayExecutor:
                     limit_slippage_pct=order_plan.get("limit_slippage_pct"),
                     breakout_cap_pct=order_plan.get("breakout_cap_pct"),
                     slippage_cap_pct=order_plan.get("slippage_cap_pct"),
+                )
+                self._log_direct_strategy_execution_event(
+                    signal=signal,
+                    event_type="native_handoff_rejected",
+                    stage="handoff",
+                    decision="rejected",
+                    reject_reason=str(order_plan.get("reason_code") or "protected_limit_exceeds_cap"),
+                    payload_json={
+                        "message": "보호형 지정가가 허용 상한을 초과하여 신규 BUY 차단",
+                        "asset_type": order_plan.get("asset_type"),
+                        "current_price": order_plan.get("current_price"),
+                        "best_ask": order_plan.get("best_ask"),
+                        "limit_price": order_plan.get("limit_price"),
+                        "entry_reference_price": order_plan.get("entry_reference_price"),
+                        "entry_reference_label": order_plan.get("entry_reference_label"),
+                    },
                 )
                 return {
                     "success": False,
@@ -4185,6 +4498,21 @@ class MultidayExecutor:
                 limit_price=order_plan.get("limit_price"),
                 slippage_cap_pct=order_plan.get("slippage_cap_pct"),
             )
+            self._log_direct_strategy_execution_event(
+                signal=signal,
+                event_type="native_handoff_started",
+                stage="handoff",
+                decision="started",
+                payload_json={
+                    "order_style": order_plan.get("style"),
+                    "order_type": order_plan.get("order_type"),
+                    "requested_price": order_plan.get("price"),
+                    "current_price": order_plan.get("current_price"),
+                    "best_ask": order_plan.get("best_ask"),
+                    "entry_reference_price": order_plan.get("entry_reference_price"),
+                    "entry_reference_label": order_plan.get("entry_reference_label"),
+                },
+            )
 
             # 동기화 주문 - 체결 확인 후에만 성공 반환
             sync_result = self.order_synchronizer.execute_buy_order(
@@ -4199,6 +4527,24 @@ class MultidayExecutor:
                 order_type=str(order_plan.get("order_type") or "01"),
             )
             submitted_at = getattr(sync_result, "submitted_at", None)
+            if getattr(sync_result, "order_no", "") or submitted_at is not None:
+                self._log_direct_strategy_execution_event(
+                    signal=signal,
+                    event_type="order_submitted",
+                    stage="order",
+                    decision="submitted",
+                    broker_order_id=str(getattr(sync_result, "order_no", "") or ""),
+                    event_ts=submitted_at or datetime.now(KST),
+                    payload_json={
+                        "side": "BUY",
+                        "requested_price": order_plan.get("price"),
+                        "requested_order_type": order_plan.get("order_type"),
+                        "order_style": order_plan.get("style"),
+                        "current_price": order_plan.get("current_price"),
+                        "best_ask": order_plan.get("best_ask"),
+                        "limit_price": order_plan.get("limit_price"),
+                    },
+                )
             self._log_entry_trace(
                 "order_submit",
                 signal,
@@ -4341,6 +4687,20 @@ class MultidayExecutor:
                         "limit_price": order_plan.get("limit_price"),
                     },
                 )
+                self._log_direct_strategy_execution_event(
+                    signal=signal,
+                    event_type="order_filled",
+                    stage="order",
+                    decision="filled",
+                    broker_order_id=str(getattr(sync_result, "order_no", "") or ""),
+                    event_ts=datetime.now(KST),
+                    payload_json={
+                        "side": "BUY",
+                        "fill_price": actual_price,
+                        "exec_qty": applied_qty,
+                        "order_style": order_plan.get("style"),
+                    },
+                )
 
                 return {
                     "success": True,
@@ -4433,6 +4793,20 @@ class MultidayExecutor:
                             "limit_price": order_plan.get("limit_price"),
                         },
                     )
+                    self._log_direct_strategy_execution_event(
+                        signal=signal,
+                        event_type="order_filled",
+                        stage="order",
+                        decision="partial_filled",
+                        broker_order_id=str(getattr(sync_result, "order_no", "") or ""),
+                        event_ts=datetime.now(KST),
+                        payload_json={
+                            "side": "BUY",
+                            "fill_price": float(pos.entry_price),
+                            "exec_qty": applied_qty,
+                            "order_style": order_plan.get("style"),
+                        },
+                    )
                 
                 return {
                     "success": False,
@@ -4445,6 +4819,19 @@ class MultidayExecutor:
             else:
                 # 완전 실패 - 포지션 상태 변경 없음
                 if self._auto_reconcile_stale_position_after_buy_failure(signal, sync_result.message):
+                    self._log_direct_strategy_execution_event(
+                        signal=signal,
+                        event_type="order_filled",
+                        stage="order",
+                        decision="reconciled_fill",
+                        broker_order_id=str(getattr(sync_result, "order_no", "") or ""),
+                        event_ts=datetime.now(KST),
+                        payload_json={
+                            "side": "BUY",
+                            "reconciled": True,
+                            "message": sync_result.message,
+                        },
+                    )
                     reconciled_pos = self.strategy.position if self.strategy.has_position else None
                     return {
                         "success": True,
@@ -4457,6 +4844,42 @@ class MultidayExecutor:
                         ),
                         "strategy_tag": strategy_tag,
                     }
+                reject_reason = "native_handoff_rejected"
+                lower_message = str(sync_result.message or "").lower()
+                if "중복 주문 차단" in str(sync_result.message or ""):
+                    reject_reason = "duplicate_blocked"
+                    self._log_direct_strategy_execution_event(
+                        signal=signal,
+                        event_type="order_duplicate_blocked",
+                        stage="order",
+                        decision="blocked",
+                        reject_reason=reject_reason,
+                        broker_order_id=str(getattr(sync_result, "order_no", "") or ""),
+                        event_ts=datetime.now(KST),
+                        payload_json={"message": sync_result.message},
+                    )
+                elif getattr(sync_result, "result_type", None) == OrderExecutionResult.CANCELLED or "cancelled" in lower_message:
+                    self._log_direct_strategy_execution_event(
+                        signal=signal,
+                        event_type="order_cancelled",
+                        stage="order",
+                        decision="cancelled",
+                        reject_reason="cancelled",
+                        broker_order_id=str(getattr(sync_result, "order_no", "") or ""),
+                        event_ts=datetime.now(KST),
+                        payload_json={"message": sync_result.message},
+                    )
+                else:
+                    self._log_direct_strategy_execution_event(
+                        signal=signal,
+                        event_type="native_handoff_rejected",
+                        stage="handoff",
+                        decision="rejected",
+                        reject_reason=reject_reason,
+                        broker_order_id=str(getattr(sync_result, "order_no", "") or ""),
+                        event_ts=datetime.now(KST),
+                        payload_json={"message": sync_result.message},
+                    )
                 logger.error(f"매수 실패: {sync_result.message}")
                 return {
                     "success": False,
@@ -4466,6 +4889,15 @@ class MultidayExecutor:
                 }
             
         except Exception as e:
+            self._log_direct_strategy_execution_event(
+                signal=signal,
+                event_type="native_handoff_rejected",
+                stage="handoff",
+                decision="rejected",
+                reject_reason="exception",
+                payload_json={"message": str(e)},
+                event_ts=datetime.now(KST),
+            )
             logger.exception(f"매수 주문 에러: {e}")
             self.telegram.notify_error("매수 주문 실패", str(e))
             return {"success": False, "message": str(e)}

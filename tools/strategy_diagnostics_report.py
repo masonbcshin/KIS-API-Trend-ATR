@@ -68,6 +68,8 @@ def main() -> int:
         parity_rows=parity_rows,
         top_n=max(int(args.top_n or 0), 1),
     )
+    if args.replay_event_dir:
+        report["replay_input_diagnostics"] = dict(replay_payload.get("event_input_diagnostics") or {})
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
     else:
