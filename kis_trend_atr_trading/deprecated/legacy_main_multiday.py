@@ -51,6 +51,11 @@ from kis_trend_atr_trading.engine.multiday_executor import MultidayExecutor
 from kis_trend_atr_trading.engine.market_regime_worker import MarketRegimeRefreshThread
 from kis_trend_atr_trading.engine.order_synchronizer import get_instance_lock
 from kis_trend_atr_trading.engine.risk_manager import create_risk_manager_from_settings
+from kis_trend_atr_trading.engine.strategy_pipeline_persistence import (
+    PipelinePersistenceThread,
+    StrategyPipelinePersistenceManager,
+    slice_recovery_result_for_symbol,
+)
 from kis_trend_atr_trading.engine.runtime_state_machine import (
     FeedStatus,
     RuntimeConfig,
@@ -89,6 +94,70 @@ from kis_trend_atr_trading.env import (
     validate_environment,
     assert_not_real_mode,
 )
+
+
+def _build_shared_pipeline_persistence_runtime():
+    logger = get_logger("main")
+    manager = StrategyPipelinePersistenceManager(
+        state_dir=str(getattr(settings, "PIPELINE_STATE_DIR", "data/pipeline_state") or "data/pipeline_state"),
+        enabled=bool(getattr(settings, "ENABLE_PIPELINE_STATE_PERSISTENCE", False)),
+        candidate_snapshot_interval_sec=float(
+            getattr(settings, "PIPELINE_CANDIDATE_SNAPSHOT_INTERVAL_SEC", 15) or 15.0
+        ),
+        intent_journal_enabled=bool(getattr(settings, "PIPELINE_INTENT_JOURNAL_ENABLED", True)),
+        intent_max_age_sec=float(getattr(settings, "PIPELINE_INTENT_MAX_AGE_SEC", 120) or 120.0),
+        candidate_max_recover_age_sec=float(
+            getattr(settings, "PIPELINE_CANDIDATE_MAX_RECOVER_AGE_SEC", 300) or 300.0
+        ),
+        recover_only_current_trade_date=bool(
+            getattr(settings, "PIPELINE_RECOVER_ONLY_CURRENT_TRADE_DATE", True)
+        ),
+    )
+    manager.log_startup_configuration()
+    if not manager.prepare_process_global_writer():
+        logger.warning(
+            "[PIPELINE_PERSIST] shared_runtime_unavailable state_dir=%s error_state=%s",
+            manager.state_dir,
+            manager.error_state or "",
+        )
+        return manager, None, None
+    stop_event = threading.Event()
+    worker = PipelinePersistenceThread(
+        persistence_manager=manager,
+        stop_event=stop_event,
+    )
+    try:
+        worker.start()
+    except Exception as exc:
+        manager.disable(error_state=f"writer_start_failed:{type(exc).__name__}:{exc}")
+        logger.exception("[PIPELINE_PERSIST] shared_runtime_start_failed state_dir=%s", manager.state_dir)
+        return manager, None, None
+    return manager, worker, stop_event
+
+
+def _assign_bootstrap_pipeline_recovery(executors, persistence_manager):
+    if persistence_manager is None or not persistence_manager.enabled or not executors:
+        return
+    current_now = datetime.now(KST)
+    current_trade_date = executors[0]._trade_date_key(current_now)
+    reconciled_symbols = set()
+    for executor in executors:
+        reconciled_symbols.update(set(executor._pipeline_reconciled_symbols() or set()))
+    recovery = persistence_manager.load_recovery_state_once(
+        current_trade_date=current_trade_date,
+        now=current_now,
+        reconciled_symbols=reconciled_symbols,
+    )
+    for executor in executors:
+        executor.set_bootstrap_pipeline_recovery(
+            slice_recovery_result_for_symbol(recovery, symbol=executor.stock_code)
+        )
+    get_logger("main").info(
+        "[PIPELINE_PERSIST] bootstrap_restore_assigned executors=%s recovered_candidates=%s recovered_intents=%s",
+        len(executors),
+        len(recovery.recovered_pullback_candidates) + len(recovery.recovered_shadow_candidates),
+        len(recovery.recovered_pending_intents),
+    )
 
 
 def print_banner():
@@ -398,6 +467,9 @@ def run_trade(
     ws_quote_stop = None
     market_regime_worker = None
     market_regime_worker_stop_event = None
+    shared_pipeline_persistence_manager = None
+    shared_pipeline_persistence_worker = None
+    shared_pipeline_persistence_stop_event = None
     _stop_market_regime_worker = lambda: None
 
     try:
@@ -868,6 +940,9 @@ def run_trade(
 
         print("🔄 저장된 포지션 확인 중...")
         shared_risk_manager = create_risk_manager_from_settings()
+        shared_pipeline_persistence_manager, shared_pipeline_persistence_worker, shared_pipeline_persistence_stop_event = (
+            _build_shared_pipeline_persistence_runtime()
+        )
         executors_by_symbol = {}
         for symbol in run_symbols:
             symbol_store = _symbol_position_store(symbol)
@@ -880,6 +955,7 @@ def run_trade(
                 risk_manager=shared_risk_manager,
                 position_store=symbol_store,
                 market_data_provider=rest_provider,
+                pipeline_persistence_manager=shared_pipeline_persistence_manager,
             )
             if _should_restore_on_start(symbol, holdings_symbols, symbol_store):
                 restored = executor.restore_position_on_start()
@@ -895,6 +971,7 @@ def run_trade(
             executors.append(executor)
             executors_by_symbol[symbol] = executor
             fast_eval_scheduler.mark_force(symbol, reason="startup")
+        _assign_bootstrap_pipeline_recovery(executors, shared_pipeline_persistence_manager)
         print("")
 
         # 거래 시작
@@ -1336,6 +1413,7 @@ def run_trade(
                         risk_manager=shared_risk_manager,
                         position_store=symbol_store,
                         market_data_provider=rest_provider,
+                        pipeline_persistence_manager=shared_pipeline_persistence_manager,
                     )
                     if _should_restore_on_start(symbol, holdings_symbols, symbol_store):
                         restored = executor.restore_position_on_start()
@@ -2088,6 +2166,13 @@ def run_trade(
         logger.error(f"거래 오류: {e}")
     finally:
         _stop_market_regime_worker()
+        if shared_pipeline_persistence_stop_event is not None:
+            shared_pipeline_persistence_stop_event.set()
+        if shared_pipeline_persistence_worker is not None:
+            try:
+                shared_pipeline_persistence_worker.join(timeout=5.0)
+            except Exception:
+                pass
         if ws_stop is not None:
             try:
                 ws_stop()

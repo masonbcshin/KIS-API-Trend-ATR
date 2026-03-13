@@ -29,6 +29,11 @@ from typing import Dict, Optional, Any, List
 import pandas as pd
 
 try:
+    from kis_trend_atr_trading.analytics.event_logger import (
+        StrategyAnalyticsEventLogger,
+        compute_candidate_id,
+        compute_intent_id,
+    )
     from kis_trend_atr_trading.config import settings
     from kis_trend_atr_trading.api.kis_api import KISApi, KISApiError
     from kis_trend_atr_trading.strategy.multiday_trend_atr import (
@@ -89,6 +94,7 @@ try:
     from kis_trend_atr_trading.engine.strategy_pipeline_persistence import (
         PipelinePersistenceThread,
         StrategyPipelinePersistenceManager,
+        slice_recovery_result_for_symbol,
     )
     from kis_trend_atr_trading.engine.strategy_pipeline_registry import build_default_strategy_registry
     from kis_trend_atr_trading.utils.avg_price import calc_weighted_avg, quantize_price, reduce_quantity_after_sell
@@ -110,6 +116,11 @@ try:
     from kis_trend_atr_trading.utils.market_hours import KST
     from kis_trend_atr_trading.env import get_db_namespace_mode
 except ImportError:
+    from analytics.event_logger import (
+        StrategyAnalyticsEventLogger,
+        compute_candidate_id,
+        compute_intent_id,
+    )
     from config import settings
     from api.kis_api import KISApi, KISApiError
     from strategy.multiday_trend_atr import (
@@ -170,6 +181,7 @@ except ImportError:
     from engine.strategy_pipeline_persistence import (
         PipelinePersistenceThread,
         StrategyPipelinePersistenceManager,
+        slice_recovery_result_for_symbol,
     )
     from engine.strategy_pipeline_registry import build_default_strategy_registry
     from utils.avg_price import calc_weighted_avg, quantize_price, reduce_quantity_after_sell
@@ -299,6 +311,7 @@ class MultidayExecutor:
         telegram: TelegramNotifier = None,
         position_store: PositionStore = None,
         market_data_provider: Optional[MarketDataProvider] = None,
+        pipeline_persistence_manager: Optional[StrategyPipelinePersistenceManager] = None,
     ):
         """
         멀티데이 실행 엔진 초기화
@@ -439,7 +452,16 @@ class MultidayExecutor:
         self._strategy_pipeline_registry: Optional[Any] = None
         self._strategy_pipeline_health_store: Optional[WorkerHealthStore] = None
         self._strategy_pipeline_degraded_controller: Optional[DegradedModeController] = None
-        self._pipeline_persistence_manager: Optional[StrategyPipelinePersistenceManager] = None
+        self._shared_pipeline_persistence_manager: Optional[StrategyPipelinePersistenceManager] = (
+            pipeline_persistence_manager
+        )
+        self._pipeline_persistence_manager: Optional[StrategyPipelinePersistenceManager] = (
+            pipeline_persistence_manager
+        )
+        self._pipeline_persistence_registration_key: str = (
+            f"{str(stock_code or settings.DEFAULT_STOCK_CODE or '').zfill(6)}:{id(self)}"
+        )
+        self._bootstrap_pipeline_recovery: Optional[Any] = None
         self._strategy_pipeline_enabled_tags: tuple[str, ...] = ()
         self._strategy_shadow_state_lock = threading.Lock()
         self._strategy_shadow_candidates: Dict[str, Any] = {}
@@ -515,6 +537,7 @@ class MultidayExecutor:
         self._recovery_corrupt_record_skipped_count: int = 0
         self._recovery_broker_reconciled_count: int = 0
         self._pipeline_advisory_runtime_metadata: Dict[str, Any] = {}
+        self._strategy_analytics_logger: Optional[StrategyAnalyticsEventLogger] = None
         
         # 일별 거래 기록
         self._daily_trades = []
@@ -737,6 +760,109 @@ class MultidayExecutor:
             getattr(settings, "ENABLE_PIPELINE_STATE_PERSISTENCE", False)
         )
 
+    def _is_strategy_analytics_enabled(self) -> bool:
+        return bool(getattr(settings, "ENABLE_STRATEGY_ANALYTICS", False))
+
+    def _get_strategy_analytics_logger(self) -> Optional[StrategyAnalyticsEventLogger]:
+        if not self._is_strategy_analytics_enabled():
+            return None
+        if self._strategy_analytics_logger is None:
+            self._strategy_analytics_logger = StrategyAnalyticsEventLogger(
+                event_dir=str(
+                    getattr(settings, "STRATEGY_ANALYTICS_EVENT_DIR", "data/analytics")
+                    or "data/analytics"
+                ),
+                enabled=True,
+            )
+        return self._strategy_analytics_logger
+
+    def _close_strategy_analytics_logger(self) -> None:
+        logger_obj = getattr(self, "_strategy_analytics_logger", None)
+        if logger_obj is None:
+            return
+        try:
+            logger_obj.close()
+        finally:
+            self._strategy_analytics_logger = None
+
+    def _resolve_strategy_analytics_regime_state(self) -> str:
+        state = str(getattr(self, "_strategy_regime_snapshot_state_used", "") or "").strip()
+        if state:
+            return state
+        snapshot = getattr(self, "market_regime_snapshot", None)
+        error_state = str(getattr(self, "_market_regime_worker_error_state", "") or "").strip()
+        if error_state:
+            return "error_state"
+        if snapshot is None:
+            return "absent"
+        return "stale" if bool(getattr(snapshot, "is_stale", False)) else "fresh"
+
+    def _log_strategy_analytics_event(
+        self,
+        *,
+        event_type: str,
+        stage: str,
+        strategy_tag: str,
+        symbol: str,
+        event_ts: Optional[datetime] = None,
+        decision: str = "",
+        reject_reason: str = "",
+        intent: Optional[Any] = None,
+        candidate: Optional[Any] = None,
+        broker_order_id: str = "",
+        payload_json: Optional[Dict[str, Any]] = None,
+        source_component: str = "",
+        trade_date: str = "",
+        queue_depth: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        logger_obj = self._get_strategy_analytics_logger()
+        if logger_obj is None:
+            return None
+        current_ts = event_ts or datetime.now(KST)
+        normalized_symbol = str(symbol or self.stock_code or "").zfill(6) if str(symbol or self.stock_code or "").strip() else ""
+        resolved_trade_date = str(trade_date or self._trade_date_key(current_ts) or "")
+        resolved_queue_depth = queue_depth
+        if resolved_queue_depth is None:
+            resolved_queue_depth = int(getattr(self, "_authoritative_intent_queue_depth", 0) or 0)
+        candidate_id = ""
+        if candidate is not None:
+            try:
+                candidate_id = compute_candidate_id(candidate)
+            except Exception:
+                candidate_id = ""
+        if not candidate_id and intent is not None:
+            native_payload = getattr(intent, "native_payload", None)
+            for carrier in (getattr(intent, "meta", None), getattr(native_payload, "meta", None) if native_payload is not None else None):
+                if isinstance(carrier, dict):
+                    candidate_id = str(carrier.get("candidate_id") or "").strip()
+                    if candidate_id:
+                        break
+        intent_id = ""
+        if intent is not None:
+            try:
+                intent_id = compute_intent_id(intent)
+            except Exception:
+                intent_id = ""
+        return logger_obj.log_event(
+            event_ts=current_ts,
+            trade_date=resolved_trade_date,
+            strategy_tag=str(strategy_tag or ""),
+            symbol=normalized_symbol,
+            intent_id=intent_id,
+            candidate_id=candidate_id,
+            broker_order_id=str(broker_order_id or ""),
+            event_type=str(event_type or ""),
+            stage=str(stage or ""),
+            decision=str(decision or ""),
+            reject_reason=str(reject_reason or ""),
+            regime_state=self._resolve_strategy_analytics_regime_state(),
+            degraded_mode=bool(self.is_pipeline_degraded()),
+            queue_depth=resolved_queue_depth,
+            payload_schema_version="v1",
+            source_component=str(source_component or ""),
+            payload_json=dict(payload_json or {}),
+        )
+
     def is_pipeline_degraded(self) -> bool:
         controller = getattr(self, "_strategy_pipeline_degraded_controller", None)
         return bool(controller is not None and controller.is_degraded())
@@ -746,13 +872,16 @@ class MultidayExecutor:
         removed_pullback_candidates = 0
         removed_shadow_candidates = 0
         removed_shadow_intents = 0
+        expired_pullback_candidates: List[Any] = []
+        expired_shadow_candidates: List[Any] = []
         if self._pullback_candidate_store is not None:
-            removed_pullback_candidates = int(self._pullback_candidate_store.cleanup_expired(current_now) or 0)
+            expired_pullback_candidates = list(self._pullback_candidate_store.pop_expired(current_now) or [])
+            removed_pullback_candidates = len(expired_pullback_candidates)
         with self._strategy_shadow_state_lock:
             for key, candidate in list(self._strategy_shadow_candidates.items()):
                 expires_at = getattr(candidate, "expires_at", None)
                 if isinstance(expires_at, datetime) and expires_at <= current_now:
-                    self._strategy_shadow_candidates.pop(key, None)
+                    expired_shadow_candidates.append(self._strategy_shadow_candidates.pop(key))
                     removed_shadow_candidates += 1
             for key, intent in list(self._strategy_shadow_intents.items()):
                 expires_at = getattr(intent, "expires_at", None)
@@ -771,6 +900,36 @@ class MultidayExecutor:
             + sum(int(value or 0) for value in dict(self.get_strategy_shadow_counts().get("candidates") or {}).values()),
             0,
         )
+        for candidate in expired_pullback_candidates:
+            self._log_strategy_analytics_event(
+                event_type="candidate_expired",
+                stage="cleanup",
+                decision="expired",
+                strategy_tag=str(getattr(candidate, "strategy_tag", "") or "pullback_rebreakout"),
+                symbol=str(getattr(candidate, "symbol", "") or ""),
+                event_ts=current_now,
+                candidate=candidate,
+                source_component="pipeline_cleanup",
+                payload_json={
+                    "expires_at": getattr(candidate, "expires_at", None),
+                    "context_version": str(getattr(candidate, "context_version", "") or ""),
+                },
+            )
+        for candidate in expired_shadow_candidates:
+            self._log_strategy_analytics_event(
+                event_type="candidate_expired",
+                stage="cleanup",
+                decision="expired",
+                strategy_tag=str(getattr(candidate, "strategy_tag", "") or ""),
+                symbol=str(getattr(candidate, "symbol", "") or ""),
+                event_ts=current_now,
+                candidate=candidate,
+                source_component="pipeline_cleanup",
+                payload_json={
+                    "expires_at": getattr(candidate, "expires_at", None),
+                    "entry_reference_price": float(getattr(candidate, "entry_reference_price", 0.0) or 0.0),
+                },
+            )
         if total_candidates or removed_shadow_intents:
             logger.info(
                 "[PIPELINE_HEALTH] candidate_cleanup pullback=%s shadow_candidates=%s shadow_intents=%s",
@@ -821,7 +980,7 @@ class MultidayExecutor:
         self._pullback_pipeline_stop_event = threading.Event()
         self._strategy_pipeline_health_store = None
         self._strategy_pipeline_degraded_controller = None
-        self._pipeline_persistence_manager = None
+        self._pipeline_persistence_manager = self._shared_pipeline_persistence_manager
         if self._is_pipeline_backpressure_enabled():
             self._strategy_pipeline_health_store = WorkerHealthStore()
             self._strategy_pipeline_degraded_controller = DegradedModeController(
@@ -859,21 +1018,11 @@ class MultidayExecutor:
                 trend_atr_strategy=self.strategy,
                 orb_strategy=getattr(self.strategy, "orb_strategy", None),
             )
-        if self._is_pipeline_state_persistence_enabled():
-            self._pipeline_persistence_manager = StrategyPipelinePersistenceManager(
-                state_dir=str(getattr(settings, "PIPELINE_STATE_DIR", "data/pipeline_state") or "data/pipeline_state"),
-                enabled=True,
-                candidate_snapshot_interval_sec=float(
-                    getattr(settings, "PIPELINE_CANDIDATE_SNAPSHOT_INTERVAL_SEC", 15) or 15.0
-                ),
-                intent_journal_enabled=bool(getattr(settings, "PIPELINE_INTENT_JOURNAL_ENABLED", True)),
-                intent_max_age_sec=float(getattr(settings, "PIPELINE_INTENT_MAX_AGE_SEC", 120) or 120.0),
-                candidate_max_recover_age_sec=float(
-                    getattr(settings, "PIPELINE_CANDIDATE_MAX_RECOVER_AGE_SEC", 300) or 300.0
-                ),
-                recover_only_current_trade_date=bool(
-                    getattr(settings, "PIPELINE_RECOVER_ONLY_CURRENT_TRADE_DATE", True)
-                ),
+        if self._is_pipeline_state_persistence_enabled() and self._pipeline_persistence_manager is None:
+            logger.warning(
+                "[PIPELINE_PERSIST] shared_manager_missing symbol=%s state_dir=%s persistence_disabled_for_executor=true",
+                self.stock_code,
+                str(getattr(settings, "PIPELINE_STATE_DIR", "data/pipeline_state") or "data/pipeline_state"),
             )
         if self._is_pullback_daily_refresh_enabled():
             self._pullback_daily_refresh_worker = DailyRefreshThread(
@@ -923,14 +1072,18 @@ class MultidayExecutor:
             stop_event=self._pullback_pipeline_stop_event,
             on_error=self._handle_pullback_pipeline_worker_error,
         )
-        if self._pipeline_persistence_manager is not None:
-            self._restore_persisted_pipeline_state()
-            self._pipeline_persistence_worker = PipelinePersistenceThread(
+        if self._pipeline_persistence_manager is not None and self._pipeline_persistence_manager.enabled:
+            self._pipeline_persistence_manager.register_runtime_source(
+                owner_key=self._pipeline_persistence_registration_key,
                 executor=self,
-                persistence_manager=self._pipeline_persistence_manager,
                 candidate_store=self._pullback_candidate_store,
-                stop_event=self._pullback_pipeline_stop_event,
-                on_error=self._handle_pullback_pipeline_worker_error,
+            )
+            self._restore_persisted_pipeline_state()
+        elif self._pipeline_persistence_manager is not None and not self._pipeline_persistence_manager.enabled:
+            logger.warning(
+                "[PIPELINE_PERSIST] shared_manager_disabled symbol=%s error_state=%s",
+                self.stock_code,
+                self._pipeline_persistence_manager.error_state,
             )
         if self._is_pipeline_backpressure_enabled() and self._strategy_pipeline_health_store is not None:
             self._pipeline_health_monitor_worker = PipelineHealthMonitorThread(
@@ -987,6 +1140,16 @@ class MultidayExecutor:
         logger.info("[PULLBACK_PIPELINE] started symbol=%s", self.stock_code)
 
     def _stop_threaded_pullback_pipeline(self) -> None:
+        manager = getattr(self, "_pipeline_persistence_manager", None)
+        if manager is not None:
+            try:
+                manager.unregister_runtime_source(owner_key=self._pipeline_persistence_registration_key)
+            except Exception:
+                logger.debug(
+                    "[PIPELINE_PERSIST] source_unregistration_failed symbol=%s owner=%s",
+                    self.stock_code,
+                    self._pipeline_persistence_registration_key,
+                )
         unsubscribe = getattr(self, "_pullback_quote_unsubscribe", None)
         if callable(unsubscribe):
             try:
@@ -1024,7 +1187,7 @@ class MultidayExecutor:
         self._pullback_account_risk_store = None
         self._strategy_pipeline_health_store = None
         self._strategy_pipeline_degraded_controller = None
-        self._pipeline_persistence_manager = None
+        self._pipeline_persistence_manager = self._shared_pipeline_persistence_manager
         self._strategy_pipeline_registry = None
         self._strategy_pipeline_enabled_tags = ()
         self.clear_strategy_shadow_state()
@@ -1065,6 +1228,7 @@ class MultidayExecutor:
         self._recovery_corrupt_record_skipped_count = 0
         self._recovery_broker_reconciled_count = 0
         self._pipeline_advisory_runtime_metadata = {}
+        self._close_strategy_analytics_logger()
 
     def is_cached_intraday_provider_ready(self) -> bool:
         provider = getattr(self, "market_data_provider", None)
@@ -1243,21 +1407,15 @@ class MultidayExecutor:
             reconciled.add(normalized_stock)
         return reconciled
 
-    def _restore_persisted_pipeline_state(self) -> None:
-        manager = getattr(self, "_pipeline_persistence_manager", None)
-        if manager is None or not manager.enabled:
-            return
-        current_now = datetime.now(KST)
-        current_trade_date = self._trade_date_key(current_now)
-        recovery = manager.load_recovery_state(
-            current_trade_date=current_trade_date,
-            now=current_now,
-            reconciled_symbols=self._pipeline_reconciled_symbols(),
-        )
-        for candidate in recovery.recovered_pullback_candidates:
+    def set_bootstrap_pipeline_recovery(self, recovery: Optional[Any]) -> None:
+        self._bootstrap_pipeline_recovery = recovery
+
+    def _apply_persisted_pipeline_recovery(self, *, recovery: Any, current_now: datetime) -> None:
+        for candidate in list(getattr(recovery, "recovered_pullback_candidates", []) or []):
             self._pullback_candidate_store.upsert(candidate)
-        for candidate in recovery.recovered_shadow_candidates:
+        for candidate in list(getattr(recovery, "recovered_shadow_candidates", []) or []):
             self.upsert_strategy_shadow_candidate(candidate.strategy_tag, candidate.symbol, candidate)
+        recovered_pending_intents = list(getattr(recovery, "recovered_pending_intents", []) or [])
         self._pipeline_recovered_pending_intents = [
             {
                 "intent_id": intent.intent_id,
@@ -1268,26 +1426,69 @@ class MultidayExecutor:
                 "expires_at": intent.expires_at.isoformat() if isinstance(intent.expires_at, datetime) else "",
                 "journal_state": intent.journal_state,
             }
-            for intent in recovery.recovered_pending_intents
+            for intent in recovered_pending_intents
         ]
-        self._pipeline_advisory_runtime_metadata = dict(recovery.advisory_runtime_metadata or {})
-        self._pipeline_state_load_ms = float(recovery.load_ms or 0.0)
+        self._pipeline_advisory_runtime_metadata = dict(getattr(recovery, "advisory_runtime_metadata", {}) or {})
+        self._pipeline_state_load_ms = float(getattr(recovery, "load_ms", 0.0) or 0.0)
         self._recovered_candidate_count = int(
-            len(recovery.recovered_pullback_candidates) + len(recovery.recovered_shadow_candidates)
+            len(list(getattr(recovery, "recovered_pullback_candidates", []) or []))
+            + len(list(getattr(recovery, "recovered_shadow_candidates", []) or []))
         )
-        self._recovered_intent_count = int(len(recovery.recovered_pending_intents))
-        self._dropped_stale_candidate_count = int(recovery.dropped_stale_candidate_count)
-        self._dropped_stale_intent_count = int(recovery.dropped_stale_intent_count)
-        self._recovery_duplicate_prevented_count = int(recovery.duplicate_prevented_count)
-        self._recovery_corrupt_record_skipped_count = int(recovery.corrupt_record_skipped_count)
-        self._recovery_broker_reconciled_count = int(recovery.broker_reconciled_count)
+        self._recovered_intent_count = int(len(recovered_pending_intents))
+        self._dropped_stale_candidate_count = int(getattr(recovery, "dropped_stale_candidate_count", 0) or 0)
+        self._dropped_stale_intent_count = int(getattr(recovery, "dropped_stale_intent_count", 0) or 0)
+        self._recovery_duplicate_prevented_count = int(getattr(recovery, "duplicate_prevented_count", 0) or 0)
+        self._recovery_corrupt_record_skipped_count = int(getattr(recovery, "corrupt_record_skipped_count", 0) or 0)
+        self._recovery_broker_reconciled_count = int(getattr(recovery, "broker_reconciled_count", 0) or 0)
         logger.info(
-            "[PIPELINE_PERSIST] restored candidates=%s intents=%s duplicate_prevented=%s corrupt_skipped=%s",
+            "[PIPELINE_PERSIST] restore_applied symbol=%s candidates=%s intents=%s duplicate_prevented=%s corrupt_skipped=%s",
+            self.stock_code,
             self._recovered_candidate_count,
             self._recovered_intent_count,
             self._recovery_duplicate_prevented_count,
             self._recovery_corrupt_record_skipped_count,
         )
+        if self._recovery_duplicate_prevented_count > 0:
+            self._log_strategy_analytics_event(
+                event_type="recovery_duplicate_prevented",
+                stage="recovery",
+                decision="blocked",
+                strategy_tag="pipeline_recovery",
+                symbol=self.stock_code,
+                event_ts=current_now,
+                source_component="pipeline_recovery",
+                payload_json={
+                    "duplicate_prevented_count": self._recovery_duplicate_prevented_count,
+                    "corrupt_record_skipped_count": self._recovery_corrupt_record_skipped_count,
+                    "broker_reconciled_count": self._recovery_broker_reconciled_count,
+                },
+            )
+
+    def _restore_persisted_pipeline_state(self) -> None:
+        manager = getattr(self, "_pipeline_persistence_manager", None)
+        if manager is None or not manager.enabled:
+            return
+        current_now = datetime.now(KST)
+        recovery = getattr(self, "_bootstrap_pipeline_recovery", None)
+        if recovery is None:
+            current_trade_date = self._trade_date_key(current_now)
+            recovery = slice_recovery_result_for_symbol(
+                manager.load_recovery_state_once(
+                    current_trade_date=current_trade_date,
+                    now=current_now,
+                    reconciled_symbols=self._pipeline_reconciled_symbols(),
+                ),
+                symbol=self.stock_code,
+            )
+        self._bootstrap_pipeline_recovery = None
+        apply_recovery = getattr(self, "_apply_persisted_pipeline_recovery", None)
+        if apply_recovery is None:
+            apply_recovery = lambda *, recovery, current_now: MultidayExecutor._apply_persisted_pipeline_recovery(
+                self,
+                recovery=recovery,
+                current_now=current_now,
+            )
+        apply_recovery(recovery=recovery, current_now=current_now)
 
     def retry_entry_unblock_via_resync(self) -> bool:
         """재동기화 재시도로 sticky 차단 해제를 시도."""
@@ -4213,6 +4414,21 @@ class MultidayExecutor:
         
         pos = self.strategy.position
         exit_reason = signal.exit_reason or ExitReason.MANUAL_EXIT
+        self._log_strategy_analytics_event(
+            event_type="exit_decision",
+            stage="exit",
+            decision="started",
+            strategy_tag=self._strategy_tag(signal),
+            symbol=self.stock_code,
+            event_ts=datetime.now(KST),
+            source_component="executor",
+            payload_json={
+                "exit_reason": getattr(exit_reason, "value", str(exit_reason)),
+                "price": float(getattr(signal, "price", 0.0) or 0.0),
+                "quantity": int(getattr(pos, "quantity", 0) or 0),
+                "entry_price": float(getattr(pos, "entry_price", 0.0) or 0.0),
+            },
+        )
         
         # 손절 여부 판단 (긴급 청산 플래그)
         is_emergency = exit_reason in (

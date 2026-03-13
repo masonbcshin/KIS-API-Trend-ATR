@@ -35,13 +35,19 @@ def _make_manager(tmp_path: Path) -> StrategyPipelinePersistenceManager:
     )
 
 
+def _flush_manager(manager: StrategyPipelinePersistenceManager) -> None:
+    manager.drain_pending_writes()
+
+
 def _make_authoritative_intent(
     *,
     created_at: datetime | None = None,
     expires_at: datetime | None = None,
+    trade_date: str | None = None,
 ) -> AuthoritativeEntryIntent:
     created_at = created_at or _kst_dt(9, 7)
     expires_at = expires_at or _kst_dt(9, 25)
+    trade_date = trade_date or created_at.date().isoformat()
     native_payload = PullbackEntryIntent(
         symbol="005930",
         strategy_tag="pullback_rebreakout",
@@ -59,7 +65,7 @@ def _make_authoritative_intent(
         symbol="005930",
         created_at=created_at,
         expires_at=expires_at,
-        trade_date="2026-03-11",
+        trade_date=trade_date,
         entry_reference_price=50100.0,
         entry_reference_label="pullback_intraday_high",
         native_payload=native_payload,
@@ -101,6 +107,7 @@ def test_restart_recovery_prevents_duplicates_via_reconciliation(tmp_path: Path)
     manager = _make_manager(tmp_path)
     intent = _make_authoritative_intent()
     manager.append_intent_state(intent=intent, journal_state="accepted", message="accepted", source="timing_worker")
+    _flush_manager(manager)
 
     recovery = manager.load_recovery_state(
         current_trade_date="2026-03-11",
@@ -121,6 +128,7 @@ def test_recovered_pending_intent_is_not_immediately_auto_requeued(tmp_path: Pat
         expires_at=live_now + multiday_executor.timedelta(minutes=10),
     )
     manager.append_intent_state(intent=intent, journal_state="accepted", message="accepted", source="timing_worker")
+    _flush_manager(manager)
 
     executor = _make_fake_recovery_executor(manager)
     executor._pullback_entry_queue = EntryIntentQueue(maxsize=32)
@@ -152,6 +160,7 @@ def test_strategy_native_expiry_authority_is_preserved_for_recovered_intents(tmp
         message="accepted",
         source="timing_worker",
     )
+    _flush_manager(manager)
 
     recovery = manager.load_recovery_state(
         current_trade_date="2026-03-11",
@@ -167,6 +176,7 @@ def test_single_writer_order_worker_writes_order_journal(tmp_path: Path):
     manager = _make_manager(tmp_path)
     intent = _make_authoritative_intent()
     manager.append_intent_state(intent=intent, journal_state="accepted", message="accepted", source="timing_worker")
+    _flush_manager(manager)
 
     executor = SimpleNamespace(
         _pipeline_persistence_manager=manager,
@@ -198,10 +208,36 @@ def test_single_writer_order_worker_writes_order_journal(tmp_path: Path):
     worker._now = lambda: _kst_dt(9, 8)  # type: ignore[method-assign]
 
     worker._process_intent(intent)
+    _flush_manager(manager)
 
     journal_lines = manager.order_journal_path.read_text(encoding="utf-8").strip().splitlines()
     assert len(journal_lines) == 1
     assert "\"journal_state\":\"filled\"" in journal_lines[0]
+
+
+def test_bootstrap_recovery_is_applied_without_second_disk_restore(tmp_path: Path):
+    manager = _make_manager(tmp_path)
+    intent = _make_authoritative_intent()
+    manager.append_intent_state(intent=intent, journal_state="accepted", message="accepted", source="timing_worker")
+    _flush_manager(manager)
+
+    executor = _make_fake_recovery_executor(manager)
+    executor.set_bootstrap_pipeline_recovery = lambda recovery: setattr(executor, "_bootstrap_pipeline_recovery", recovery)
+    executor._apply_persisted_pipeline_recovery = lambda *, recovery, current_now: MultidayExecutor._apply_persisted_pipeline_recovery(  # type: ignore[attr-defined]
+        executor,
+        recovery=recovery,
+        current_now=current_now,
+    )
+    executor._bootstrap_pipeline_recovery = manager.load_recovery_state_once(
+        current_trade_date="2026-03-11",
+        now=_kst_dt(9, 9),
+        reconciled_symbols=(),
+    )
+
+    with patch.object(manager, "load_recovery_state_once", side_effect=AssertionError("should not reload")):
+        MultidayExecutor._restore_persisted_pipeline_state(executor)
+
+    assert len(executor._pipeline_recovered_pending_intents) == 1
 
 
 def test_pipeline_state_persistence_flag_off_preserves_existing_behavior():

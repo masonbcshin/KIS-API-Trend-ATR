@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import threading
 import time
-from dataclasses import asdict, dataclass, is_dataclass
+import uuid
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 try:
     from config import settings
@@ -85,6 +87,20 @@ class RecoveryResult:
     load_ms: float = 0.0
 
 
+@dataclass(frozen=True)
+class JournalWriteRequest:
+    journal_kind: str
+    record: Dict[str, Any]
+    flush: bool = False
+
+
+@dataclass(frozen=True)
+class RegisteredPersistenceSource:
+    owner_key: str
+    executor: Any
+    candidate_store: Any
+
+
 class StrategyPipelinePersistenceManager:
     def __init__(
         self,
@@ -109,11 +125,34 @@ class StrategyPipelinePersistenceManager:
         self._candidate_max_recover_age_sec = max(float(candidate_max_recover_age_sec or 300.0), 0.0)
         self._recover_only_current_trade_date = bool(recover_only_current_trade_date)
         self._write_lock = threading.Lock()
+        self._registration_lock = threading.Lock()
+        self._runtime_sources: Dict[str, RegisteredPersistenceSource] = {}
+        self._write_queue: "queue.Queue[JournalWriteRequest]" = queue.Queue()
+        self._status_lock = threading.Lock()
+        self._restore_lock = threading.Lock()
         self._last_candidate_snapshot_at: Optional[datetime] = None
+        self._error_state: str = ""
+        self._writer_started: bool = False
+        self._writer_thread_name: str = ""
+        self._restore_result: Optional[RecoveryResult] = None
+        self._restore_completed: bool = False
+        self._effective_state_dir_logged: bool = False
 
     @property
     def enabled(self) -> bool:
         return bool(self._enabled)
+
+    @property
+    def error_state(self) -> str:
+        return str(self._error_state or "")
+
+    @property
+    def state_dir(self) -> Path:
+        return self._state_dir
+
+    @property
+    def writer_started(self) -> bool:
+        return bool(self._writer_started)
 
     @property
     def candidate_snapshot_path(self) -> Path:
@@ -130,6 +169,109 @@ class StrategyPipelinePersistenceManager:
     @property
     def runtime_metadata_path(self) -> Path:
         return self._state_dir / "runtime_metadata.json"
+
+    def log_startup_configuration(self) -> None:
+        if self._effective_state_dir_logged:
+            return
+        self._effective_state_dir_logged = True
+        logger.info(
+            "[PIPELINE_PERSIST] startup enabled=%s state_dir=%s",
+            self.enabled,
+            self._state_dir,
+        )
+
+    def disable(self, *, error_state: str) -> None:
+        reason = str(error_state or "disabled").strip() or "disabled"
+        with self._status_lock:
+            previously_enabled = self._enabled
+            self._enabled = False
+            self._error_state = reason
+        logger.error(
+            "[PIPELINE_PERSIST] disabled state_dir=%s error_state=%s previously_enabled=%s",
+            self._state_dir,
+            reason,
+            previously_enabled,
+        )
+
+    def prepare_process_global_writer(self) -> bool:
+        self.log_startup_configuration()
+        if not self.enabled:
+            logger.info(
+                "[PIPELINE_PERSIST] process_global_writer skipped enabled=%s state_dir=%s error_state=%s",
+                self.enabled,
+                self._state_dir,
+                self.error_state or "disabled_by_config",
+            )
+            return False
+        try:
+            self.ensure_state_dir()
+        except Exception as exc:
+            self.disable(error_state=f"startup_failed:{type(exc).__name__}:{exc}")
+            logger.exception(
+                "[PIPELINE_PERSIST] startup_failed state_dir=%s",
+                self._state_dir,
+            )
+            return False
+        return True
+
+    def mark_process_global_writer_started(self, *, thread_name: str) -> None:
+        with self._status_lock:
+            self._writer_started = True
+            self._writer_thread_name = str(thread_name or "")
+        logger.info(
+            "[PIPELINE_PERSIST] process_global_writer started thread=%s state_dir=%s",
+            self._writer_thread_name,
+            self._state_dir,
+        )
+
+    def mark_process_global_writer_stopped(self) -> None:
+        with self._status_lock:
+            self._writer_started = False
+        logger.info(
+            "[PIPELINE_PERSIST] process_global_writer stopped thread=%s state_dir=%s error_state=%s",
+            self._writer_thread_name or "unknown",
+            self._state_dir,
+            self.error_state or "",
+        )
+
+    def register_runtime_source(self, *, owner_key: str, executor: Any, candidate_store: Any) -> None:
+        normalized_key = str(owner_key or "").strip()
+        if not normalized_key:
+            raise ValueError("owner_key is required for pipeline persistence registration")
+        with self._registration_lock:
+            self._runtime_sources[normalized_key] = RegisteredPersistenceSource(
+                owner_key=normalized_key,
+                executor=executor,
+                candidate_store=candidate_store,
+            )
+            registered_count = len(self._runtime_sources)
+        logger.info(
+            "[PIPELINE_PERSIST] source_registered owner=%s symbol=%s total_sources=%s",
+            normalized_key,
+            str(getattr(executor, "stock_code", "") or ""),
+            registered_count,
+        )
+
+    def unregister_runtime_source(self, *, owner_key: str) -> None:
+        normalized_key = str(owner_key or "").strip()
+        if not normalized_key:
+            return
+        with self._registration_lock:
+            self._runtime_sources.pop(normalized_key, None)
+            registered_count = len(self._runtime_sources)
+        logger.info(
+            "[PIPELINE_PERSIST] source_unregistered owner=%s total_sources=%s",
+            normalized_key,
+            registered_count,
+        )
+
+    def registered_source_count(self) -> int:
+        with self._registration_lock:
+            return len(self._runtime_sources)
+
+    def _registered_sources_snapshot(self) -> List[RegisteredPersistenceSource]:
+        with self._registration_lock:
+            return list(self._runtime_sources.values())
 
     def ensure_state_dir(self) -> None:
         self._state_dir.mkdir(parents=True, exist_ok=True)
@@ -192,24 +334,48 @@ class StrategyPipelinePersistenceManager:
     def _append_jsonl(self, path: Path, record: Dict[str, Any], *, flush: bool = False) -> None:
         self.ensure_state_dir()
         line = json.dumps(_json_ready(record), ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        payload = f"{line}\n"
         with self._write_lock:
             with path.open("a", encoding="utf-8") as fh:
-                fh.write(line)
-                fh.write("\n")
+                fh.write(payload)
                 fh.flush()
                 if flush:
                     os.fsync(fh.fileno())
 
     def _atomic_write_json(self, path: Path, payload: Dict[str, Any]) -> None:
         self.ensure_state_dir()
-        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        tmp_path = path.parent / (
+            f"{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+        )
         body = json.dumps(_json_ready(payload), ensure_ascii=True, indent=2, sort_keys=True)
         with self._write_lock:
-            with tmp_path.open("w", encoding="utf-8") as fh:
-                fh.write(body)
-                fh.flush()
-                os.fsync(fh.fileno())
-            tmp_path.replace(path)
+            try:
+                with tmp_path.open("w", encoding="utf-8") as fh:
+                    fh.write(body)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                tmp_path.replace(path)
+            except Exception as exc:
+                err_no = getattr(exc, "errno", "")
+                logger.error(
+                    "[PIPELINE_PERSIST] atomic_write_failed tmp=%s final=%s errno=%s err=%s",
+                    tmp_path,
+                    path,
+                    err_no,
+                    exc,
+                )
+                raise
+            finally:
+                if tmp_path.exists():
+                    try:
+                        tmp_path.unlink()
+                    except Exception as cleanup_exc:
+                        logger.warning(
+                            "[PIPELINE_PERSIST] tmp_cleanup_failed tmp=%s final=%s err=%s",
+                            tmp_path,
+                            path,
+                            cleanup_exc,
+                        )
 
     def _load_jsonl(self, path: Path) -> tuple[list[Dict[str, Any]], int]:
         if not path.exists():
@@ -265,6 +431,87 @@ class StrategyPipelinePersistenceManager:
         payload["source_kind"] = str(source_kind or "")
         return payload
 
+    def _collect_sources(
+        self,
+        *,
+        executor: Optional[Any] = None,
+        candidate_store: Optional[Any] = None,
+    ) -> List[RegisteredPersistenceSource]:
+        if executor is not None and candidate_store is not None:
+            return [
+                RegisteredPersistenceSource(
+                    owner_key=str(getattr(executor, "stock_code", "") or "adhoc"),
+                    executor=executor,
+                    candidate_store=candidate_store,
+                )
+            ]
+        return self._registered_sources_snapshot()
+
+    def _resolve_snapshot_trade_date(self, sources: Sequence[RegisteredPersistenceSource], current_now: datetime) -> str:
+        for source in list(sources or []):
+            trade_date_key = getattr(source.executor, "_trade_date_key", None)
+            if callable(trade_date_key):
+                try:
+                    value = str(trade_date_key(current_now) or "").strip()
+                except Exception:
+                    value = ""
+                if value:
+                    return value
+        return current_now.date().isoformat()
+
+    def _snapshot_records_for_sources(self, sources: Sequence[RegisteredPersistenceSource]) -> List[Dict[str, Any]]:
+        records: List[Dict[str, Any]] = []
+        seen_record_keys: set[str] = set()
+        for source in list(sources or []):
+            pullback_candidates = list(getattr(source.candidate_store, "snapshot", lambda: {})().values())
+            shadow_candidates = []
+            snapshot_shadow_candidates = getattr(source.executor, "snapshot_strategy_shadow_candidates", None)
+            if callable(snapshot_shadow_candidates):
+                shadow_candidates = list(snapshot_shadow_candidates().values())
+            for candidate in pullback_candidates:
+                record = self._serialize_candidate(candidate, source_kind="pullback_candidate_store")
+                record_key = _stable_hash(record)
+                if record_key in seen_record_keys:
+                    continue
+                seen_record_keys.add(record_key)
+                records.append(record)
+            for candidate in shadow_candidates:
+                try:
+                    record = self._serialize_candidate(candidate, source_kind="strategy_shadow_candidate")
+                except TypeError:
+                    continue
+                record_key = _stable_hash(record)
+                if record_key in seen_record_keys:
+                    continue
+                seen_record_keys.add(record_key)
+                records.append(record)
+        return records
+
+    def _runtime_metadata_payload(self, *, current_now: datetime, sources: Sequence[RegisteredPersistenceSource]) -> Dict[str, Any]:
+        executors_payload: Dict[str, Dict[str, Any]] = {}
+        for source in list(sources or []):
+            executor = source.executor
+            symbol_key = str(getattr(executor, "stock_code", "") or source.owner_key or "unknown").zfill(6)
+            executors_payload[symbol_key] = {
+                "worker_health_state": dict(getattr(executor, "_worker_health_state", {}) or {}),
+                "worker_state_reason": dict(getattr(executor, "_worker_state_reason", {}) or {}),
+                "worker_lag_sec": dict(getattr(executor, "_worker_lag_sec", {}) or {}),
+                "risk_snapshot_stale": bool(getattr(executor, "_risk_snapshot_stale", False)),
+                "risk_snapshot_last_success_age_sec": float(
+                    getattr(executor, "_risk_snapshot_last_success_age_sec", -1.0) or -1.0
+                ),
+                "market_regime_snapshot_state": str(
+                    getattr(executor, "_strategy_regime_snapshot_state_used", "absent") or "absent"
+                ),
+                "symbol": str(getattr(executor, "stock_code", "") or "").zfill(6),
+            }
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "saved_at": current_now.isoformat(),
+            "executor_count": len(executors_payload),
+            "executors": executors_payload,
+        }
+
     def _deserialize_candidate(self, record: Dict[str, Any]) -> Optional[Any]:
         candidate_type = str(record.get("candidate_type") or "").strip()
         if candidate_type == "pullback_setup_candidate":
@@ -306,8 +553,8 @@ class StrategyPipelinePersistenceManager:
     def maybe_save_candidate_snapshot(
         self,
         *,
-        executor: Any,
-        candidate_store: Any,
+        executor: Optional[Any] = None,
+        candidate_store: Optional[Any] = None,
         now: Optional[datetime] = None,
         force: bool = False,
     ) -> bool:
@@ -318,50 +565,59 @@ class StrategyPipelinePersistenceManager:
             age_sec = max((current_now - self._last_candidate_snapshot_at).total_seconds(), 0.0)
             if age_sec < self._candidate_snapshot_interval_sec:
                 return False
-        pullback_candidates = list(getattr(candidate_store, "snapshot", lambda: {})().values())
-        shadow_candidates = []
-        snapshot_shadow_candidates = getattr(executor, "snapshot_strategy_shadow_candidates", None)
-        if callable(snapshot_shadow_candidates):
-            shadow_candidates = list(snapshot_shadow_candidates().values())
-        records = []
-        for candidate in pullback_candidates:
-            records.append(self._serialize_candidate(candidate, source_kind="pullback_candidate_store"))
-        for candidate in shadow_candidates:
-            try:
-                records.append(self._serialize_candidate(candidate, source_kind="strategy_shadow_candidate"))
-            except TypeError:
-                continue
+        sources = self._collect_sources(executor=executor, candidate_store=candidate_store)
+        if not sources:
+            return False
+        records = self._snapshot_records_for_sources(sources)
         payload = {
             "schema_version": SCHEMA_VERSION,
             "saved_at": current_now.isoformat(),
-            "trade_date": str(getattr(executor, "_trade_date_key", lambda dt: dt.date().isoformat())(current_now) or ""),
+            "trade_date": self._resolve_snapshot_trade_date(sources, current_now),
             "records": records,
         }
         started = time.perf_counter()
         self._atomic_write_json(self.candidate_snapshot_path, payload)
         self._last_candidate_snapshot_at = current_now
-        setattr(executor, "_pipeline_state_save_ms", (time.perf_counter() - started) * 1000.0)
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        for source in sources:
+            try:
+                setattr(source.executor, "_pipeline_state_save_ms", elapsed_ms)
+            except Exception:
+                continue
+        logger.info(
+            "[PIPELINE_PERSIST] snapshot_saved path=%s records=%s sources=%s elapsed_ms=%.2f",
+            self.candidate_snapshot_path,
+            len(records),
+            len(sources),
+            elapsed_ms,
+        )
         return True
 
-    def save_runtime_metadata(self, *, executor: Any, now: Optional[datetime] = None) -> None:
+    def save_runtime_metadata(
+        self,
+        *,
+        executor: Optional[Any] = None,
+        candidate_store: Optional[Any] = None,
+        now: Optional[datetime] = None,
+    ) -> None:
         if not self.enabled:
             return
         current_now = now or datetime.now(KST)
-        payload = {
-            "schema_version": SCHEMA_VERSION,
-            "saved_at": current_now.isoformat(),
-            "worker_health_state": dict(getattr(executor, "_worker_health_state", {}) or {}),
-            "worker_state_reason": dict(getattr(executor, "_worker_state_reason", {}) or {}),
-            "worker_lag_sec": dict(getattr(executor, "_worker_lag_sec", {}) or {}),
-            "risk_snapshot_stale": bool(getattr(executor, "_risk_snapshot_stale", False)),
-            "risk_snapshot_last_success_age_sec": float(
-                getattr(executor, "_risk_snapshot_last_success_age_sec", -1.0) or -1.0
-            ),
-            "market_regime_snapshot_state": str(
-                getattr(executor, "_strategy_regime_snapshot_state_used", "absent") or "absent"
-            ),
-        }
+        sources = self._collect_sources(executor=executor, candidate_store=candidate_store)
+        if not sources:
+            return
+        payload = self._runtime_metadata_payload(current_now=current_now, sources=sources)
         self._atomic_write_json(self.runtime_metadata_path, payload)
+        logger.info(
+            "[PIPELINE_PERSIST] runtime_metadata_saved path=%s sources=%s",
+            self.runtime_metadata_path,
+            len(sources),
+        )
+
+    def _enqueue_journal_write(self, request: JournalWriteRequest) -> None:
+        if not self.enabled:
+            return
+        self._write_queue.put(request)
 
     def append_intent_state(
         self,
@@ -384,7 +640,13 @@ class StrategyPipelinePersistenceManager:
             source=source,
         )
         flush = str(journal_state or "") in {"submitted", "filled", "cancelled"}
-        self._append_jsonl(self.intent_journal_path, record, flush=flush)
+        self._enqueue_journal_write(
+            JournalWriteRequest(
+                journal_kind="intent",
+                record=record,
+                flush=flush,
+            )
+        )
 
     def append_order_state(
         self,
@@ -407,7 +669,13 @@ class StrategyPipelinePersistenceManager:
             source=source,
         )
         flush = str(journal_state or "") in {"submitted", "filled", "cancelled"}
-        self._append_jsonl(self.order_journal_path, record, flush=flush)
+        self._enqueue_journal_write(
+            JournalWriteRequest(
+                journal_kind="order",
+                record=record,
+                flush=flush,
+            )
+        )
 
     def classify_reject_state(self, reason: str) -> str:
         normalized = str(reason or "").strip()
@@ -430,6 +698,59 @@ class StrategyPipelinePersistenceManager:
             return "cancelled"
         reason = str(order_result.get("reason") or order_result.get("message") or "")
         return self.classify_reject_state(reason)
+
+    def process_next_write(self, *, timeout: float = 0.0) -> bool:
+        if not self.enabled and self._write_queue.empty():
+            return False
+        try:
+            request = self._write_queue.get(timeout=max(float(timeout or 0.0), 0.0))
+        except queue.Empty:
+            return False
+        try:
+            self._process_journal_request(request)
+        finally:
+            self._write_queue.task_done()
+        return True
+
+    def drain_pending_writes(self) -> int:
+        drained = 0
+        while True:
+            try:
+                request = self._write_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                self._process_journal_request(request)
+                drained += 1
+            finally:
+                self._write_queue.task_done()
+        return drained
+
+    def _process_journal_request(self, request: JournalWriteRequest) -> None:
+        path = self.intent_journal_path if request.journal_kind == "intent" else self.order_journal_path
+        record = dict(request.record or {})
+        try:
+            self._append_jsonl(path, record, flush=bool(request.flush))
+            logger.info(
+                "[PIPELINE_PERSIST] journal_append_success kind=%s path=%s state=%s intent_id=%s symbol=%s strategy=%s",
+                request.journal_kind,
+                path,
+                str(record.get("journal_state") or ""),
+                str(record.get("intent_id") or ""),
+                str(record.get("symbol") or ""),
+                str(record.get("strategy_tag") or ""),
+            )
+        except Exception as exc:
+            logger.exception(
+                "[PIPELINE_PERSIST] journal_append_failed kind=%s path=%s state=%s intent_id=%s err=%s",
+                request.journal_kind,
+                path,
+                str(record.get("journal_state") or ""),
+                str(record.get("intent_id") or ""),
+                exc,
+            )
+            self.disable(error_state=f"journal_append_failed:{request.journal_kind}:{type(exc).__name__}")
+            raise
 
     def _load_runtime_metadata(self) -> Optional[Dict[str, Any]]:
         if not self.runtime_metadata_path.exists():
@@ -583,49 +904,106 @@ class StrategyPipelinePersistenceManager:
         )
         return result
 
+    def load_recovery_state_once(
+        self,
+        *,
+        current_trade_date: str,
+        now: Optional[datetime] = None,
+        reconciled_symbols: Optional[Iterable[str]] = None,
+    ) -> RecoveryResult:
+        with self._restore_lock:
+            if self._restore_completed and self._restore_result is not None:
+                return self._restore_result
+            logger.info(
+                "[PIPELINE_PERSIST] one_time_restore_started state_dir=%s current_trade_date=%s",
+                self._state_dir,
+                current_trade_date,
+            )
+            recovery = self.load_recovery_state(
+                current_trade_date=current_trade_date,
+                now=now,
+                reconciled_symbols=reconciled_symbols,
+            )
+            self._restore_result = recovery
+            self._restore_completed = True
+            logger.info(
+                "[PIPELINE_PERSIST] one_time_restore_completed state_dir=%s recovered_candidates=%s recovered_intents=%s duplicate_prevented=%s",
+                self._state_dir,
+                len(recovery.recovered_pullback_candidates) + len(recovery.recovered_shadow_candidates),
+                len(recovery.recovered_pending_intents),
+                recovery.duplicate_prevented_count,
+            )
+            return recovery
+
+
+def slice_recovery_result_for_symbol(recovery: RecoveryResult, *, symbol: str) -> RecoveryResult:
+    normalized_symbol = str(symbol or "").zfill(6)
+    if not normalized_symbol:
+        return recovery
+    return RecoveryResult(
+        recovered_pullback_candidates=[
+            candidate
+            for candidate in list(recovery.recovered_pullback_candidates or [])
+            if str(getattr(candidate, "symbol", "") or "").zfill(6) == normalized_symbol
+        ],
+        recovered_shadow_candidates=[
+            candidate
+            for candidate in list(recovery.recovered_shadow_candidates or [])
+            if str(getattr(candidate, "symbol", "") or "").zfill(6) == normalized_symbol
+        ],
+        recovered_pending_intents=[
+            intent
+            for intent in list(recovery.recovered_pending_intents or [])
+            if str(getattr(intent, "symbol", "") or "").zfill(6) == normalized_symbol
+        ],
+        finalized_or_submitted_intent_ids=set(recovery.finalized_or_submitted_intent_ids or set()),
+        dropped_stale_candidate_count=0,
+        dropped_stale_intent_count=0,
+        duplicate_prevented_count=0,
+        corrupt_record_skipped_count=0,
+        broker_reconciled_count=0,
+        advisory_runtime_metadata=dict(recovery.advisory_runtime_metadata or {}),
+        load_ms=float(recovery.load_ms or 0.0),
+    )
+
 
 class PipelinePersistenceThread(threading.Thread):
     def __init__(
         self,
         *,
-        executor: Any,
         persistence_manager: StrategyPipelinePersistenceManager,
-        candidate_store: Any,
         stop_event: threading.Event,
-        on_error: Any,
     ) -> None:
         super().__init__(name="PipelinePersistenceThread", daemon=True)
-        self._executor = executor
         self._persistence_manager = persistence_manager
-        self._candidate_store = candidate_store
         self._stop_event = stop_event
-        self._on_error = on_error
 
     def run(self) -> None:
         interval_sec = max(
             float(getattr(settings, "PIPELINE_CANDIDATE_SNAPSHOT_INTERVAL_SEC", 15) or 15.0),
             1.0,
         )
-        while not self._stop_event.is_set():
-            started = time.perf_counter()
-            try:
-                self._persistence_manager.maybe_save_candidate_snapshot(
-                    executor=self._executor,
-                    candidate_store=self._candidate_store,
-                )
-                self._persistence_manager.save_runtime_metadata(executor=self._executor)
-                setattr(self._executor, "_pipeline_state_save_ms", (time.perf_counter() - started) * 1000.0)
-            except Exception as exc:
-                logger.error("[PIPELINE_PERSIST] worker_error=%s", exc)
-                self._on_error(self.name, exc)
-                return
-            self._stop_event.wait(interval_sec)
+        poll_sec = min(interval_sec, 1.0)
+        if not self._persistence_manager.prepare_process_global_writer():
+            return
+        self._persistence_manager.mark_process_global_writer_started(thread_name=self.name)
+        last_periodic_flush_at = 0.0
         try:
-            self._persistence_manager.maybe_save_candidate_snapshot(
-                executor=self._executor,
-                candidate_store=self._candidate_store,
-                force=True,
+            while not self._stop_event.is_set():
+                self._persistence_manager.process_next_write(timeout=poll_sec)
+                now_monotonic = time.monotonic()
+                if now_monotonic - last_periodic_flush_at < interval_sec:
+                    continue
+                self._persistence_manager.maybe_save_candidate_snapshot(force=False)
+                self._persistence_manager.save_runtime_metadata()
+                last_periodic_flush_at = now_monotonic
+            self._persistence_manager.drain_pending_writes()
+            self._persistence_manager.maybe_save_candidate_snapshot(force=True)
+            self._persistence_manager.save_runtime_metadata()
+        except Exception as exc:
+            logger.exception("[PIPELINE_PERSIST] process_global_writer_error err=%s", exc)
+            self._persistence_manager.disable(
+                error_state=f"writer_thread_failed:{type(exc).__name__}:{exc}"
             )
-            self._persistence_manager.save_runtime_metadata(executor=self._executor)
-        except Exception:
-            logger.exception("[PIPELINE_PERSIST] final_flush_failed")
+        finally:
+            self._persistence_manager.mark_process_global_writer_stopped()
