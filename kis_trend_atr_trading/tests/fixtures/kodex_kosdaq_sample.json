@@ -1,0 +1,27 @@
+{
+  "info": {
+    "product": {
+      "fId": "2ETF54",
+      "fNm": "KODEX 코스닥 150"
+    }
+  },
+  "pdf": {
+    "gijunYMD": "20260314",
+    "pdfExcelDownloadUrl": "/excel_pdf.do?fId=2ETF54&gijunYMD=20260314",
+    "totalCnt": 3,
+    "list": [
+      {
+        "itmNo": "086520",
+        "secNm": "에코프로"
+      },
+      {
+        "itmNo": "0009K0",
+        "secNm": "에임드바이오"
+      },
+      {
+        "itmNo": "KRD010010001",
+        "secNm": "원화예금"
+      }
+    ]
+  }
+}
