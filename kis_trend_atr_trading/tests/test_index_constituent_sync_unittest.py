@@ -10,6 +10,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
+from db.repository import SymbolCacheRecord
 from utils.index_constituent_sync import (
     ConstituentRecord,
     SourceSnapshot,
@@ -30,6 +31,49 @@ class DummyFetcher:
 
     def fetch(self, *, index_name: str):
         return self._snapshots[index_name]
+
+
+class InMemorySymbolCacheRepo:
+    def __init__(self):
+        self._data = {}
+        self.upsert_calls = []
+
+    def get(self, stock_code: str):
+        return self._data.get(stock_code)
+
+    def upsert(self, stock_code: str, stock_name: str, updated_at=None):
+        record = SymbolCacheRecord(
+            stock_code=stock_code,
+            stock_name=stock_name,
+            updated_at=updated_at or datetime.now(KST),
+        )
+        self._data[stock_code] = record
+        self.upsert_calls.append((stock_code, stock_name))
+        return True
+
+
+class FailingSymbolCacheRepo(InMemorySymbolCacheRepo):
+    def __init__(self, fail_code: str):
+        super().__init__()
+        self._fail_code = fail_code
+
+    def upsert(self, stock_code: str, stock_name: str, updated_at=None):
+        if stock_code == self._fail_code:
+            return False
+        return super().upsert(stock_code, stock_name, updated_at=updated_at)
+
+
+class FlakySymbolCacheRepo(InMemorySymbolCacheRepo):
+    def __init__(self, fail_code: str, fail_times: int):
+        super().__init__()
+        self._fail_code = fail_code
+        self._remaining_failures = fail_times
+
+    def upsert(self, stock_code: str, stock_name: str, updated_at=None):
+        if stock_code == self._fail_code and self._remaining_failures > 0:
+            self._remaining_failures -= 1
+            return False
+        return super().upsert(stock_code, stock_name, updated_at=updated_at)
 
 
 def _build_rows(expected_member_count: int, *, special_member_code: str, special_member_name: str):
@@ -170,6 +214,7 @@ def test_name_mismatch_is_recorded_but_does_not_fail(tmp_path):
     kodex_rows = list(tiger_rows)
     kodex_rows[10] = ConstituentRecord(code=kodex_rows[10].code, name="이름다름", kind="member")
     synced_at = KST.localize(datetime(2026, 3, 14, 8, 30))
+    repo = InMemorySymbolCacheRepo()
 
     summary = sync_index_constituents_proxy(
         index_names=["kosdaq150"],
@@ -180,13 +225,16 @@ def test_name_mismatch_is_recorded_but_does_not_fail(tmp_path):
         kodex_fetcher=DummyFetcher(
             {"kosdaq150": SourceSnapshot("kosdaq150", "kodex", "2026-03-14", kodex_rows, "kodex")}
         ),
+        cache_repo=repo,
         synced_at=synced_at,
+        symbol_cache_retry_delay_sec=0,
     )
 
     meta = json.loads((tmp_path / "kosdaq150_constituents.meta.json").read_text(encoding="utf-8"))
     assert summary["status"] == "ok"
     assert meta["name_mismatch_count"] == 1
     assert meta["cross_check_match"] is True
+    assert summary["indexes"]["kosdaq150"]["symbol_cache_sync"]["upserted_count"] == len(kodex_rows)
 
 
 def test_sync_dry_run_does_not_write_files(tmp_path):
@@ -207,6 +255,7 @@ def test_sync_dry_run_does_not_write_files(tmp_path):
     assert summary["status"] == "dry_run"
     assert not (tmp_path / "kosdaq150_constituents.txt").exists()
     assert not (tmp_path / "kosdaq150_constituents.meta.json").exists()
+    assert summary["indexes"]["kosdaq150"]["symbol_cache_sync"]["upserted_count"] == 0
 
 
 def test_sync_preserves_last_known_good_on_failure(tmp_path):
@@ -228,3 +277,72 @@ def test_sync_preserves_last_known_good_on_failure(tmp_path):
     assert summary["status"] == "failed"
     assert summary["indexes"]["kospi200"]["last_known_good_exists"] is True
     assert existing.read_text(encoding="utf-8") == "# old\n005930\t삼성전자\tmember\n"
+
+
+def test_sync_publishes_symbol_cache_after_artifact_write(tmp_path):
+    rows = _build_rows(150, special_member_code="0009K0", special_member_name="에임드바이오")
+    repo = InMemorySymbolCacheRepo()
+
+    summary = sync_index_constituents_proxy(
+        index_names=["kosdaq150"],
+        output_dir=tmp_path,
+        tiger_fetcher=DummyFetcher(
+            {"kosdaq150": SourceSnapshot("kosdaq150", "tiger", "2026-03-13", rows, "tiger")}
+        ),
+        kodex_fetcher=DummyFetcher(
+            {"kosdaq150": SourceSnapshot("kosdaq150", "kodex", "2026-03-14", rows, "kodex")}
+        ),
+        cache_repo=repo,
+        symbol_cache_retry_delay_sec=0,
+    )
+
+    assert summary["status"] == "ok"
+    assert (tmp_path / "kosdaq150_constituents.txt").exists()
+    assert ("0009K0", "에임드바이오") in repo.upsert_calls
+    assert summary["indexes"]["kosdaq150"]["symbol_cache_sync"]["row_count"] == len(rows)
+    assert summary["indexes"]["kosdaq150"]["symbol_cache_sync"]["upserted_count"] == len(rows)
+    assert summary["indexes"]["kosdaq150"]["symbol_cache_sync"]["attempt_count"] == 1
+
+
+def test_sync_retries_symbol_cache_publish_before_failing(tmp_path):
+    rows = _build_rows(150, special_member_code="0009K0", special_member_name="에임드바이오")
+    repo = FlakySymbolCacheRepo(fail_code="0009K0", fail_times=1)
+
+    summary = sync_index_constituents_proxy(
+        index_names=["kosdaq150"],
+        output_dir=tmp_path,
+        tiger_fetcher=DummyFetcher(
+            {"kosdaq150": SourceSnapshot("kosdaq150", "tiger", "2026-03-13", rows, "tiger")}
+        ),
+        kodex_fetcher=DummyFetcher(
+            {"kosdaq150": SourceSnapshot("kosdaq150", "kodex", "2026-03-14", rows, "kodex")}
+        ),
+        cache_repo=repo,
+        symbol_cache_retry_delay_sec=0,
+    )
+
+    assert summary["status"] == "ok"
+    assert summary["indexes"]["kosdaq150"]["symbol_cache_sync"]["attempt_count"] == 2
+    assert ("0009K0", "에임드바이오") in repo.upsert_calls
+
+
+def test_sync_fails_when_symbol_cache_publish_fails_after_file_write(tmp_path):
+    rows = _build_rows(150, special_member_code="0009K0", special_member_name="에임드바이오")
+    repo = FailingSymbolCacheRepo(fail_code="0009K0")
+
+    summary = sync_index_constituents_proxy(
+        index_names=["kosdaq150"],
+        output_dir=tmp_path,
+        tiger_fetcher=DummyFetcher(
+            {"kosdaq150": SourceSnapshot("kosdaq150", "tiger", "2026-03-13", rows, "tiger")}
+        ),
+        kodex_fetcher=DummyFetcher(
+            {"kosdaq150": SourceSnapshot("kosdaq150", "kodex", "2026-03-14", rows, "kodex")}
+        ),
+        cache_repo=repo,
+        symbol_cache_retry_delay_sec=0,
+    )
+
+    assert summary["status"] == "failed"
+    assert "symbol_cache sync failed after 3 attempts" in summary["indexes"]["kosdaq150"]["error"]
+    assert (tmp_path / "kosdaq150_constituents.txt").exists()

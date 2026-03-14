@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import time
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -15,6 +16,7 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
 import requests
 
+from db.repository import get_symbol_cache_repository
 from utils.logger import get_logger
 from utils.market_hours import KST
 
@@ -22,6 +24,8 @@ logger = get_logger("index_constituent_sync")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_REFERENCE_OUTPUT_DIR = REPO_ROOT / "data" / "reference"
+DEFAULT_SYMBOL_CACHE_RETRY_ATTEMPTS = 3
+DEFAULT_SYMBOL_CACHE_RETRY_DELAY_SEC = 1.0
 
 
 @dataclass(frozen=True)
@@ -88,6 +92,19 @@ class ConstituentFetchError(IndexConstituentSyncError):
 
 class ConstituentValidationError(IndexConstituentSyncError):
     """Raised when fetched proxy source data is unsafe to promote."""
+
+
+@dataclass(frozen=True)
+class SymbolCacheSyncResult:
+    upserted_count: int
+    failed_count: int
+    row_count: int
+    member_count: int
+    auxiliary_count: int
+    attempt_count: int = 1
+
+    def to_dict(self) -> Dict[str, int]:
+        return asdict(self)
 
 
 class _TigerTableParser(HTMLParser):
@@ -403,6 +420,89 @@ def write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
     write_text_atomic(path, json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
 
 
+def sync_symbol_cache_from_rows(
+    *,
+    rows: Sequence[ConstituentRecord],
+    cache_repo: Any,
+    updated_at: datetime,
+) -> SymbolCacheSyncResult:
+    upserted = 0
+    failed = 0
+    member_count = 0
+    auxiliary_count = 0
+    for row in rows:
+        if row.kind == "auxiliary":
+            auxiliary_count += 1
+        else:
+            member_count += 1
+        if cache_repo.upsert(row.code, row.name, updated_at=updated_at):
+            upserted += 1
+            continue
+        failed += 1
+        logger.warning(
+            "[INDEX_PROXY_SYNC] symbol_cache upsert failed code=%s name=%s kind=%s",
+            row.code,
+            row.name,
+            row.kind,
+        )
+    if failed:
+        raise IndexConstituentSyncError(
+            f"symbol_cache sync failed: upserted={upserted} failed={failed}"
+        )
+    return SymbolCacheSyncResult(
+        upserted_count=upserted,
+        failed_count=failed,
+        row_count=len(rows),
+        member_count=member_count,
+        auxiliary_count=auxiliary_count,
+    )
+
+
+def sync_symbol_cache_with_retry(
+    *,
+    rows: Sequence[ConstituentRecord],
+    cache_repo: Any,
+    updated_at: datetime,
+    max_attempts: int = DEFAULT_SYMBOL_CACHE_RETRY_ATTEMPTS,
+    retry_delay_sec: float = DEFAULT_SYMBOL_CACHE_RETRY_DELAY_SEC,
+    sleep_fn: Any = time.sleep,
+) -> SymbolCacheSyncResult:
+    attempts = max(int(max_attempts), 1)
+    delay = max(float(retry_delay_sec), 0.0)
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            result = sync_symbol_cache_from_rows(
+                rows=rows,
+                cache_repo=cache_repo,
+                updated_at=updated_at,
+            )
+            return SymbolCacheSyncResult(
+                upserted_count=result.upserted_count,
+                failed_count=result.failed_count,
+                row_count=result.row_count,
+                member_count=result.member_count,
+                auxiliary_count=result.auxiliary_count,
+                attempt_count=attempt,
+            )
+        except Exception as exc:
+            last_error = exc
+            if attempt >= attempts:
+                break
+            logger.warning(
+                "[INDEX_PROXY_SYNC] symbol_cache publish retry scheduled attempt=%s/%s delay=%.1fs err=%s",
+                attempt,
+                attempts,
+                delay,
+                exc,
+            )
+            if delay > 0:
+                sleep_fn(delay)
+    raise IndexConstituentSyncError(
+        f"symbol_cache sync failed after {attempts} attempts: {last_error}"
+    )
+
+
 class TigerProxyConstituentFetcher:
     def __init__(self, *, session: Optional[requests.Session] = None, timeout: float = 20.0) -> None:
         self._session = session or requests.Session()
@@ -464,10 +564,15 @@ def sync_index_constituents_proxy(
     output_dir: Path,
     tiger_fetcher: Any,
     kodex_fetcher: Any,
+    cache_repo: Any = None,
     dry_run: bool = False,
     synced_at: Optional[datetime] = None,
+    symbol_cache_retry_attempts: int = DEFAULT_SYMBOL_CACHE_RETRY_ATTEMPTS,
+    symbol_cache_retry_delay_sec: float = DEFAULT_SYMBOL_CACHE_RETRY_DELAY_SEC,
+    symbol_cache_retry_sleep_fn: Any = time.sleep,
 ) -> Dict[str, Any]:
     now_kst = synced_at or datetime.now(KST)
+    symbol_cache_repo = None if dry_run else (cache_repo or get_symbol_cache_repository())
     summary: Dict[str, Any] = {
         "status": "ok",
         "output_dir": str(output_dir),
@@ -506,6 +611,23 @@ def sync_index_constituents_proxy(
                     ),
                 )
                 write_json_atomic(paths["meta"], metadata)
+                symbol_cache_sync = sync_symbol_cache_with_retry(
+                    rows=rows,
+                    cache_repo=symbol_cache_repo,
+                    updated_at=now_kst,
+                    max_attempts=symbol_cache_retry_attempts,
+                    retry_delay_sec=symbol_cache_retry_delay_sec,
+                    sleep_fn=symbol_cache_retry_sleep_fn,
+                )
+            else:
+                symbol_cache_sync = SymbolCacheSyncResult(
+                    upserted_count=0,
+                    failed_count=0,
+                    row_count=len(rows),
+                    member_count=metadata["member_count"],
+                    auxiliary_count=metadata["auxiliary_count"],
+                    attempt_count=0,
+                )
             summary["indexes"][index_name] = {
                 "status": "dry_run" if dry_run else "ok",
                 "output_txt": str(paths["txt"]),
@@ -517,6 +639,7 @@ def sync_index_constituents_proxy(
                 "member_count": metadata["member_count"],
                 "auxiliary_count": metadata["auxiliary_count"],
                 "name_mismatch_count": metadata["name_mismatch_count"],
+                "symbol_cache_sync": symbol_cache_sync.to_dict(),
                 "metadata": metadata,
             }
         except Exception as exc:

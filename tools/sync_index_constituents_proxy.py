@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sync KOSPI200/KOSDAQ150 constituent artifacts from ETF proxy sources."""
+"""Sync KOSPI200/KOSDAQ150 constituent artifacts and publish symbol_cache."""
 
 from __future__ import annotations
 
@@ -53,7 +53,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=str(DEFAULT_REFERENCE_OUTPUT_DIR),
         help="artifact 출력 디렉터리 (기본: data/reference)",
     )
-    parser.add_argument("--dry-run", action="store_true", help="파일 반영 없이 검증만 수행")
+    parser.add_argument("--dry-run", action="store_true", help="파일/DB 반영 없이 검증만 수행")
     parser.add_argument("--json", action="store_true", help="결과를 JSON으로 출력")
     return parser
 
@@ -103,7 +103,9 @@ def main() -> int:
             print(
                 f"- {index_name} status={item['status']} member_count={item.get('member_count', 0)} "
                 f"auxiliary_count={item.get('auxiliary_count', 0)} cross_check_match={item.get('cross_check_match')} "
-                f"name_mismatch_count={item.get('name_mismatch_count', 0)} output_txt={item['output_txt']}"
+                f"name_mismatch_count={item.get('name_mismatch_count', 0)} "
+                f"symbol_cache_upserted={item.get('symbol_cache_sync', {}).get('upserted_count', 0)} "
+                f"output_txt={item['output_txt']}"
             )
             if item["status"] == "failed":
                 print(f"  error={item['error']}")
